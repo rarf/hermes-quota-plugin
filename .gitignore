@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.tmp
+quota_cache.json
+quota_cache.json.tmp
