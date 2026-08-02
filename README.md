@@ -47,8 +47,17 @@ hermes plugins enable quota
 - **`/usage`**: shows the same quota block appended after the account/credits
   sections.
 
-- **`/quota`**: full per-provider breakdown (or `/quota refresh` to force a
-  re-fetch).
+- **`/quota`**: full per-provider breakdown. Subcommands:
+
+  | Command                | Action                                              |
+  |------------------------|-----------------------------------------------------|
+  | `/quota`               | show all providers (auto-refreshes if stale)       |
+  | `/quota refresh`       | force a re-fetch of every provider, then show       |
+  | `/quota <provider>`    | e.g. `/quota grok`, `/quota openai-codex`           |
+  | `/quota help`          | usage                                               |
+
+  The same is available on the CLI: `hermes quota`, `hermes quota refresh`,
+  `hermes quota provider <name>`.
 
 ## How it works
 
