@@ -14,6 +14,29 @@ places** with zero core special-casing:
 All three read the plugin's **precomputed cache** (`quota_cache.json`), so they
 never do network I/O in the hot path.
 
+## See it in action
+
+### Desktop status bar
+
+![Hermes Quota status bar](docs/images/quota-statusbar.png)
+
+The widget shows the provider with the lowest remaining quota and opens the
+full breakdown when clicked.
+
+### Quota page
+
+![Hermes Quota page](docs/images/quota-page.png)
+
+The page shows provider windows, remaining percentage, reset time, and cache
+freshness without exposing credentials or account identifiers.
+
+### Configuration preview
+
+![Hermes Quota settings preview](docs/images/quota-settings-preview.png)
+
+This is a clean configuration preview of the plugin's public settings surface;
+it intentionally contains no account data or private paths.
+
 ---
 
 ## Features
@@ -100,8 +123,37 @@ hermes plugins enable quota
 # Desktop widget (separate location)
 mkdir -p ~/.hermes/desktop-plugins/quota
 cp desktop/plugin.js ~/.hermes/desktop-plugins/quota/plugin.js
-# then ⌘K → Reload desktop plugins
+# then restart Hermes Desktop completely so the Python API is remounted
 ```
+
+## Command examples
+
+### Plugin health check
+
+```text
+$ hermes plugins doctor quota
+Plugin Doctor: .../plugins/quota
+  manifest: quota 1.0.0 (standalone)
+  OK: runtime discovery, manifest parsing, import, and registration passed
+  registrations: 0 tool(s), 0 hook(s)
+```
+
+### Quota status
+
+```text
+$ hermes quota status
+📊 **quota** (fetched 1m ago)
+
+• **openai-codex** · Session 45% (reset tomorrow 06:43)
+• **gemini**: unavailable (consumer-tier-deprecated)
+• **grok**: unavailable (no-session-cookies)
+• **kimi**: unavailable (no-credentials)
+
+_Run `/quota refresh` to force a re-fetch._
+```
+
+Unavailable providers are reported honestly; the plugin never turns missing
+credentials or failed probes into a fabricated `0%` value.
 
 ---
 
