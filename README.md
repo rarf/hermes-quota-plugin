@@ -68,12 +68,62 @@ no core edits).
 | anthropic    | core `account_usage`                              |
 | nous         | core `account_usage` (Nous credits)              |
 | openrouter   | core `account_usage`                              |
-| grok         | `grok_session.json` cookies → Grok billing API   |
+| grok         | `grok_session.json` browser cookies → Grok billing API (requires local session export) |
 | gemini       | `~/.gemini/oauth_creds.json` → Gemini CLI quota   |
 | kimi         | `kimi_session.json` api key / token               |
 
 New providers appear **automatically** in the `/quota` page and are considered
 for the "worst" chip — no widget change needed.
+
+## Grok setup with browser cookies
+
+The Grok bearer token available to Hermes may authenticate model or `x_search`
+requests without granting access to the billing endpoint. In that case, use a
+local browser-session cookie export instead. Cookies are credentials: never
+paste them into chat, an issue, or a public log.
+
+### One-time setup
+
+1. Open `https://grok.com` in Chrome or Edge and sign in.
+2. Press `F12` and open **Network**.
+3. Reload the page.
+4. Select a request to `grok.com` that contains `GrokBuildBilling` or billing
+   data.
+5. Open **Headers**, find the `Cookie` request header, and copy only its value
+   to the clipboard. Do not copy it into this conversation.
+6. Run the local importer from the installed plugin:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  "$env:LOCALAPPDATA\hermes\plugins\quota\scripts\import-grok-cookies.ps1"
+```
+
+The script reads the clipboard locally and writes:
+
+```text
+%USERPROFILE%\grok_session.json
+```
+
+It never prints the cookie. Then refresh:
+
+```powershell
+hermes quota refresh
+hermes quota grok
+```
+
+Expected result when the session is accepted:
+
+```text
+• **grok** · Weekly 72% (reset tomorrow 18:00)
+```
+
+If the result is `cloudflare-blocked` or `auth-failed`, the browser session
+has expired or Grok rejected the request. Sign in again and export a fresh
+Cookie header. The plugin does not treat a failed cookie probe as `0%`.
+
+> This fallback uses the same browser-session approach documented by CodexBar.
+> It is intentionally local and manual; the plugin never uploads cookies or
+> sends them to any service other than Grok's billing endpoint.
 
 ---
 

@@ -31,7 +31,7 @@ done
 mkdir -p "$PLUGIN_DIR" "$DESKTOP_DIR"
 
 # Backend and API. Do not copy the git metadata or caches.
-for item in plugin.yaml __init__.py commands.py quota_cache.py quota_providers dashboard LICENSE SPEC.md; do
+for item in plugin.yaml __init__.py commands.py quota_cache.py quota_providers dashboard LICENSE SPEC.md scripts; do
   [ -e "$REPO_ROOT/$item" ] && cp -Rf "$REPO_ROOT/$item" "$PLUGIN_DIR/"
 done
 rm -rf "$PLUGIN_DIR/__pycache__" "$PLUGIN_DIR/quota_providers/__pycache__" "$PLUGIN_DIR/dashboard/__pycache__"
