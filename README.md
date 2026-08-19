@@ -68,17 +68,25 @@ cd hermes-quota-plugin
 
 After install:
 
-- **Desktop:** press **⌘K → "Reload desktop plugins"** (or restart Hermes
-  Desktop). The quota chip appears on the status bar.
-- **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota <provider>`.
+1. **Restart Hermes Desktop completely.** Close and reopen the application. This
+   remounts the Python `dashboard/plugin_api.py` backend in the Desktop's
+   embedded Hermes process.
+2. **Do not rely only on `Reload desktop plugins`.** That command hot-reloads
+   the JavaScript widget, but it does not remount a changed Python dashboard API.
+3. **Bot profiles:** the installer adds `quota` to each existing profile's
+   `plugins.enabled` list while preserving other enabled plugins.
+4. **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota <provider>`.
 
+If the Desktop still says **Quota backend unavailable**, close every Hermes
+Desktop window, verify `hermes plugins doctor quota`, and launch Desktop again.
+The expected route is `GET /api/plugins/quota/quota`; the expected plugin API
+health route is `GET /api/plugins/quota/health`.
 To remove: `./uninstall.sh`.
 
-> Requires a Hermes core that includes the generic `footer` and `usage_extra`
-> lifecycle hooks (upstream in `rarf/hermes-agent`, branches `footer-hook` /
-> `usage-extra-hook`). Without them the plugin still loads but the footer/usage
-> block contributes nothing — no errors. The **desktop widget** and `/quota`
-> page work independently of those hooks.
+> The optional `footer` and `usage_extra` hooks are used only when the running
+> Hermes core exposes them. On current builds without those hooks, the plugin
+> still provides the desktop widget, `/quota` page, and CLI command without
+> registering unknown hooks or producing doctor errors.
 
 ---
 
@@ -104,10 +112,14 @@ chip → ctx.rest('/quota') → gateway → GET /api/plugins/quota/quota
      → dashboard/plugin_api.py → quota_cache.json
 ```
 
-The Python backend is imported **only when** the plugin is in
-`plugins.enabled` in `~/.hermes/config.yaml` **and** the dashboard
-`manifest.json` declares `"api": "plugin_api.py"` (the loader mounts
-`plugin_api.py`, *not* `api.py`).
+The Python backend is imported **only when** the plugin is enabled by Hermes
+and the dashboard `manifest.json` declares `"api": "plugin_api.py"` (the
+loader mounts `plugin_api.py`, *not* `api.py`). The installer resolves the
+shared Hermes root on Windows and never installs per-profile copies.
+
+The optional `footer` and `usage_extra` hooks are registered only when the
+running Hermes build exposes them. On older builds the widget, `/quota`, and
+API page still work without warnings.
 
 ---
 

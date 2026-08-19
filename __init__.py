@@ -90,10 +90,27 @@ def usage_extra(**kwargs: Any) -> Optional[str]:
     return None
 
 
+def _supports_hook(ctx: Any, hook_name: str) -> bool:
+    """Return whether this Hermes runtime supports a lifecycle hook.
+
+    Quota can run on older Hermes builds that do not yet expose the optional
+    footer hooks. Do not register unknown hooks: Hermes keeps them for forward
+    compatibility, but the plugin doctor quite correctly reports them as
+    errors. The desktop widget and /quota command do not depend on these hooks.
+    """
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+        return hook_name in VALID_HOOKS
+    except Exception:
+        return False
+
+
 def register(ctx) -> None:
-    """Register the quota plugin's hooks and commands."""
-    ctx.register_hook("footer", footer_segment)
-    ctx.register_hook("usage_extra", usage_extra)
+    """Register supported quota surfaces without breaking older Hermes builds."""
+    if _supports_hook(ctx, "footer"):
+        ctx.register_hook("footer", footer_segment)
+    if _supports_hook(ctx, "usage_extra"):
+        ctx.register_hook("usage_extra", usage_extra)
     ctx.register_command(
         "quota",
         handler=commands.quota_command,

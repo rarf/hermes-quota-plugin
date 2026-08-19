@@ -30,7 +30,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ _AUTO_REFRESH_WAIT_S = 20.0
 def _global_hermes_home() -> str:
     # Global Hermes home, independent of any active desktop profile. Used as
     # the fallback source when the active profile has no providers yet.
-    return os.path.expanduser("~/.hermes")
+    return str(get_default_hermes_root())
 
 
 def _profile_hermes_home() -> str:
