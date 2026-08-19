@@ -1,133 +1,37 @@
-# hermes-quota-plugin
+# Hermes Quota
 
-Per-provider **quota / rate-limit** status for Hermes, surfaced in **three
-places** with zero core special-casing:
+[![License](https://img.shields.io/github/license/rarf/hermes-quota-plugin)](LICENSE)
+[![Last commit](https://img.shields.io/github/last-commit/rarf/hermes-quota-plugin)](https://github.com/rarf/hermes-quota-plugin/commits/master)
+[![Hermes plugin](https://img.shields.io/badge/Hermes-plugin-7c5cff)](https://hermes-agent.nousresearch.com/docs/user-guide/bot-mode)
 
-1. **Desktop status bar** (widget) — a chip showing the *worst* provider's
-   remaining % + a tonal progress bar. Hover for a button affordance; click
-   opens the full `/quota` page.
-2. **`/quota` desktop page** — every configured provider with per-window
-   remaining % and reset breakdown.
-3. **Runtime footer + `/usage` + `/quota` CLI** — a quota block appended to the
-   agent's final message and usage output, plus on-demand slash commands.
+See your AI provider quota before the next request fails.
 
-All three read the plugin's **precomputed cache** (`quota_cache.json`), so they
-never do network I/O in the hot path.
+Hermes Quota adds a small status indicator, a detailed quota page, and a CLI
+command to Hermes Desktop. It reads a local cache, so checking the status never
+adds another network call to a normal agent response.
 
-## See it in action
+## What you get
 
-### Desktop status bar
+- A status-bar indicator for the provider with the lowest remaining quota.
+- A `/quota` page with every provider, window, percentage, and reset time.
+- `hermes quota` and `/quota` commands.
+- Honest unavailable states when a provider has no credentials or no supported
+  quota endpoint.
+- Optional footer and `/usage` integration on Hermes builds that expose those
+  lifecycle hooks.
 
-<img width="338" height="34" alt="image" src="https://github.com/user-attachments/assets/4bbb316e-cea1-4837-9aff-fbdef45287a5" />
+![Hermes Quota status bar](https://github.com/user-attachments/assets/4bbb316e-cea1-4837-9aff-fbdef45287a5)
 
+![Hermes Quota page](https://github.com/user-attachments/assets/57f027fe-da1d-470f-8800-1493fab69b8d)
 
-The widget shows the provider with the lowest remaining quota and opens the
-full breakdown when clicked.
+The configuration preview below shows the public settings surface. It contains
+no account data or private paths.
 
-### Quota page
+![Hermes Quota settings preview](https://github.com/user-attachments/assets/db592a97-7508-4908-9e95-26508e82b49d)
 
-<img width="2326" height="443" alt="image" src="https://github.com/user-attachments/assets/57f027fe-da1d-470f-8800-1493fab69b8d" />
+## Install
 
-
-The page shows provider windows, remaining percentage, reset time, and cache
-freshness without exposing credentials or account identifiers.
-
-### Configuration preview
-
-<img width="807" height="235" alt="image" src="https://github.com/user-attachments/assets/db592a97-7508-4908-9e95-26508e82b49d" />
-
-
-This is a clean configuration preview of the plugin's public settings surface;
-it intentionally contains no account data or private paths.
-
----
-
-## Features
-
-| Feature | Where | Notes |
-|---------|-------|-------|
-| Status-bar chip (worst provider + bar) | Desktop widget | Font matches other status-bar items; severity-colored. |
-| Hover affordance | Desktop widget | Highlights like a button. |
-| Click → `/quota` page | Desktop widget | Full provider breakdown. |
-| Per-window remaining % + reset | `/quota` page, footer, CLI | `resets in 3h 12m` or absolute date. |
-| Show / hide status bar | Setting | Toggle in Settings ▸ Plugins ▸ Quota. |
-| Show / hide docked pane | Setting | **Off by default** (optional side pane). |
-| Reset format (relative / absolute) | Setting | Countdown style on `/quota`. |
-| Show unconfigured providers | Setting | Off by default. |
-| Refresh interval | Setting | Poll cadence (seconds). |
-| Pluggable providers | Backend | Add a fetcher, register it — no other changes. |
-
-Everything is **configurable** from Settings ▸ Plugins ▸ Quota (no env vars,
-no core edits).
-
-### Supported providers
-
-| Provider     | Source                                            |
-|--------------|---------------------------------------------------|
-| openai-codex | core `account_usage` (Codex rate-limit windows)   |
-| anthropic    | core `account_usage`                              |
-| nous         | core `account_usage` (Nous credits)              |
-| openrouter   | core `account_usage`                              |
-| grok         | `grok_session.json` browser cookies → Grok billing API (requires local session export) |
-| gemini       | `~/.gemini/oauth_creds.json` → Gemini CLI quota   |
-| kimi         | `kimi_session.json` api key / token               |
-
-New providers appear **automatically** in the `/quota` page and are considered
-for the "worst" chip — no widget change needed.
-
-## Grok setup with browser cookies
-
-The Grok bearer token available to Hermes may authenticate model or `x_search`
-requests without granting access to the billing endpoint. In that case, use a
-local browser-session cookie export instead. Cookies are credentials: never
-paste them into chat, an issue, or a public log.
-
-### One-time setup
-
-1. Open `https://grok.com` in Chrome or Edge and sign in.
-2. Press `F12` and open **Network**.
-3. Reload the page.
-4. Select a request to `grok.com` that contains `GrokBuildBilling` or billing
-   data.
-5. Open **Headers**, find the `Cookie` request header, and copy only its value
-   to the clipboard. Do not copy it into this conversation.
-6. Run the local importer from the installed plugin:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File `
-  "$env:LOCALAPPDATA\hermes\plugins\quota\scripts\import-grok-cookies.ps1"
-```
-
-The script reads the clipboard locally and writes:
-
-```text
-%USERPROFILE%\grok_session.json
-```
-
-It never prints the cookie. Then refresh:
-
-```powershell
-hermes quota refresh
-hermes quota grok
-```
-
-Expected result when the session is accepted:
-
-```text
-• **grok** · Weekly 72% (reset tomorrow 18:00)
-```
-
-If the result is `cloudflare-blocked` or `auth-failed`, the browser session
-has expired or Grok rejected the request. Sign in again and export a fresh
-Cookie header. The plugin does not treat a failed cookie probe as `0%`.
-
-> This fallback uses the same browser-session approach documented by CodexBar.
-> It is intentionally local and manual; the plugin never uploads cookies or
-> sends them to any service other than Grok's billing endpoint.
-
----
-
-## Install (simplified — one command)
+Run this from Git Bash on Windows, or from a normal shell on macOS/Linux:
 
 ```bash
 git clone https://github.com/rarf/hermes-quota-plugin.git
@@ -135,53 +39,67 @@ cd hermes-quota-plugin
 ./install.sh
 ```
 
-`install.sh` does **both** installs for you:
+The installer copies the backend and Desktop widget, enables the plugin, and
+adds it to existing Bot profiles without removing their other enabled plugins.
 
-1. copies the backend + dashboard into `~/.hermes/plugins/quota/`
-2. copies the desktop widget into `~/.hermes/desktop-plugins/quota/plugin.js`
-3. enables the backend plugin (`hermes plugins enable quota`)
-4. prints the final steps
+> **Important:** close and reopen Hermes Desktop after installation or an
+> update. `Reload desktop plugins` reloads JavaScript, but it does not remount
+> the Python dashboard backend.
 
-After install:
-
-1. **Restart Hermes Desktop completely.** Close and reopen the application. This
-   remounts the Python `dashboard/plugin_api.py` backend in the Desktop's
-   embedded Hermes process.
-2. **Do not rely only on `Reload desktop plugins`.** That command hot-reloads
-   the JavaScript widget, but it does not remount a changed Python dashboard API.
-3. **Bot profiles:** the installer adds `quota` to each existing profile's
-   `plugins.enabled` list while preserving other enabled plugins.
-4. **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota <provider>`.
-
-If the Desktop still says **Quota backend unavailable**, close every Hermes
-Desktop window, verify `hermes plugins doctor quota`, and launch Desktop again.
-The expected route is `GET /api/plugins/quota/quota`; the expected plugin API
-health route is `GET /api/plugins/quota/health`.
-To remove: `./uninstall.sh`.
-
-> The optional `footer` and `usage_extra` hooks are used only when the running
-> Hermes core exposes them. On current builds without those hooks, the plugin
-> still provides the desktop widget, `/quota` page, and CLI command without
-> registering unknown hooks or producing doctor errors.
-
----
-
-## Manual install (if you prefer)
+Verify the installation:
 
 ```bash
-# Backend + dashboard
-hermes plugins install https://github.com/rarf/hermes-quota-plugin.git
-hermes plugins enable quota
-
-# Desktop widget (separate location)
-mkdir -p ~/.hermes/desktop-plugins/quota
-cp desktop/plugin.js ~/.hermes/desktop-plugins/quota/plugin.js
-# then restart Hermes Desktop completely so the Python API is remounted
+hermes plugins doctor quota
+hermes quota refresh
+hermes quota status
 ```
 
-## Command examples
+## Providers
 
-### Plugin health check
+| Provider | How quota is read |
+|---|---|
+| OpenAI Codex | Hermes account usage |
+| Anthropic | Hermes account usage |
+| Nous | Hermes account usage |
+| OpenRouter | Hermes account usage |
+| Grok | Local browser session, then Grok billing endpoint |
+| Gemini | Gemini CLI credentials |
+| Kimi | Local Kimi session credentials |
+
+### Grok on Windows
+
+If the Grok bearer token can run models but cannot read billing, the plugin uses
+the logged-in Firefox profile automatically. It reads only `grok.com` cookies
+from Firefox's local `cookies.sqlite`; values stay in memory and are never
+printed.
+
+1. Sign in to `https://grok.com` in Firefox.
+2. Close Firefox, so its cookie database can be copied cleanly.
+3. Run:
+
+```powershell
+hermes quota refresh
+hermes quota grok
+```
+
+No token or cookie needs to be pasted into chat.
+
+If Firefox is unavailable, the plugin still accepts a manually exported
+browser session. Copy only the `Cookie` header value from a logged-in Grok
+request, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File `
+  "$env:LOCALAPPDATA\hermes\plugins\quota\scripts\import-grok-cookies.ps1"
+```
+
+The importer reads the clipboard locally and writes
+`%USERPROFILE%\grok_session.json`. It never prints the cookie.
+
+A rejected or expired browser session is reported as `auth-failed` or
+`cloudflare-blocked`, not as a fake `0%` quota.
+
+## Commands
 
 ```text
 $ hermes plugins doctor quota
@@ -191,88 +109,116 @@ Plugin Doctor: .../plugins/quota
   registrations: 0 tool(s), 0 hook(s)
 ```
 
-### Quota status
-
 ```text
 $ hermes quota status
 📊 **quota** (fetched 1m ago)
 
 • **openai-codex** · Session 45% (reset tomorrow 06:43)
+• **grok** · Weekly 72% (reset tomorrow 18:00)
 • **gemini**: unavailable (consumer-tier-deprecated)
-• **grok**: unavailable (no-session-cookies)
-• **kimi**: unavailable (no-credentials)
 
 _Run `/quota refresh` to force a re-fetch._
 ```
 
-Unavailable providers are reported honestly; the plugin never turns missing
-credentials or failed probes into a fabricated `0%` value.
+Useful commands:
 
----
-
-## Data path
-
-```
-chip → ctx.rest('/quota') → gateway → GET /api/plugins/quota/quota
-     → dashboard/plugin_api.py → quota_cache.json
+```bash
+hermes quota                    # all providers
+hermes quota refresh            # fetch fresh data
+hermes quota grok               # one provider
 ```
 
-The Python backend is imported **only when** the plugin is enabled by Hermes
-and the dashboard `manifest.json` declares `"api": "plugin_api.py"` (the
-loader mounts `plugin_api.py`, *not* `api.py`). The installer resolves the
-shared Hermes root on Windows and never installs per-profile copies.
+Inside a Hermes chat:
 
-The optional `footer` and `usage_extra` hooks are registered only when the
-running Hermes build exposes them. On older builds the widget, `/quota`, and
-API page still work without warnings.
-
----
-
-## Extending
-
-### Add a provider
-
-Write a fetcher returning a `QuotaResult` and `@register("provider-id")` it in
-`quota_providers/`. No changes to cache orchestration or the widget.
-
-### Change widget appearance
-
-- Colors: the `fill` / `rclass` ternaries in `desktop/plugin.js`.
-- Severity: `toneForRemaining()` (`<=15` bad, `<=40` warn).
-- Font: `text-[0.6875rem]` (matches status-bar items).
-
-### Make the click target something else
-
-`desktop/plugin.js` calls `host.navigate('/quota')` on click — swap for any
-`host.*` verb (e.g. `host.openWorkspace(...)`).
-
-> **Plugin-runtime constraints (learned the hard way):** the status-bar item is
-> loaded uncompiled as plain `jsx()` — keep it simple. `useState` and `onClick`
-> work; a `flex-col` container or `absolute`-positioned popover **breaks the
-> render**. Use `host.navigate` / `host.openWorkspace` for richer surfaces, and
-> register the item **once** (don't re-register on every poll — that hangs the
-> renderer).
-
----
-
-## Repo layout
-
+```text
+/quota
+/quota refresh
+/quota grok
 ```
-hermes-quota-plugin/
-├── install.sh            # installs backend + desktop widget (idempotent)
-├── uninstall.sh          # removes both
-├── plugin.yaml           # backend plugin manifest
-├── commands.py           # /quota slash + CLI commands
-├── quota_cache.py        # cache orchestration
-├── quota_providers/      # pluggable provider fetchers
-├── dashboard/
-│   ├── manifest.json     # points "api" at plugin_api.py
-│   └── plugin_api.py     # FastAPI router (GET /quota, POST /refresh)
-├── desktop/
-│   └── plugin.js         # the desktop status-bar widget
-└── SPEC.md               # original design spec
+
+## How it works
+
+```text
+Provider quota sources
+        │
+        ▼
+  quota_cache.json
+     ┌──┴──┐
+     ▼     ▼
+ Desktop  CLI/chat
+ widget   /quota
 ```
+
+The Desktop widget calls the plugin API at:
+
+```text
+/api/plugins/quota/quota
+```
+
+The backend reads the precomputed cache. Provider refreshes happen only when
+requested or scheduled, not inline with every model response.
+
+## Privacy and safety
+
+- No telemetry or analytics are added.
+- Cookies and tokens are never printed by the plugin or importer.
+- Grok browser cookies are used only for the Grok billing request.
+- Missing credentials produce an explicit unavailable state.
+- The plugin does not request permission to override built-in Hermes tools.
+- The installer keeps one global plugin copy and updates Bot profile settings
+  without deleting unrelated configuration.
+
+## Troubleshooting
+
+### Desktop says `Quota backend unavailable`
+
+Close every Hermes Desktop window and reopen it. The Python dashboard backend is
+mounted when the Desktop backend starts; reloading JavaScript alone is not
+sufficient.
+
+Then run:
+
+```bash
+hermes plugins doctor quota
+hermes quota refresh
+```
+
+### Grok says `no-session-cookies`
+
+Use Firefox, sign in to Grok, close Firefox, and run `hermes quota refresh`.
+The plugin searches the standard Firefox profile automatically.
+
+### Grok says `auth-failed` or `cloudflare-blocked`
+
+The browser session expired or Grok rejected the request. Sign in again and
+refresh the quota. Do not paste cookies into an issue or chat.
+
+## Development
+
+The plugin is a standalone Hermes plugin. The main files are:
+
+```text
+plugin.yaml                       runtime manifest
+__init__.py                       CLI, slash command, optional hooks
+quota_cache.py                    cache orchestration
+quota_providers/                  provider fetchers
+ dashboard/plugin_api.py          authenticated Desktop API routes
+desktop/plugin.js                 Desktop widget
+scripts/import-grok-cookies.ps1   manual local cookie fallback
+```
+
+Run the local checks:
+
+```bash
+bash -n install.sh
+python -m py_compile __init__.py commands.py quota_cache.py
+hermes plugins doctor quota
+hermes quota refresh
+```
+
+To add a provider, register a fetcher in `quota_providers/` that returns a
+`QuotaResult`. The cache and widget do not need provider-specific changes.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

@@ -9,6 +9,7 @@ import urllib.error
 from typing import Optional
 
 from .base import QuotaResult, QuotaWindow, build_unavailable
+from .browser_cookies import load_firefox_grok_cookies
 
 _GROK_ENDPOINT = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
 _EMPTY_GRPCWEB_BODY = b"\x00\x00\x00\x00\x00"  # 0x00 frame + 4-byte len(0)
@@ -28,11 +29,14 @@ def _load_cookies() -> Optional[str]:
         cookies = data.get("cookies") or data
         if isinstance(cookies, dict):
             cookies = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        if not cookies or not str(cookies).strip():
-            return None
-        return str(cookies)
+        if cookies and str(cookies).strip():
+            return str(cookies)
     except Exception:
-        return None
+        pass
+
+    # Automatic local fallback for the logged-in Firefox profile. The helper
+    # copies the SQLite DB before reading it and only selects grok.com cookies.
+    return load_firefox_grok_cookies()
 
 
 def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
