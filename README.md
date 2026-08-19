@@ -26,14 +26,16 @@ full breakdown when clicked.
 
 ### Quota page
 
-![Hermes Quota page](docs/images/quota-page.png)
+<img width="2326" height="443" alt="image" src="https://github.com/user-attachments/assets/57f027fe-da1d-470f-8800-1493fab69b8d" />
+
 
 The page shows provider windows, remaining percentage, reset time, and cache
 freshness without exposing credentials or account identifiers.
 
 ### Configuration preview
 
-![Hermes Quota settings preview](docs/images/quota-settings-preview.png)
+<img width="807" height="235" alt="image" src="https://github.com/user-attachments/assets/db592a97-7508-4908-9e95-26508e82b49d" />
+
 
 This is a clean configuration preview of the plugin's public settings surface;
 it intentionally contains no account data or private paths.
