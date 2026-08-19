@@ -18,7 +18,8 @@ never do network I/O in the hot path.
 
 ### Desktop status bar
 
-![Hermes Quota status bar](docs/images/quota-statusbar.png)
+<img width="338" height="34" alt="image" src="https://github.com/user-attachments/assets/4bbb316e-cea1-4837-9aff-fbdef45287a5" />
+
 
 The widget shows the provider with the lowest remaining quota and opens the
 full breakdown when clicked.
