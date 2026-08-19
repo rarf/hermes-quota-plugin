@@ -1,91 +1,160 @@
 # hermes-quota-plugin
 
-Standalone **Hermes Agent** plugin that surfaces per-provider quota / rate-limit
-status in two places, with zero core special-casing:
+Per-provider **quota / rate-limit** status for Hermes, surfaced in **three
+places** with zero core special-casing:
 
-- a **📊 quota block** appended to the runtime footer (via the generic `footer`
-  lifecycle hook), and
-- the same block appended to the `/usage` command (via the generic
-  `usage_extra` lifecycle hook), plus a dedicated **`/quota`** slash command
-  for on-demand detail.
+1. **Desktop status bar** (widget) — a chip showing the *worst* provider's
+   remaining % + a tonal progress bar. Hover for a button affordance; click
+   opens the full `/quota` page.
+2. **`/quota` desktop page** — every configured provider with per-window
+   remaining % and reset breakdown.
+3. **Runtime footer + `/usage` + `/quota` CLI** — a quota block appended to the
+   agent's final message and usage output, plus on-demand slash commands.
 
-The plugin carries its **own quota subsystem** (fetchers + cache) so it survives
-`hermes update` — the only core change it needs is the two generic hooks
-(`footer`, `usage_extra`), contributed upstream in
-[rarf/hermes-agent](https://github.com/rarf/hermes-agent) (`footer-hook` and
-`usage-extra-hook` branches).
+All three read the plugin's **precomputed cache** (`quota_cache.json`), so they
+never do network I/O in the hot path.
 
-## Install
+---
 
-```bash
-# Clone into the user plugin dir (Hermes auto-discovers ~/.hermes/plugins/<name>/)
-git clone https://github.com/rarf/hermes-quota-plugin.git \
-  ~/.hermes/plugins/quota
+## Features
 
-# Enable it
-hermes plugins enable quota
-```
+| Feature | Where | Notes |
+|---------|-------|-------|
+| Status-bar chip (worst provider + bar) | Desktop widget | Font matches other status-bar items; severity-colored. |
+| Hover affordance | Desktop widget | Highlights like a button. |
+| Click → `/quota` page | Desktop widget | Full provider breakdown. |
+| Per-window remaining % + reset | `/quota` page, footer, CLI | `resets in 3h 12m` or absolute date. |
+| Show / hide status bar | Setting | Toggle in Settings ▸ Plugins ▸ Quota. |
+| Show / hide docked pane | Setting | **Off by default** (optional side pane). |
+| Reset format (relative / absolute) | Setting | Countdown style on `/quota`. |
+| Show unconfigured providers | Setting | Off by default. |
+| Refresh interval | Setting | Poll cadence (seconds). |
+| Pluggable providers | Backend | Add a fetcher, register it — no other changes. |
 
-> Requires Hermes core that includes the `footer` and `usage_extra` hooks
-> (PRs `footer-hook` / `usage-extra-hook`, or any build containing them).
-> Without them the plugin still loads but contributes nothing — no errors.
-
-## Usage
-
-- **Footer**: once `runtime_footer` is enabled in `config.yaml`
-  (`display.runtime_footer.enabled: true`), the final message gains a quota
-  block, e.g.
-
-  ```
-  gpt-5.4 · 6% · ~
-  📊 quota:
-  • anthropic: Current session 54% (reset today 13:09) · Current week 44% (reset tomorrow 23:59)
-  • grok: Weekly 0% (reset today 18:00)
-  • openai-codex: Session 67% (reset Aug 08 04:37)
-  ```
-
-- **`/usage`**: shows the same quota block appended after the account/credits
-  sections.
-
-- **`/quota`**: full per-provider breakdown. Subcommands:
-
-  | Command                | Action                                              |
-  |------------------------|-----------------------------------------------------|
-  | `/quota`               | show all providers (auto-refreshes if stale)       |
-  | `/quota refresh`       | force a re-fetch of every provider, then show       |
-  | `/quota <provider>`    | e.g. `/quota grok`, `/quota openai-codex`           |
-  | `/quota help`          | usage                                               |
-
-  The same is available on the CLI: `hermes quota`, `hermes quota refresh`,
-  `hermes quota provider <name>`.
-
-## How it works
-
-Reading live quota on every final message would mean N network calls per reply
-(and the footer has no live agent/credentials in scope). Instead:
-
-- provider fetchers live in `quota_providers/` (a pluggable registry);
-- `refresh_quota_cache()` runs them on a schedule (cron) and writes a small
-  JSON summary to `$HERMES_HOME/quota_cache.json`;
-- the footer hook and `/quota` command read that JSON — pure, offline, fast.
-
-Each fetcher is **fail-open**: a fetch error yields an `unavailable_reason`
-record (never fake zeros), so one broken provider can't abort the whole refresh.
+Everything is **configurable** from Settings ▸ Plugins ▸ Quota (no env vars,
+no core edits).
 
 ### Supported providers
 
-| Provider       | Source                                            |
-|----------------|---------------------------------------------------|
-| openai-codex   | core `account_usage` (Codex rate-limit windows)   |
-| anthropic      | core `account_usage`                              |
-| nous           | core `account_usage` (Nous credits)              |
-| openrouter     | core `account_usage`                              |
-| grok           | `grok_session.json` cookies → Grok billing API   |
-| gemini         | `~/.gemini/oauth_creds.json` → Gemini CLI quota   |
-| kimi           | `kimi_session.json` api key / token               |
+| Provider     | Source                                            |
+|--------------|---------------------------------------------------|
+| openai-codex | core `account_usage` (Codex rate-limit windows)   |
+| anthropic    | core `account_usage`                              |
+| nous         | core `account_usage` (Nous credits)              |
+| openrouter   | core `account_usage`                              |
+| grok         | `grok_session.json` cookies → Grok billing API   |
+| gemini       | `~/.gemini/oauth_creds.json` → Gemini CLI quota   |
+| kimi         | `kimi_session.json` api key / token               |
 
-Adding a provider = write a fetcher returning a `QuotaResult` and
-`@register("provider-id")` it. No changes to the cache orchestration.
+New providers appear **automatically** in the `/quota` page and are considered
+for the "worst" chip — no widget change needed.
+
+---
+
+## Install (simplified — one command)
+
+```bash
+git clone https://github.com/rarf/hermes-quota-plugin.git
+cd hermes-quota-plugin
+./install.sh
+```
+
+`install.sh` does **both** installs for you:
+
+1. copies the backend + dashboard into `~/.hermes/plugins/quota/`
+2. copies the desktop widget into `~/.hermes/desktop-plugins/quota/plugin.js`
+3. enables the backend plugin (`hermes plugins enable quota`)
+4. prints the final steps
+
+After install:
+
+- **Desktop:** press **⌘K → "Reload desktop plugins"** (or restart Hermes
+  Desktop). The quota chip appears on the status bar.
+- **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota <provider>`.
+
+To remove: `./uninstall.sh`.
+
+> Requires a Hermes core that includes the generic `footer` and `usage_extra`
+> lifecycle hooks (upstream in `rarf/hermes-agent`, branches `footer-hook` /
+> `usage-extra-hook`). Without them the plugin still loads but the footer/usage
+> block contributes nothing — no errors. The **desktop widget** and `/quota`
+> page work independently of those hooks.
+
+---
+
+## Manual install (if you prefer)
+
+```bash
+# Backend + dashboard
+hermes plugins install https://github.com/rarf/hermes-quota-plugin.git
+hermes plugins enable quota
+
+# Desktop widget (separate location)
+mkdir -p ~/.hermes/desktop-plugins/quota
+cp desktop/plugin.js ~/.hermes/desktop-plugins/quota/plugin.js
+# then ⌘K → Reload desktop plugins
+```
+
+---
+
+## Data path
+
+```
+chip → ctx.rest('/quota') → gateway → GET /api/plugins/quota/quota
+     → dashboard/plugin_api.py → quota_cache.json
+```
+
+The Python backend is imported **only when** the plugin is in
+`plugins.enabled` in `~/.hermes/config.yaml` **and** the dashboard
+`manifest.json` declares `"api": "plugin_api.py"` (the loader mounts
+`plugin_api.py`, *not* `api.py`).
+
+---
+
+## Extending
+
+### Add a provider
+
+Write a fetcher returning a `QuotaResult` and `@register("provider-id")` it in
+`quota_providers/`. No changes to cache orchestration or the widget.
+
+### Change widget appearance
+
+- Colors: the `fill` / `rclass` ternaries in `desktop/plugin.js`.
+- Severity: `toneForRemaining()` (`<=15` bad, `<=40` warn).
+- Font: `text-[0.6875rem]` (matches status-bar items).
+
+### Make the click target something else
+
+`desktop/plugin.js` calls `host.navigate('/quota')` on click — swap for any
+`host.*` verb (e.g. `host.openWorkspace(...)`).
+
+> **Plugin-runtime constraints (learned the hard way):** the status-bar item is
+> loaded uncompiled as plain `jsx()` — keep it simple. `useState` and `onClick`
+> work; a `flex-col` container or `absolute`-positioned popover **breaks the
+> render**. Use `host.navigate` / `host.openWorkspace` for richer surfaces, and
+> register the item **once** (don't re-register on every poll — that hangs the
+> renderer).
+
+---
+
+## Repo layout
+
+```
+hermes-quota-plugin/
+├── install.sh            # installs backend + desktop widget (idempotent)
+├── uninstall.sh          # removes both
+├── plugin.yaml           # backend plugin manifest
+├── commands.py           # /quota slash + CLI commands
+├── quota_cache.py        # cache orchestration
+├── quota_providers/      # pluggable provider fetchers
+├── dashboard/
+│   ├── manifest.json     # points "api" at plugin_api.py
+│   └── plugin_api.py     # FastAPI router (GET /quota, POST /refresh)
+├── desktop/
+│   └── plugin.js         # the desktop status-bar widget
+└── SPEC.md               # original design spec
+```
 
 ## License
 
