@@ -17,11 +17,19 @@ from typing import Optional
 
 
 def _firefox_cookie_dbs() -> list[Path]:
+    roots: list[Path] = []
+    # Windows: %APPDATA%\Mozilla\Firefox\Profiles
     appdata = os.environ.get("APPDATA")
-    if not appdata:
-        return []
-    root = Path(appdata) / "Mozilla" / "Firefox" / "Profiles"
-    return [Path(p) for p in glob.glob(str(root / "*" / "cookies.sqlite"))]
+    if appdata:
+        roots.append(Path(appdata) / "Mozilla" / "Firefox" / "Profiles")
+    # macOS: ~/Library/Application Support/Firefox/Profiles
+    roots.append(Path.home() / "Library" / "Application Support" / "Firefox" / "Profiles")
+    # Linux: ~/.mozilla/firefox
+    roots.append(Path.home() / ".mozilla" / "firefox")
+    dbs: list[Path] = []
+    for root in roots:
+        dbs.extend(Path(p) for p in glob.glob(str(root / "*" / "cookies.sqlite")))
+    return dbs
 
 
 def load_firefox_grok_cookies() -> Optional[str]:
