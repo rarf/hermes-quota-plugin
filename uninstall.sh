@@ -1,27 +1,171 @@
 #!/usr/bin/env bash
-#
-# Quota plugin — uninstaller.
-# Removes both surfaces (backend + dashboard, and the desktop widget) and
-# disables the backend plugin. If you cloned the repo elsewhere, this only
-# touches the installed locations under ~/.hermes.
-#
-set -euo pipefail
+# Remove the quota backend, Desktop widget, and profile entries transactionally.
+set -Eeuo pipefail
 
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-QUOTA_PLUGINS="$HERMES_HOME/plugins/quota"
-QUOTA_DESKTOP="$HERMES_HOME/desktop-plugins/quota"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/hermes-home.sh
+source "$REPO_ROOT/scripts/hermes-home.sh"
 
-echo "==> Removing backend + dashboard: $QUOTA_PLUGINS"
-rm -rf "$QUOTA_PLUGINS"
+HOME_DIR="$(resolve_hermes_root)"
+export HERMES_HOME="$HOME_DIR"
+QUOTA_PLUGIN="$HOME_DIR/plugins/quota"
+QUOTA_DESKTOP="$HOME_DIR/desktop-plugins/quota"
 
-echo "==> Removing desktop widget: $QUOTA_DESKTOP"
-rm -rf "$QUOTA_DESKTOP"
-
-echo "==> Disabling backend plugin 'quota'"
-if command -v hermes >/dev/null 2>&1; then
-  hermes plugins disable quota 2>/dev/null || true
+if ! command -v hermes >/dev/null 2>&1; then
+  echo "Cannot uninstall safely: 'hermes' is not on PATH; no changes were made." >&2
+  exit 2
+fi
+python_works() {
+  command -v "$1" >/dev/null 2>&1 &&
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
+}
+if python_works python; then
+  PYTHON_BIN=python
+elif python_works python3; then
+  PYTHON_BIN=python3
+else
+  echo "Cannot uninstall safely: no working Python 3.9+ interpreter was found; no changes were made." >&2
+  exit 2
 fi
 
-echo
-echo "✅ Quota plugin removed."
-echo "   Restart Hermes Desktop (or ⌘K → 'Reload desktop plugins')."
+normalize_list() {
+  "$PYTHON_BIN" -c 'import json,sys; v=json.load(sys.stdin); v=[] if v is None else v; isinstance(v,list) or (_ for _ in ()).throw(ValueError("expected JSON list")); print(json.dumps(v))'
+}
+
+remove_quota() {
+  "$PYTHON_BIN" -c 'import json,sys; v=json.load(sys.stdin); print(json.dumps([x for x in v if x != "quota"]))'
+}
+
+config_get_state() {
+  local profile="$1" key="$2" raw normalized
+  local -a args=()
+  [ -z "$profile" ] || args=(-p "$profile")
+  if raw="$(hermes "${args[@]}" config get "$key" --json 2>&1)"; then
+    if ! normalized="$(printf '%s' "$raw" | normalize_list)"; then
+      echo "Invalid $key${profile:+ for profile $profile}; expected a JSON list; no changes were made." >&2
+      return 1
+    fi
+    printf '1\t%s\n' "$normalized"
+  elif [[ "$raw" == "Config key not set: $key"* ]]; then
+    printf '0\t[]\n'
+  else
+    echo "Failed to read $key${profile:+ for profile $profile}; no changes were made." >&2
+    return 1
+  fi
+}
+
+config_set_list() {
+  local profile="$1" key="$2" value="$3"
+  local -a args=()
+  [ -z "$profile" ] || args=(-p "$profile")
+  hermes "${args[@]}" config set "$key" "$value" >/dev/null
+}
+
+config_unset() {
+  local profile="$1" key="$2"
+  local -a args=()
+  [ -z "$profile" ] || args=(-p "$profile")
+  hermes "${args[@]}" config unset "$key" >/dev/null
+}
+
+config_apply() {
+  local profile="$1" key="$2" was_present="$3" desired="$4"
+  if [ "$was_present" = 0 ] && [ "$desired" = '[]' ]; then
+    return 0
+  fi
+  config_set_list "$profile" "$key" "$desired"
+}
+
+config_restore() {
+  local profile="$1" key="$2" was_present="$3" value="$4"
+  if [ "$was_present" = 1 ]; then
+    config_set_list "$profile" "$key" "$value"
+  else
+    config_unset "$profile" "$key"
+  fi
+}
+
+profiles=("")
+if [ -d "$HOME_DIR/profiles" ]; then
+  for profile_dir in "$HOME_DIR"/profiles/*; do
+    [ -d "$profile_dir" ] || continue
+    profiles+=("$(basename "$profile_dir")")
+  done
+fi
+
+before_enabled_present=()
+before_disabled_present=()
+before_enabled=()
+before_disabled=()
+desired_enabled=()
+desired_disabled=()
+for profile in "${profiles[@]}"; do
+  enabled_state="$(config_get_state "$profile" plugins.enabled)"
+  disabled_state="$(config_get_state "$profile" plugins.disabled)"
+  enabled_present="${enabled_state%%$'\t'*}"
+  disabled_present="${disabled_state%%$'\t'*}"
+  enabled="${enabled_state#*$'\t'}"
+  disabled="${disabled_state#*$'\t'}"
+  before_enabled_present+=("$enabled_present")
+  before_disabled_present+=("$disabled_present")
+  before_enabled+=("$enabled")
+  before_disabled+=("$disabled")
+  desired_enabled+=("$(printf '%s' "$enabled" | remove_quota)")
+  desired_disabled+=("$(printf '%s' "$disabled" | remove_quota)")
+done
+
+mkdir -p "$HOME_DIR"
+STAGE_DIR="$(mktemp -d "$HOME_DIR/.quota-uninstall.XXXXXX")"
+trap 'rm -rf "$STAGE_DIR" || true' EXIT
+BACKUP_PLUGIN="$STAGE_DIR/plugin"
+BACKUP_DESKTOP="$STAGE_DIR/desktop"
+PLUGIN_BACKED_UP=0
+DESKTOP_BACKED_UP=0
+CONFIG_APPLIED=0
+
+rollback() {
+  status=$?
+  trap - ERR
+  set +e
+
+  i=0
+  while [ "$i" -lt "$CONFIG_APPLIED" ]; do
+    config_restore "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${before_enabled[$i]}" || true
+    config_restore "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${before_disabled[$i]}" || true
+    i=$((i + 1))
+  done
+  if [ "$PLUGIN_BACKED_UP" -eq 1 ]; then
+    [ ! -e "$QUOTA_PLUGIN" ] || rm -rf "$QUOTA_PLUGIN"
+    mv "$BACKUP_PLUGIN" "$QUOTA_PLUGIN" || true
+  fi
+  if [ "$DESKTOP_BACKED_UP" -eq 1 ]; then
+    [ ! -e "$QUOTA_DESKTOP" ] || rm -rf "$QUOTA_DESKTOP"
+    mv "$BACKUP_DESKTOP" "$QUOTA_DESKTOP" || true
+  fi
+  echo "Quota uninstall failed; previous files and configuration were restored where possible." >&2
+  exit "$status"
+}
+trap rollback ERR
+
+if [ -e "$QUOTA_PLUGIN" ]; then
+  mv "$QUOTA_PLUGIN" "$BACKUP_PLUGIN"
+  PLUGIN_BACKED_UP=1
+fi
+if [ -e "$QUOTA_DESKTOP" ]; then
+  mv "$QUOTA_DESKTOP" "$BACKUP_DESKTOP"
+  DESKTOP_BACKED_UP=1
+fi
+
+for i in "${!profiles[@]}"; do
+  CONFIG_APPLIED=$((i + 1))
+  config_apply "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${desired_enabled[$i]}"
+  config_apply "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${desired_disabled[$i]}"
+done
+
+trap - ERR
+if ! rm -rf "$BACKUP_PLUGIN" "$BACKUP_DESKTOP"; then
+  echo "Warning: uninstall succeeded, but a temporary backup could not be removed: $STAGE_DIR" >&2
+fi
+
+printf '\nQuota plugin removed from %s\n' "$HOME_DIR"
+printf '%s\n' 'Close every Hermes Desktop window, then reopen the app to unmount the Python backend.'

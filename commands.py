@@ -22,8 +22,10 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .quota_cache import read_quota_cache, quota_cache_age_seconds, refresh_quota_cache
+from .quota_providers import PROVIDER_FETCHERS
 
 _CACHE_MAX_AGE_S = 60 * 30
+_PROVIDER_IDS = tuple(PROVIDER_FETCHERS)
 
 QUOTA_HELP = (
     "**/quota** — per-provider quota / rate-limit status\n"
@@ -153,6 +155,8 @@ def setup_argparse(subparser):
     subs.add_parser("refresh", help="Force a re-fetch of all providers")
     prov = subs.add_parser("provider", help="Show quota for one provider")
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
+    for provider_id in _PROVIDER_IDS:
+        subs.add_parser(provider_id, help=f"Show quota for {provider_id}")
     subparser.set_defaults(func=_handle_cli)
 
 
@@ -164,5 +168,8 @@ def _handle_cli(args):
         return
     if cmd == "provider":
         print(_render_quota(getattr(args, "name", None)))
+        return
+    if cmd in _PROVIDER_IDS:
+        print(_render_quota(cmd))
         return
     print(_render_quota(None))

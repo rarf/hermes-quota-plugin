@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -20,6 +21,30 @@ _BROWSER_UA = (
 
 _SESSION_PATH = os.path.join(os.path.expanduser("~"), "grok_session.json")
 _RAW_DEBUG_PATH = os.path.join(os.path.expanduser("~"), "grok_last_response.bin")
+
+
+def _write_private_debug(path: str, raw: bytes) -> None:
+    """Atomically replace a private debug file without following target symlinks."""
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    prefix = f".{os.path.basename(path)}."
+    fd, temp_path = tempfile.mkstemp(prefix=prefix, dir=parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _load_cookies() -> Optional[str]:
@@ -157,11 +182,11 @@ def fetch_grok_quota() -> QuotaResult:
         return build_unavailable("grok", f"http-{e.code}")
     except Exception as e:
         return build_unavailable("grok", f"fetch-error:{type(e).__name__}")
-    try:
-        with open(_RAW_DEBUG_PATH, "wb") as fh:
-            fh.write(raw)
-    except Exception:
-        pass
+    if os.environ.get("HERMES_QUOTA_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            _write_private_debug(_RAW_DEBUG_PATH, raw)
+        except Exception:
+            pass
     result = _parse_grok_protobuf(raw)
     if result is None:
         return build_unavailable("grok", "parse-pending")
