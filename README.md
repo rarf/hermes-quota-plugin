@@ -274,6 +274,7 @@ dashboard/plugin_api.py           authenticated Desktop API
 dashboard/manifest.json           dashboard API manifest
 desktop/plugin.js                 native Desktop widget
 scripts/hermes-home.sh             shared platform path resolution
+scripts/hermes-config.sh           shared config transaction helpers
 scripts/import-grok-cookies.ps1   manual Grok cookie fallback
 ```
 

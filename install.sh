@@ -5,6 +5,7 @@ set -Eeuo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/hermes-home.sh
 source "$REPO_ROOT/scripts/hermes-home.sh"
+source "$REPO_ROOT/scripts/hermes-config.sh"
 
 HOME_DIR="$(resolve_hermes_root)"
 export HERMES_HOME="$HOME_DIR"
@@ -14,7 +15,7 @@ DESKTOP_DIR="$HOME_DIR/desktop-plugins/quota"
 for required in \
   plugin.yaml __init__.py commands.py quota_cache.py quota_providers \
   dashboard/plugin_api.py dashboard/manifest.json desktop/plugin.js \
-  scripts/hermes-home.sh; do
+  scripts/hermes-home.sh scripts/hermes-config.sh; do
   [ -e "$REPO_ROOT/$required" ] || {
     echo "Missing required file: $required" >&2
     exit 1
@@ -25,18 +26,7 @@ if ! command -v hermes >/dev/null 2>&1; then
   echo "Cannot install safely: 'hermes' is not on PATH." >&2
   exit 2
 fi
-python_works() {
-  command -v "$1" >/dev/null 2>&1 &&
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
-}
-if python_works python; then
-  PYTHON_BIN=python
-elif python_works python3; then
-  PYTHON_BIN=python3
-else
-  echo "Cannot install safely: no working Python 3.9+ interpreter was found." >&2
-  exit 2
-fi
+hermes_config_init_python || exit $?
 
 mkdir -p "$HOME_DIR" "$HOME_DIR/plugins" "$HOME_DIR/desktop-plugins"
 STAGE_DIR="$(mktemp -d "$HOME_DIR/.quota-install.XXXXXX")"
@@ -138,8 +128,8 @@ before_disabled=()
 desired_enabled=()
 desired_disabled=()
 for profile in "${profiles[@]}"; do
-  enabled_state="$(config_get_state "$profile" plugins.enabled)"
-  disabled_state="$(config_get_state "$profile" plugins.disabled)"
+  enabled_state="$(hermes_config_get_state "$profile" plugins.enabled)"
+  disabled_state="$(hermes_config_get_state "$profile" plugins.disabled)"
   enabled_present="${enabled_state%%$'\t'*}"
   disabled_present="${disabled_state%%$'\t'*}"
   enabled="${enabled_state#*$'\t'}"
@@ -148,8 +138,8 @@ for profile in "${profiles[@]}"; do
   before_disabled_present+=("$disabled_present")
   before_enabled+=("$enabled")
   before_disabled+=("$disabled")
-  desired_enabled+=("$(printf '%s' "$enabled" | mutate_list add)")
-  desired_disabled+=("$(printf '%s' "$disabled" | mutate_list remove)")
+  desired_enabled+=("$(printf '%s' "$enabled" | hermes_config_add_quota)")
+  desired_disabled+=("$(printf '%s' "$disabled" | hermes_config_remove_quota)")
 done
 
 CONFIG_APPLIED=0
@@ -170,8 +160,8 @@ rollback() {
 
   i=0
   while [ "$i" -lt "$CONFIG_APPLIED" ]; do
-    config_restore "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${before_enabled[$i]}" || true
-    config_restore "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${before_disabled[$i]}" || true
+    hermes_config_restore "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${before_enabled[$i]}" || true
+    hermes_config_restore "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${before_disabled[$i]}" || true
     i=$((i + 1))
   done
   echo "Quota installation failed; previous files and configuration were restored where possible." >&2
@@ -181,8 +171,8 @@ trap rollback ERR
 
 for i in "${!profiles[@]}"; do
   CONFIG_APPLIED=$((i + 1))
-  config_apply "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${desired_enabled[$i]}"
-  config_apply "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${desired_disabled[$i]}"
+  hermes_config_apply "${profiles[$i]}" plugins.enabled "${before_enabled_present[$i]}" "${before_enabled[$i]}" "${desired_enabled[$i]}"
+  hermes_config_apply "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${before_disabled[$i]}" "${desired_disabled[$i]}"
 done
 
 if [ -e "$PLUGIN_DIR" ]; then
