@@ -55,64 +55,6 @@ rm -rf \
   "$STAGE_PLUGIN/dashboard/__pycache__" \
   "$STAGE_PLUGIN/quota_providers/__pycache__"
 
-normalize_list() {
-  "$PYTHON_BIN" -c 'import json,sys; v=json.load(sys.stdin); v=[] if v is None else v; isinstance(v,list) or (_ for _ in ()).throw(ValueError("expected JSON list")); print(json.dumps(v))'
-}
-
-mutate_list() {
-  local mode="$1"
-  "$PYTHON_BIN" -c 'import json,sys; mode=sys.argv[1]; v=json.load(sys.stdin); v=[x for x in v if x != "quota"]; print(json.dumps(v + (["quota"] if mode == "add" else [])))' "$mode"
-}
-
-config_get_state() {
-  local profile="$1" key="$2" raw normalized
-  local -a args=()
-  [ -z "$profile" ] || args=(-p "$profile")
-  if raw="$(hermes "${args[@]}" config get "$key" --json 2>&1)"; then
-    if ! normalized="$(printf '%s' "$raw" | normalize_list)"; then
-      echo "Invalid $key${profile:+ for profile $profile}; expected a JSON list; no changes were made." >&2
-      return 1
-    fi
-    printf '1\t%s\n' "$normalized"
-  elif [[ "$raw" == "Config key not set: $key"* ]]; then
-    printf '0\t[]\n'
-  else
-    echo "Failed to read $key${profile:+ for profile $profile}; no changes were made." >&2
-    return 1
-  fi
-}
-
-config_set_list() {
-  local profile="$1" key="$2" value="$3"
-  local -a args=()
-  [ -z "$profile" ] || args=(-p "$profile")
-  hermes "${args[@]}" config set "$key" "$value" >/dev/null
-}
-
-config_unset() {
-  local profile="$1" key="$2"
-  local -a args=()
-  [ -z "$profile" ] || args=(-p "$profile")
-  hermes "${args[@]}" config unset "$key" >/dev/null
-}
-
-config_apply() {
-  local profile="$1" key="$2" was_present="$3" desired="$4"
-  if [ "$was_present" = 0 ] && [ "$desired" = '[]' ]; then
-    return 0
-  fi
-  config_set_list "$profile" "$key" "$desired"
-}
-
-config_restore() {
-  local profile="$1" key="$2" was_present="$3" value="$4"
-  if [ "$was_present" = 1 ]; then
-    config_set_list "$profile" "$key" "$value"
-  else
-    config_unset "$profile" "$key"
-  fi
-}
-
 profiles=("")
 if [ -d "$HOME_DIR/profiles" ]; then
   for profile_dir in "$HOME_DIR"/profiles/*; do

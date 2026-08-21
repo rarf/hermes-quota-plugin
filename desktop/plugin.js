@@ -2,7 +2,9 @@
  * Hermes desktop widget for the `quota` plugin.
  *
  * Statusbar (style inspired by CodexBar):
- *   * a single chip: worst remaining % across providers + tonal bar.
+ *   * default: one chip per configured provider, side by side, each with its
+ *     own popover (per-window % + reset). "Worst only" mode falls back to the
+ *     single worst-remaining-% chip + tonal bar.
  *   * hover gives a button-like affordance; click opens the /quota route
  *     (full provider list with per-window % + reset breakdown).
  *   * respects the "Show status bar" setting; docked pane off by default.
@@ -154,6 +156,21 @@ function setShowDockedPane(v) {
   }
 }
 
+// statusbarMode: 'all' renders every configured provider side by side;
+// 'worst' renders the single worst-provider chip (previous behaviour).
+const STATUSBAR_MODE_KEY = 'statusbarMode'
+const STATUSBAR_MODE_DEFAULT = 'all'
+
+const statusbarModeAtom = atom(STATUSBAR_MODE_DEFAULT)
+
+function applyStoredStatusbarMode() {
+  applyStored(STATUSBAR_MODE_KEY, statusbarModeAtom, ['all', 'worst'], STATUSBAR_MODE_DEFAULT)
+}
+
+function setStatusbarMode(mode) {
+  setStored(STATUSBAR_MODE_KEY, mode, statusbarModeAtom)
+}
+
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
 const REFRESH_INTERVAL_KEY = 'refreshInterval'
 const REFRESH_INTERVAL_DEFAULT = 60
@@ -188,6 +205,7 @@ function applyStoredAll() {
   applyStoredResetFormat()
   applyStoredShowUnconfigured()
   applyStoredSurfaceVisibility()
+  applyStoredStatusbarMode()
   applyStoredRefreshInterval()
 }
 
@@ -515,10 +533,23 @@ function QuotaChipWithBar() {
 }
 
 function StatusBar() {
-  // Final: click chip → /quota route. Respects the "Show status bar" setting.
+  // 'all' → one chip per configured provider, side by side, each with its own
+  // popover (per-window % + reset). 'worst' → the previous single worst chip.
+  // Both respect the "Show status bar" setting.
   const showStatusBar = useValue(showStatusBarAtom)
+  const mode = useValue(statusbarModeAtom)
+  const showUnconfigured = useValue(showUnconfiguredAtom)
+  const { data, isError } = useQuota()
   if (!showStatusBar) return null
-  return jsx(QuotaChipWithBar, {})
+  if (mode === 'worst') return jsx(QuotaChipWithBar, {})
+  if (isError || !data || !data.providers) return jsx(StatusDot, { tone: 'muted' })
+  const entries = Object.entries(data.providers).filter(([, p]) => showUnconfigured || isConfigured(p))
+  if (entries.length === 0) return jsx(StatusDot, { tone: 'muted' })
+  return jsx(
+    'div',
+    { className: 'flex h-full items-center' },
+    entries.map(([pid, p]) => jsx(ProviderItem, { pid, provider: p, key: pid }))
+  )
 }
 
 // ---- pane -----------------------------------------------------------------
@@ -695,12 +726,32 @@ function RefreshIntervalControl() {
   })
 }
 
+function StatusbarModeControl() {
+  const t = usePluginI18n(ID)
+  const mode = useValue(statusbarModeAtom)
+  return jsxs('div', {
+    className: 'flex items-center justify-between gap-2',
+    children: [
+      jsx('span', { className: 'text-xs text-(--ui-text-secondary)', children: t('statusbarModeLabel') }),
+      jsx(SegmentedControl, {
+        value: mode,
+        onChange: (v) => setStatusbarMode(v),
+        options: [
+          { id: 'all', label: t('statusbarModeAll') },
+          { id: 'worst', label: t('statusbarModeWorst') },
+        ],
+      }),
+    ],
+  })
+}
+
 function QuotaSettings() {
   const t = usePluginI18n(ID)
   return jsxs('div', {
     className: 'flex flex-col gap-3 overflow-y-auto py-1',
     children: [
       jsx(ShowStatusBarControl, {}),
+      jsx(StatusbarModeControl, {}),
       jsx(ShowDockedPaneControl, {}),
       jsx(ResetFormatControl, {}),
       jsx(ShowUnconfiguredControl, {}),
@@ -838,6 +889,9 @@ export default {
         relative: 'Relative',
         absolute: 'Absolute',
         showUnconfiguredLabel: 'Show unconfigured',
+        statusbarModeLabel: 'Status bar mode',
+        statusbarModeAll: 'All providers',
+        statusbarModeWorst: 'Worst only',
         showStatusBarLabel: 'Show status bar indicator',
         showStatusBarHint: 'The Hermes status bar must also be visible (⌘K → Toggle status bar).',
         showDockedPaneLabel: 'Show docked quota pane',

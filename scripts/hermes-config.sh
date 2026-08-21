@@ -33,13 +33,13 @@ hermes_config_get_state() {
   local profile="$1" key="$2" raw normalized
   local -a args=()
   [ -z "$profile" ] || args=(-p "$profile")
-  if raw="$(hermes "${args[@]}" config get "$key" --json 2>&1)"; then
+  if raw="$(hermes "${args[@]}" config get "$key" --json 2>/dev/null)"; then
     if ! normalized="$(printf '%s' "$raw" | hermes_config_normalize_list)"; then
       echo "Invalid $key${profile:+ for profile $profile}; expected a JSON list; no changes were made." >&2
       return 1
     fi
     printf '1\t%s\n' "$normalized"
-  elif [[ "$raw" == "Config key not set: $key"* ]]; then
+  elif raw="$(hermes "${args[@]}" config get "$key" --json 2>&1)"; [[ "$raw" == *"Config key not set: $key"* ]]; then
     printf '0\t[]\n'
   else
     echo "Failed to read $key${profile:+ for profile $profile}; no changes were made." >&2

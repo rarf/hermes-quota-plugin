@@ -1,5 +1,5 @@
 name: quota
-version: 1.0.1
+version: 1.1.0
 description: "Per-provider quota / rate-limit footer + /quota command. Contributes a 📊 quota block to the runtime footer (via the 'footer' lifecycle hook) and a per-provider quota breakdown to /usage (via the 'usage_extra' hook), and registers a /quota slash command for on-demand detail. Reuses the precomputed quota_cache.json so the footer/command never do network I/O inline."
 author: rarf
 kind: standalone
