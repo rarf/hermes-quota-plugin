@@ -195,4 +195,39 @@ def fetch_grok_quota() -> QuotaResult:
 
 from .registry import register as _register  # noqa: E402
 
-_register("grok")(fetch_grok_quota)
+# Grok is opt-in: reads browser cookies (Firefox grok.com), which is the only
+# path we have right now and is sensitive. Disabled by default; enable with:
+#   hermes config set plugins.entries.quota.settings.grokEnabled true
+import os as _os
+
+# Resolve opt-in from plugin config (set via `hermes config set ...`), falling
+# back to the HERMES_QUOTA_GROK_ENABLED env var. Config wins so the UI toggle
+# and CLI config are the single source of truth.
+def _grok_enabled() -> bool:
+    val = _os.environ.get("HERMES_QUOTA_GROK_ENABLED", "").strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        plugins = cfg.get("plugins") if isinstance(cfg, dict) else None
+        entries = plugins.get("entries") if isinstance(plugins, dict) else None
+        entry = entries.get("quota") if isinstance(entries, dict) else None
+        if isinstance(entry, dict):
+            settings = entry.get("settings")
+            if isinstance(settings, dict) and "grokEnabled" in settings:
+                return bool(settings.get("grokEnabled"))
+    except Exception:
+        pass
+    return False
+
+
+def _fetch_grok_optin() -> Optional["QuotaResult"]:
+    if not _grok_enabled():
+        return build_unavailable("grok", "opt-in-disabled")
+    return fetch_grok_quota()
+
+
+_register("grok")(_fetch_grok_optin)

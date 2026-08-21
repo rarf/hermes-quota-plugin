@@ -18,10 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .quota_cache import read_quota_cache, quota_cache_age_seconds
+from .quota_cache import read_quota_cache, quota_cache_age_seconds, MAX_AGE_S
 from . import commands
-
-_CACHE_MAX_AGE_S = 60 * 30
 
 
 def _format_quota_block(quota_cache: dict[str, Any]) -> str:
@@ -65,7 +63,7 @@ def footer_segment(**kwargs: Any) -> Optional[str]:
     it after the built-in model / context / cwd fields.
     """
     try:
-        if (quota_cache_age_seconds() or 10**9) <= _CACHE_MAX_AGE_S:
+        if (quota_cache_age_seconds() or 10**9) <= MAX_AGE_S:
             return _format_quota_block(read_quota_cache())
     except Exception:
         pass
@@ -81,7 +79,7 @@ def usage_extra(**kwargs: Any) -> Optional[str]:
     (matching the contract other ``usage_extra`` hooks follow).
     """
     try:
-        if (quota_cache_age_seconds() or 10**9) <= _CACHE_MAX_AGE_S:
+        if (quota_cache_age_seconds() or 10**9) <= MAX_AGE_S:
             block = _format_quota_block(read_quota_cache())
             if block:
                 return block

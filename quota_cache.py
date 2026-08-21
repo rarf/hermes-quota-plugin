@@ -51,7 +51,8 @@ logger = logging.getLogger(__name__)
 
 _CACHE_FILENAME = "quota_cache.json"
 _CACHE_LOCK = threading.Lock()
-_MAX_AGE_S = 60 * 30  # 30 minutes — footer drops stale data
+# 30 minutes — footer drops stale data. Also used by CLI/quota command for staleness.
+MAX_AGE_S = 60 * 30
 
 
 def _cache_path() -> str:
@@ -92,6 +93,7 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
         "label": res.label,
         "plan": res.plan,
         "unavailable_reason": res.unavailable_reason,
+        "details": list(res.details or []),
         "windows": [
             {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
             for w in res.windows
@@ -115,6 +117,7 @@ def refresh_quota_cache(*, timeout: float = 12.0) -> dict[str, Any]:
                     "label": provider_id,
                     "plan": None,
                     "unavailable_reason": "no-data",
+                    "details": [],
                     "windows": [],
                 }
             else:
@@ -125,6 +128,7 @@ def refresh_quota_cache(*, timeout: float = 12.0) -> dict[str, Any]:
                 "label": provider_id,
                 "plan": None,
                 "unavailable_reason": "fetch-error",
+                "details": [],
                 "windows": [],
             }
 
@@ -145,7 +149,7 @@ def refresh_quota_cache(*, timeout: float = 12.0) -> dict[str, Any]:
 
 def is_fresh() -> bool:
     age = quota_cache_age_seconds()
-    return age is not None and age <= _MAX_AGE_S
+    return age is not None and age <= MAX_AGE_S
 
 
 if __name__ == "__main__":

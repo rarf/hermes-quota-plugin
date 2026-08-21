@@ -14,7 +14,7 @@ DESKTOP_DIR="$HOME_DIR/desktop-plugins/quota"
 
 for required in \
   plugin.yaml __init__.py commands.py quota_cache.py quota_providers \
-  dashboard/plugin_api.py dashboard/manifest.json desktop/plugin.js \
+  desktop/plugin.js \
   scripts/hermes-home.sh scripts/hermes-config.sh; do
   [ -e "$REPO_ROOT/$required" ] || {
     echo "Missing required file: $required" >&2
@@ -39,7 +39,7 @@ mkdir -p "$STAGE_PLUGIN" "$STAGE_DESKTOP"
 
 for item in \
   plugin.yaml __init__.py commands.py quota_cache.py quota_providers \
-  dashboard LICENSE SPEC.md scripts; do
+  LICENSE scripts; do
   [ -e "$REPO_ROOT/$item" ] && cp -R "$REPO_ROOT/$item" "$STAGE_PLUGIN/"
 done
 cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"
@@ -47,12 +47,11 @@ cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"
 (
   cd "$STAGE_PLUGIN"
   "$PYTHON_BIN" -m py_compile \
-    __init__.py commands.py quota_cache.py dashboard/plugin_api.py \
+    __init__.py commands.py quota_cache.py \
     quota_providers/*.py
 )
 rm -rf \
   "$STAGE_PLUGIN/__pycache__" \
-  "$STAGE_PLUGIN/dashboard/__pycache__" \
   "$STAGE_PLUGIN/quota_providers/__pycache__"
 
 profiles=("")
@@ -67,6 +66,7 @@ before_enabled_present=()
 before_disabled_present=()
 before_enabled=()
 before_disabled=()
+
 desired_enabled=()
 desired_disabled=()
 for profile in "${profiles[@]}"; do
@@ -138,5 +138,5 @@ fi
 
 printf '\nQuota plugin installed in %s\n' "$HOME_DIR"
 printf '%s\n' 'IMPORTANT: close every Hermes Desktop window, then reopen the app.'
-printf '%s\n' 'Reload desktop plugins refreshes JavaScript only; it does not remount dashboard/plugin_api.py.'
+printf '%s\n' 'Desktop widget reloads on save; the backend is loaded at process start.'
 printf '%s\n' 'Verify with: hermes plugins doctor quota && hermes quota refresh && hermes quota status'

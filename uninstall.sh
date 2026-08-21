@@ -30,6 +30,7 @@ before_enabled_present=()
 before_disabled_present=()
 before_enabled=()
 before_disabled=()
+
 desired_enabled=()
 desired_disabled=()
 for profile in "${profiles[@]}"; do

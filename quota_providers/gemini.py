@@ -17,38 +17,16 @@ _QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _CREDS_PATH = os.path.join(os.path.expanduser("~"), ".gemini", "oauth_creds.json")
 
+# Google's public client id/secret for the Gemini CLI (same values the CLI uses
+# for the local OAuth flow). Hardcoded on purpose: this is not a secret — it is
+# shipped in the Gemini CLI bundle and only unlocks the user's own refresh token.
+_GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+_GEMINI_CLIENT_SECRET = "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R"
+
 
 def _b64urldecode(s: str) -> dict:
     pad = "=" * (-len(s) % 4)
     return json.loads(base64.urlsafe_b64decode(s + pad).decode("utf-8", "replace"))
-
-
-def _extract_client_from_js() -> tuple[Optional[str], Optional[str]]:
-    import subprocess
-
-    try:
-        out = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=10)
-        npm_root = out.stdout.strip()
-    except Exception:
-        npm_root = ""
-    if not npm_root:
-        return None, None
-    candidates = []
-    for root, _dirs, files in os.walk(npm_root):
-        if os.path.basename(root) == "code_assist":
-            candidates.append(os.path.join(root, "oauth2.js"))
-    for c in candidates:
-        try:
-            txt = open(c, "r", encoding="utf-8", errors="replace").read()
-        except Exception:
-            continue
-        import re
-
-        m = re.findall(r'OAUTH_CLIENT_ID\s*=\s*["\']([^"\']+)["\']', txt)
-        s = re.findall(r'OAUTH_CLIENT_SECRET\s*=\s*["\']([^"\']+)["\']', txt)
-        if m and s:
-            return m[0], s[0]
-    return None, None
 
 
 def _load_creds() -> Optional[dict]:
@@ -60,10 +38,8 @@ def _load_creds() -> Optional[dict]:
 
 
 def _refresh(creds: dict) -> Optional[str]:
-    cid = os.environ.get("GEMINI_OAUTH_CLIENT_ID")
-    csec = os.environ.get("GEMINI_OAUTH_CLIENT_SECRET")
-    if not (cid and csec):
-        cid, csec = _extract_client_from_js()
+    cid = os.environ.get("GEMINI_OAUTH_CLIENT_ID", _GEMINI_CLIENT_ID)
+    csec = os.environ.get("GEMINI_OAUTH_CLIENT_SECRET", _GEMINI_CLIENT_SECRET)
     rt = creds.get("refresh_token")
     if not (cid and csec and rt):
         return None

@@ -33,9 +33,12 @@ class QuotaResult:
     windows: list[QuotaWindow] = field(default_factory=list)
     plan: Optional[str] = None
     unavailable_reason: Optional[str] = None
+    # Extra provider facts shown under the windows in the widget (e.g. Codex
+    # "Credits balance: $12.50", "You have 2 resets banked").
+    details: list[str] = field(default_factory=list)
 
     def has_data(self) -> bool:
-        return bool(self.windows) and self.unavailable_reason is None
+        return (bool(self.windows) or bool(self.details)) and self.unavailable_reason is None
 
 
 def build_unavailable(label: str, reason: str) -> QuotaResult:
