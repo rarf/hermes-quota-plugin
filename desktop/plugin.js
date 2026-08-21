@@ -291,6 +291,7 @@ const PROVIDER_META = {
 	gemini: { name: "Google Gemini", mono: "G" },
 	kimi: { name: "Kimi / Moonshot", mono: "K" },
 	grok: { name: "xAI Grok", mono: "X" },
+	"opencode-go": { name: "OpenCode Go", mono: "OC" },
 };
 
 function providerMeta(pid) {

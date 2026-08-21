@@ -23,14 +23,23 @@ network I/O of its own; it reads a local cache the backend refreshes on demand.
 
 ## Supported providers
 
-`anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`, plus
-`grok` (opt-in). Each fetcher is fail-open: a broken provider shows
-`unavailable (<reason>)` and never blocks the rest.
+`anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`,
+`opencode-go`, plus `grok` (opt-in). Each fetcher is fail-open: a broken
+provider shows `unavailable (<reason>)` and never blocks the rest.
 
 The OpenAI Codex fetcher goes beyond the core: it parses
 `additional_rate_limits` to surface **per-model Spark limits**
 (`5.3 Codex Spark · 5h`, `5.3 Codex Spark · Weekly`) that would otherwise
 stay hidden.
+
+### OpenCode Go
+
+Provider fetcher for [OpenCode Go](https://opencode.ai/docs/go) ($10/month
+subscription; 5-hour / Weekly / Monthly usage windows). Reads the Zen usage
+endpoint (`GET https://opencode.ai/zen/go/v1/usage`) with your API key — set
+`OPENCODE_API_KEY`, or just run `opencode auth login` once and the key is
+picked up from OpenCode's local auth file. Then `hermes quota opencode-go`.
+No network auth is performed; see `quota_providers/opencode_go.py`.
 
 ## Grok is opt-in
 

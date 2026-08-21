@@ -21,6 +21,7 @@ from . import grok  # noqa: F401
 from . import builtin  # noqa: F401
 from . import kimi  # noqa: F401
 from . import gemini  # noqa: F401
+from . import opencode_go  # noqa: F401
 
 __all__ = [
     "PROVIDER_FETCHERS",
