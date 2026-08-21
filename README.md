@@ -1,32 +1,44 @@
 # Hermes Quota
 
-Status-bar quota indicator, a native **Quota** page in Hermes Desktop, `hermes quota`
-in the terminal, and `/quota` inside chats. Reads a precomputed local cache — the
-UI never does network I/O, and quota checks never piggyback on agent responses.
+Live quota indicator for Hermes Desktop — a **status-bar chip** and a **Quota
+pane** in the sidebar, fed by `hermes quota status --json`. The UI never does
+network I/O of its own; it reads a local cache the backend refreshes on demand.
+
+![Quota pane and status bar](docs/images/quota-pane.png)
 
 ## What you get
 
-- **Status bar:** worst provider + bar, or all providers side by side. Toggle in Settings.
-- **Quota page & sidebar:** per-window remaining % and reset time for every provider.
-- **Cherry-pick providers:** in Quota Settings, click a provider to hide it. Your
-  choice is local and persists. Want to drop OpenRouter? One click.
-- **Slash + CLI:** `/quota`, `/quota refresh`, `/quota <provider>`; and
-  `hermes quota`, `hermes quota refresh`, `hermes quota provider <name>`.
+- **Status bar (bottom-right):** a compact chip with your lowest remaining
+  quota. Hover it for a full breakdown of **every provider and every window**
+  (Session, Spark 5h, Spark Weekly…) with `% left` and time-to-reset. Toggle
+  between *worst only* and *all providers* in Settings.
+- **Quota pane (sidebar):** one card per provider with the official brand
+  icon, a tonal progress bar, the plan badge, and detail lines (credits,
+  banked resets). Providers without data collapse into a quiet "No data"
+  section — the default view shows only providers with live numbers.
+- **Cherry-pick providers:** in Quota Settings, toggle any provider on or off.
+  Your choice is local and persists.
+- **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota status [--json]`,
+  `hermes quota provider <name>`.
 
 ## Supported providers
 
-anthropic, openai-codex, nous, openrouter, gemini, kimi (CLI or Coding Plan key),
-plus the API-key providers the fetchers already read from Hermes env (see below).
-Each fetcher is fail-open: a broken provider shows `unavailable (<reason>)` and
-never blocks the rest.
+`anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`, plus
+`grok` (opt-in). Each fetcher is fail-open: a broken provider shows
+`unavailable (<reason>)` and never blocks the rest.
+
+The OpenAI Codex fetcher goes beyond the core: it parses
+`additional_rate_limits` to surface **per-model Spark limits**
+(`5.3 Codex Spark · 5h`, `5.3 Codex Spark · Weekly`) that would otherwise
+stay hidden.
 
 ## Grok is opt-in
 
-Grok is the only provider we read from your browser (Firefox `grok.com` cookies) —
+Grok is the only provider read from your browser (Firefox `grok.com` cookies) —
 there is no clean API path right now. It is **disabled by default**. Turn it on:
 
 ```bash
-export HERMES_QUOTA_GROK_ENABLED=1   # or: hermes config set plugins.entries.quota.settings.grokEnabled true
+hermes config set plugins.entries.quota.settings.grokEnabled true
 hermes quota refresh
 ```
 
@@ -55,10 +67,12 @@ hermes plugins doctor quota && hermes quota refresh && hermes quota status
 ## Where the numbers come from
 
 Providers with a CLI or OAuth login (anthropic, openai-codex, gemini, kimi CLI)
-are read locally. API-key providers read `DEEPSEEK_API_KEY`, `OPENCODE_GO_API_KEY`,
-`OLLAMA_API_KEY`, `MINIMAX_API_KEY`, `NOVITA_API_KEY`, `DEEPINFRA_API_KEY`,
-`AI_GATEWAY_API_KEY`, `ZAI_API_KEY`/`GLM_API_KEY` from Hermes env. Refresh runs the
-fetchers and writes `$HERMES_HOME/quota_cache.json`; the UI reads that file.
+are read locally. Refresh runs the fetchers and writes `$HERMES_HOME/quota_cache.json`;
+the widget reads that file via `host.request('cli.exec', ['quota','status','--json'])`.
+
+> The usage APIs expose only `used_percent` and `reset_at` per window — not an
+> absolute cap. The plugin shows remaining **%** and **time-to-reset**, not a
+> token or dollar count.
 
 ## Privacy & safety
 
@@ -72,6 +86,7 @@ fetchers and writes `$HERMES_HOME/quota_cache.json`; the UI reads that file.
 ```bash
 bash -n install.sh uninstall.sh
 python -m py_compile __init__.py commands.py quota_cache.py quota_providers/*.py
+node --check desktop/plugin.js
 hermes plugins doctor quota
 hermes quota refresh
 ```
