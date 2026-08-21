@@ -14,6 +14,7 @@ from typing import Optional
 from .base import QuotaResult, QuotaWindow, build_unavailable
 
 _QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+_LOAD_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _CREDS_PATH = os.path.join(os.path.expanduser("~"), ".gemini", "oauth_creds.json")
 

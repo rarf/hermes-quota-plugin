@@ -1,6 +1,6 @@
 name: quota
-version: 2.0.0
-description: "Per-provider quota / rate-limit status via /quota command and desktop widget. Reads precomputed quota_cache.json so the widget never does network I/O. Cherry-pick providers in Settings. Grok via cookies is opt-in."
+version: 2.1.0
+description: "Per-provider quota / rate-limit status via /quota command and desktop widget. Reads precomputed quota_cache.json so the widget never does network I/O. Cherry-pick providers in Settings. Nous Portal works on free accounts; Gemini detects tier via loadCodeAssist; Grok uses the REST rate-limits endpoint. Pane detail: clean or dense."
 author: rarf
 kind: standalone
 provides_commands:

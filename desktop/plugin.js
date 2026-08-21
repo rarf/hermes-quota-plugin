@@ -171,6 +171,13 @@ const STATUSBAR_MODE_DEFAULT = "all";
 
 const statusbarModeAtom = atom(STATUSBAR_MODE_DEFAULT);
 
+// paneDetail: 'dense' shows every window, reset time and detail line per
+// provider; 'clean' collapses to just the percentage bars (label + % left).
+const PANE_DETAIL_KEY = "paneDetail";
+const PANE_DETAIL_DEFAULT = "dense";
+
+const paneDetailAtom = atom(PANE_DETAIL_DEFAULT);
+
 function applyStoredStatusbarMode() {
 	applyStored(
 		STATUSBAR_MODE_KEY,
@@ -182,6 +189,14 @@ function applyStoredStatusbarMode() {
 
 function setStatusbarMode(mode) {
 	setStored(STATUSBAR_MODE_KEY, mode, statusbarModeAtom);
+}
+
+function applyStoredPaneDetail() {
+	applyStored(PANE_DETAIL_KEY, paneDetailAtom, ["clean", "dense"], PANE_DETAIL_DEFAULT);
+}
+
+function setPaneDetail(mode) {
+	setStored(PANE_DETAIL_KEY, mode, paneDetailAtom);
 }
 
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
@@ -224,6 +239,7 @@ function applyStoredAll() {
 	applyStoredResetFormat();
 	applyStoredSurfaceVisibility();
 	applyStoredStatusbarMode();
+	applyStoredPaneDetail();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
 }
@@ -713,6 +729,10 @@ function QuotaBar({ value, tone }) {
 function ProviderRow({ id, provider }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
+	// 'dense' = every window, reset time and detail line; 'clean' = just the
+	// percentage bars (label + % left), no resets/details.
+	const paneDetail = useValue(paneDetailAtom);
+	const dense = paneDetail !== "clean";
 	const reason = provider.unavailable_reason;
 	const details = provider.details || [];
 	const displayName = providerMeta(id).name;
@@ -812,7 +832,7 @@ function ProviderRow({ id, provider }) {
 								],
 							}),
 							jsx(QuotaBar, { value: r, tone }),
-							w.reset_at
+							dense && w.reset_at
 								? jsx("div", {
 										className: "text-[0.6875rem] text-(--ui-text-quaternary)",
 										children: t("reset", formatReset(w.reset_at, resetFormat)),
@@ -823,16 +843,18 @@ function ProviderRow({ id, provider }) {
 					`${id}-w-${i}`,
 				);
 			}),
-			...details.map((d, i) =>
-				jsx(
-					"div",
-					{
-						className: "text-[0.6875rem] text-(--ui-text-tertiary)",
-						children: d,
-					},
-					`${id}-d-${i}`,
-				),
-			),
+			...(dense
+				? details.map((d, i) =>
+						jsx(
+							"div",
+							{
+								className: "text-[0.6875rem] text-(--ui-text-tertiary)",
+								children: d,
+							},
+							`${id}-d-${i}`,
+						),
+					)
+				: []),
 		],
 	});
 }
@@ -1037,6 +1059,28 @@ function DisabledProvidersControl() {
 	});
 }
 
+function PaneDetailControl() {
+	const t = usePluginI18n(ID);
+	const paneDetail = useValue(paneDetailAtom);
+	return jsxs("div", {
+		className: "flex items-center justify-between gap-2",
+		children: [
+			jsx("span", {
+				className: "text-xs text-(--ui-text-secondary)",
+				children: t("paneDetailLabel"),
+			}),
+			jsx(SegmentedControl, {
+				value: paneDetail,
+				onChange: (v) => setPaneDetail(v),
+				options: [
+					{ id: "clean", label: t("paneDetailClean") },
+					{ id: "dense", label: t("paneDetailDense") },
+				],
+			}),
+		],
+	});
+}
+
 function QuotaSettings() {
 	const t = usePluginI18n(ID);
 	return jsxs("div", {
@@ -1045,6 +1089,7 @@ function QuotaSettings() {
 			jsx(ShowStatusBarControl, {}),
 			jsx(StatusbarModeControl, {}),
 			jsx(ShowDockedPaneControl, {}),
+			jsx(PaneDetailControl, {}),
 			jsx(ResetFormatControl, {}),
 			jsx(RefreshIntervalControl, {}),
 			jsx(DisabledProvidersControl, {}),
@@ -1293,6 +1338,11 @@ export default {
 				statusbarModeLabel: "Status bar mode",
 				statusbarModeAll: "All providers",
 				statusbarModeWorst: "Worst only",
+				paneDetailLabel: "Pane detail",
+				paneDetailClean: "Clean",
+				paneDetailCleanHint: "Just the percentage bars",
+				paneDetailDense: "Dense",
+				paneDetailDenseHint: "Windows, resets and detail lines",
 				showStatusBarLabel: "Show status bar indicator",
 				showStatusBarHint:
 					"The Hermes status bar must also be visible (⌘K → Toggle status bar).",
