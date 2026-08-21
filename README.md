@@ -108,6 +108,16 @@ hermes quota provider grok   # one provider (explicit form)
 | Grok | Local Grok browser session → Grok billing endpoint |
 | Gemini | Gemini CLI OAuth credentials → Google quota endpoint |
 | Kimi | Local Kimi session credentials → Kimi usage endpoint |
+| OpenCode Go | `OPENCODE_API_KEY` or local OpenCode auth file → Zen Go usage endpoint |
+
+## OpenCode Go
+
+Provider fetcher for [OpenCode Go](https://opencode.ai/docs/go) ($10/month
+subscription; 5-hour / Weekly / Monthly usage windows). Reads the Zen usage
+endpoint (`GET https://opencode.ai/zen/go/v1/usage`) with your API key — set
+`OPENCODE_API_KEY`, or just run `opencode auth login` once and the key is
+picked up from OpenCode's local auth file. Then `hermes quota opencode-go`.
+No network auth is performed; see `quota_providers/opencode_go.py`.
 
 ## Cache and refresh behavior
 
