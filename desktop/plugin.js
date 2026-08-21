@@ -2,9 +2,7 @@
  * Hermes desktop widget for the `quota` plugin.
  *
  * Statusbar (style inspired by CodexBar):
- *   * default: one chip per configured provider, side by side, each with its
- *     own popover (per-window % + reset). "Worst only" mode falls back to the
- *     single worst-remaining-% chip + tonal bar.
+ *   * a single chip: worst remaining % across providers + tonal bar.
  *   * hover gives a button-like affordance; click opens the /quota route
  *     (full provider list with per-window % + reset breakdown).
  *   * respects the "Show status bar" setting; docked pane off by default.
@@ -532,10 +530,44 @@ function QuotaChipWithBar() {
   })
 }
 
+// ---- per-provider statusbar chip (plain chip, no popover) ------------------
+
+function ProviderChip({ pid, provider }) {
+  const r = worstWindow(provider)
+  const tone = toneForRemaining(r)
+  const dot =
+    tone === 'bad'
+      ? 'var(--ui-danger)'
+      : tone === 'warn'
+        ? 'var(--ui-warning, #d9a23a)'
+        : tone === 'good'
+          ? 'var(--ui-accent)'
+          : 'var(--ui-stroke-secondary)'
+  const label = provider.label || pid
+  return jsxs(
+    'button',
+    {
+      type: 'button',
+      title: `${label} · ${r == null ? '—' : `${r}%`}`,
+      className: cn(
+        'inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]',
+        'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors'
+      ),
+      onClick: () => {
+        if (typeof host.navigate === 'function') host.navigate('/quota')
+      },
+      children: [
+        jsx('span', { className: 'inline-block h-1.5 w-1.5 rounded-full', style: { background: dot } }),
+        jsx('span', { children: label }),
+        jsx('span', { className: 'tabular-nums', children: r == null ? '—' : `${r}%` }),
+      ],
+    }
+  )
+}
+
 function StatusBar() {
-  // 'all' → one chip per configured provider, side by side, each with its own
-  // popover (per-window % + reset). 'worst' → the previous single worst chip.
-  // Both respect the "Show status bar" setting.
+  // 'worst' → previous single worst chip + bar. 'all' → one plain chip per
+  // configured provider, side by side. Both respect "Show status bar".
   const showStatusBar = useValue(showStatusBarAtom)
   const mode = useValue(statusbarModeAtom)
   const showUnconfigured = useValue(showUnconfiguredAtom)
@@ -546,9 +578,8 @@ function StatusBar() {
   const entries = Object.entries(data.providers).filter(([, p]) => showUnconfigured || isConfigured(p))
   if (entries.length === 0) return jsx(StatusDot, { tone: 'muted' })
   return jsx(
-    'div',
-    { className: 'flex h-full items-center' },
-    entries.map(([pid, p]) => jsx(ProviderItem, { pid, provider: p, key: pid }))
+    'span',
+    { className: 'inline-flex h-full items-center', children: entries.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) }
   )
 }
 

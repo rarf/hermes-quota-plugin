@@ -90,7 +90,9 @@ hermes quota provider grok   # one provider (explicit form)
 
 ### Hermes Desktop
 
-- Click the quota indicator in the status bar to open the full page.
+- The status bar shows one chip per configured provider, side by side (dot +
+  label + worst remaining %). Click any chip to open the full page. Switch to
+  the single "worst provider" chip via **Quota → Settings → Status bar mode**.
 - Open **Quota** from the sidebar.
 - Use the page settings to show unconfigured providers, change reset formatting,
   adjust polling, or enable the optional docked pane.
