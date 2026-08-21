@@ -18,13 +18,15 @@ CLI:
 
 from __future__ import annotations
 
+import json
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from .quota_cache import read_quota_cache, quota_cache_age_seconds, refresh_quota_cache
+from .quota_cache import read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
 from .quota_providers import PROVIDER_FETCHERS
 
-_CACHE_MAX_AGE_S = 60 * 30
 _PROVIDER_IDS = tuple(PROVIDER_FETCHERS)
 
 QUOTA_HELP = (
@@ -65,7 +67,7 @@ def _age_label() -> str:
     age = quota_cache_age_seconds()
     if age is None:
         return "never fetched"
-    if age <= _CACHE_MAX_AGE_S:
+    if age <= MAX_AGE_S:
         return f"fetched {int(age // 60)}m ago"
     return f"stale ({int(age // 60)}m old)"
 
@@ -119,6 +121,18 @@ def _render_quota(provider_filter: Optional[str]) -> str:
     return "\n".join(lines)
 
 
+def _render_quota_json() -> str:
+    """Render the full quota cache as JSON for the desktop widget."""
+    cache = read_quota_cache()
+    # Ensure consistent shape for widget consumption
+    providers = cache.get("providers") or {}
+    out = {
+        "fetched_at": cache.get("fetched_at"),
+        "providers": providers,
+    }
+    return json.dumps(out, indent=2, sort_keys=True)
+
+
 def quota_command(raw_args: str) -> str:
     """In-session ``/quota`` slash command handler.
 
@@ -140,7 +154,7 @@ def quota_command(raw_args: str) -> str:
         # Anything else is treated as a provider filter.
         return _render_quota(sub)
     # Bare /quota: refresh if stale, then show.
-    if (quota_cache_age_seconds() or 10**9) > _CACHE_MAX_AGE_S:
+    if (quota_cache_age_seconds() or 10**9) > MAX_AGE_S:
         try:
             refresh_quota_cache()
         except Exception:
@@ -149,9 +163,24 @@ def quota_command(raw_args: str) -> str:
 
 
 # -- CLI command (hermes quota ...) -----------------------------------------
+
 def setup_argparse(subparser):
     subs = subparser.add_subparsers(dest="quota_command")
-    subs.add_parser("status", help="Show per-provider quota (default)")
+    status_p = subs.add_parser("status", help="Show per-provider quota (default)")
+    status_p.add_argument("--json", action="store_true", help="Emit raw JSON for the desktop widget")
+    status_p.add_argument(
+        "--version-json",
+        dest="version_json",
+        action="store_true",
+        help="Emit the installed build stamp (update self-check)",
+    )
+    status_p.add_argument(
+        "--max-age",
+        dest="max_age",
+        type=int,
+        default=None,
+        help="Refresh automatically when the cache is older than N seconds",
+    )
     subs.add_parser("refresh", help="Force a re-fetch of all providers")
     prov = subs.add_parser("provider", help="Show quota for one provider")
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
@@ -171,5 +200,27 @@ def _handle_cli(args):
         return
     if cmd in _PROVIDER_IDS:
         print(_render_quota(cmd))
+        return
+    if cmd == "status" and getattr(args, "json", False):
+        # Widget path: honor its poll cadence — refresh when the cache is
+        # older than the requested max age (defaults to MAX_AGE_S).
+        max_age = getattr(args, "max_age", None)
+        if max_age is None or max_age <= 0:
+            max_age = MAX_AGE_S
+        if (quota_cache_age_seconds() or 10**9) > max_age:
+            try:
+                refresh_quota_cache()
+            except Exception:
+                pass
+        print(_render_quota_json())
+        return
+    if cmd == "status" and getattr(args, "version_json", False):
+        # Update self-check: emit the installed build stamp so the widget can
+        # compare it against GitHub master without any fs access.
+        stamp_path = Path(__file__).resolve().parent / "version.json"
+        try:
+            print(stamp_path.read_text(encoding="utf-8"))
+        except OSError:
+            print('{"installed_sha": null}')
         return
     print(_render_quota(None))

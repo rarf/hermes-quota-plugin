@@ -13,12 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def load_module():
     if "quota_plugin_opencode_go" in sys.modules:
         return sys.modules["quota_plugin_opencode_go"]
-    # Reuse the shared package bootstrap from test_commands so loader behavior
-    # stays in one place.
-    from tests.test_commands import load_package
-
-    load_package()
-    from quota_plugin.quota_providers import opencode_go
+    # Import directly from the repo root (same pattern as tests/test_fetchers.py).
+    from quota_providers import opencode_go
 
     return opencode_go
 
@@ -131,14 +127,14 @@ class PayloadParsingTests(unittest.TestCase):
 
 class FetcherContractTests(unittest.TestCase):
     def test_registered_under_expected_id(self):
-        from quota_plugin.quota_providers.registry import get_fetcher
+        from quota_providers.registry import get_fetcher
 
         mod = load_module()
         self.assertIsNotNone(get_fetcher("opencode-go"))
         self.assertTrue(callable(mod.fetch_opencode_go_quota))
 
     def test_missing_credentials_is_fail_open(self):
-        from quota_plugin.quota_providers.base import QuotaResult
+        from quota_providers.base import QuotaResult
 
         mod = load_module()
         result = mod.fetch_opencode_go_quota.__wrapped__() if hasattr(

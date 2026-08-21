@@ -1,116 +1,38 @@
 # Hermes Quota
 
-[![License](https://img.shields.io/github/license/rarf/hermes-quota-plugin)](LICENSE)
-[![Last commit](https://img.shields.io/github/last-commit/rarf/hermes-quota-plugin)](https://github.com/rarf/hermes-quota-plugin/commits/master)
-[![Hermes plugin](https://img.shields.io/badge/Hermes-plugin-7c5cff)](https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins)
+Live quota indicator for Hermes Desktop — a **status-bar chip** and a **Quota
+pane** in the sidebar, fed by `hermes quota status --json`. The UI never does
+network I/O of its own; it reads a local cache the backend refreshes on demand.
 
-See provider quota before the next request fails.
+![Quota pane and status bar](docs/images/quota-pane.png)
 
-Hermes Quota adds:
+## What you get
 
-- a small status-bar indicator for the lowest remaining quota;
-- a native **Quota** page in Hermes Desktop;
-- `hermes quota` in the terminal;
-- `/quota` inside Hermes chats.
+- **Status bar (bottom-right):** a compact chip with your lowest remaining
+  quota. Hover it for a full breakdown of **every provider and every window**
+  (Session, Spark 5h, Spark Weekly…) with `% left` and time-to-reset. Toggle
+  between *worst only* and *all providers* in Settings.
+- **Quota pane (sidebar):** one card per provider with the official brand
+  icon, a tonal progress bar, the plan badge, and detail lines (credits,
+  banked resets). Providers without data collapse into a quiet "No data"
+  section — the default view shows only providers with live numbers.
+- **Cherry-pick providers:** in Quota Settings, toggle any provider on or off.
+  Your choice is local and persists.
+- **CLI:** `hermes quota`, `hermes quota refresh`, `hermes quota status [--json]`,
+  `hermes quota provider <name>`.
 
-The UI reads a local cache. It does not add quota requests to normal agent
-responses.
+## Supported providers
 
-![Hermes Quota status bar](https://github.com/user-attachments/assets/4bbb316e-cea1-4837-9aff-fbdef45287a5)
+`anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`,
+`opencode-go`, plus `grok` (opt-in). Each fetcher is fail-open: a broken
+provider shows `unavailable (<reason>)` and never blocks the rest.
 
-![Hermes Quota page](https://github.com/user-attachments/assets/57f027fe-da1d-470f-8800-1493fab69b8d)
+The OpenAI Codex fetcher goes beyond the core: it parses
+`additional_rate_limits` to surface **per-model Spark limits**
+(`5.3 Codex Spark · 5h`, `5.3 Codex Spark · Weekly`) that would otherwise
+stay hidden.
 
-## Install
-
-### Windows
-
-Run from **Git Bash**:
-
-```bash
-git clone https://github.com/rarf/hermes-quota-plugin.git
-cd hermes-quota-plugin
-./install.sh
-```
-
-### macOS and Linux
-
-Run from a normal shell:
-
-```bash
-git clone https://github.com/rarf/hermes-quota-plugin.git
-cd hermes-quota-plugin
-./install.sh
-```
-
-The installer:
-
-1. validates the staged Python files;
-2. preflights and validates every affected plugin list;
-3. replaces old plugin files cleanly, so removed files do not linger;
-4. rolls back files and configuration if any update step fails;
-5. installs the backend and Desktop widget;
-6. enables `quota` without allowing built-in tool overrides;
-7. adds `quota` to existing Hermes profiles without removing other plugins.
-
-> [!IMPORTANT]
-> Close **every** Hermes Desktop window and reopen the app after installation or
-> update. **Reload desktop plugins** refreshes JavaScript, but it cannot mount the
-> Python API backend.
-
-Verify:
-
-```bash
-hermes plugins doctor quota
-hermes quota refresh
-hermes quota status
-```
-
-A healthy installation reports `OK` from Plugin Doctor and prints one honest
-status per provider. Missing credentials appear as `unavailable`; they are not
-reported as fake zero quota.
-
-## Use
-
-### Terminal
-
-```bash
-hermes quota                 # cached status for all providers
-hermes quota refresh         # refresh every provider, then show status
-hermes quota grok            # one provider (short form)
-hermes quota provider grok   # one provider (explicit form)
-```
-
-### Hermes chat
-
-```text
-/quota
-/quota refresh
-/quota grok
-```
-
-### Hermes Desktop
-
-- The status bar shows one chip per configured provider, side by side (dot +
-  label + worst remaining %). Click any chip to open the full page. Switch to
-  the single "worst provider" chip via **Quota → Settings → Status bar mode**.
-- Open **Quota** from the sidebar.
-- Use the page settings to show unconfigured providers, change reset formatting,
-  adjust polling, or enable the optional docked pane.
-
-## Providers
-
-| Provider | Quota source |
-|---|---|
-| OpenAI Codex | Hermes account usage |
-| Anthropic | Hermes account usage |
-| Nous | Hermes account usage |
-| OpenRouter | Hermes account usage |
-| Grok | Local Grok browser session → Grok billing endpoint |
-| Gemini | Gemini CLI OAuth credentials → Google quota endpoint |
-| Kimi | Local Kimi session credentials → Kimi usage endpoint |
-| OpenCode Go | `OPENCODE_API_KEY` or local OpenCode auth file → Zen Go usage endpoint |
-
-## OpenCode Go
+### OpenCode Go
 
 Provider fetcher for [OpenCode Go](https://opencode.ai/docs/go) ($10/month
 subscription; 5-hour / Weekly / Monthly usage windows). Reads the Zen usage
@@ -119,195 +41,86 @@ endpoint (`GET https://opencode.ai/zen/go/v1/usage`) with your API key — set
 picked up from OpenCode's local auth file. Then `hermes quota opencode-go`.
 No network auth is performed; see `quota_providers/opencode_go.py`.
 
-## Cache and refresh behavior
+## Grok is opt-in
 
-Quota is stored at:
-
-```text
-$HERMES_HOME/quota_cache.json
-```
-
-When `HERMES_HOME` is unset, the default root is:
-
-| Platform | Hermes root |
-|---|---|
-| Windows | `%LOCALAPPDATA%\hermes` |
-| macOS/Linux with XDG | `$XDG_DATA_HOME/hermes` |
-| Other macOS/Linux setups | `~/.hermes` |
-
-The footer, CLI status command, and Desktop widget normally read this cache.
-A manual `refresh` fetches all providers immediately. If the Desktop backend
-receives a quota request while the cache is absent or older than 30 minutes, it
-starts one deduplicated background refresh; concurrent requests do not start
-extra refreshes.
-
-## Grok on Windows
-
-The plugin can read the signed-in Firefox profile automatically. It selects only
-unexpired `grok.com` cookies from Firefox's local `cookies.sqlite`, keeps their
-values in memory, and sends them only to Grok's billing endpoint.
-
-1. Sign in to <https://grok.com> in Firefox.
-2. Close Firefox so its cookie database can be copied cleanly.
-3. Run:
+Grok is the only provider read from your browser (Firefox `grok.com` cookies) —
+there is no clean API path right now. It is **disabled by default**. Turn it on:
 
 ```bash
+hermes config set plugins.entries.quota.settings.grokEnabled true
 hermes quota refresh
-hermes quota grok
 ```
 
-If Firefox is unavailable, copy only the `Cookie` header value from a logged-in
-Grok request to the clipboard, then run from PowerShell:
+When off, Grok simply reports `opt-in-disabled`. No cookies are read, no files written.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File `
-  "$env:LOCALAPPDATA\hermes\plugins\quota\scripts\import-grok-cookies.ps1"
-```
-
-The importer writes `%USERPROFILE%\grok_session.json` and never prints the
-cookie.
-
-### Optional Grok debug capture
-
-Raw Grok billing responses are **not written by default**. For temporary parser
-debugging, explicitly enable capture for one refresh:
+## Install
 
 ```bash
-HERMES_QUOTA_DEBUG=1 hermes quota refresh
-```
-
-This writes `%USERPROFILE%\grok_last_response.bin` using an atomic replacement and
-owner-only permissions where the operating system supports POSIX permission
-bits. Treat it as private account data and delete it after debugging. Never
-attach cookies, session files, or raw billing responses to a public issue.
-
-## Privacy and security
-
-- No telemetry or analytics are added.
-- Tokens and cookies are never printed.
-- Credentials are sent only to the matching provider endpoint.
-- Provider failures degrade to explicit `unavailable` states.
-- The plugin requests no permission to override built-in Hermes tools.
-- The Desktop API is mounted under Hermes' authenticated plugin namespace.
-- Raw Grok responses are persisted only when `HERMES_QUOTA_DEBUG=1` is set.
-
-This is an in-process third-party Hermes plugin. Review the source before
-installing it in a sensitive environment.
-
-## Update
-
-From the cloned repository:
-
-```bash
-git pull --ff-only
+git clone https://github.com/rarf/hermes-quota-plugin.git
+cd hermes-quota-plugin
 ./install.sh
-hermes plugins doctor quota
-hermes quota refresh
 ```
 
-Then close every Hermes Desktop window and reopen the app.
+One global backend + widget, enabled for every profile without touching other
+plugins. Re-run anytime to update; `./uninstall.sh` removes it symmetrically.
 
-For reproducible automation, check out a full trusted commit SHA before running
-`./install.sh` and record that SHA in the deployment log.
+### Multiple Hermes profiles
 
-## Uninstall
+Hermes resolves plugins **per profile**: both the Python backend scanner
+(`<profile>/plugins/`) and the Desktop widget loader
+(`<profile>/desktop-plugins/`) read from the *active profile's* hermes home —
+only the `default` profile uses the global `~/.hermes/` roots. A plugin
+installed solely at the global root loads in `default` and shows
+"backend unavailable" in every named profile.
 
-From the cloned repository:
+`./install.sh` handles this for you: besides the global install it symlinks
+`profiles/<name>/plugins/quota` and `profiles/<name>/desktop-plugins/quota`
+into every existing profile, so all profiles share the single real copy —
+re-running the installer after a `git pull` updates every profile at once.
+`./uninstall.sh` removes those links (symlinks only; real directories you
+created yourself are left untouched).
+
+> **Restart Hermes Desktop completely** after install/update. Reloading plugins
+> refreshes the widget only — the Python backend mounts at process start.
+> Each profile's backend also needs its own first data collection: run
+> `hermes quota refresh` once per profile (the quota cache is per-profile).
+
+Verify:
 
 ```bash
-./uninstall.sh
+hermes plugins doctor quota && hermes quota refresh && hermes quota status
+# per-profile check (example):
+HERMES_HOME=~/.hermes/profiles/guardian hermes plugins doctor quota
 ```
 
-The uninstaller uses the same platform-aware Hermes root as the installer,
-removes both plugin surfaces, removes `quota` from existing enabled and disabled
-lists without changing unrelated plugins, and restores the previous state if any
-step fails.
+## Where the numbers come from
 
-Close every Hermes Desktop window and reopen the app afterward so the Python
-backend is fully unmounted.
+Providers with a CLI or OAuth login (anthropic, openai-codex, gemini, kimi CLI)
+are read locally. Refresh runs the fetchers and writes `$HERMES_HOME/quota_cache.json`;
+the widget reads that file via `host.request('cli.exec', ['quota','status','--json'])`.
 
-## Troubleshooting
+> The usage APIs expose only `used_percent` and `reset_at` per window — not an
+> absolute cap. The plugin shows remaining **%** and **time-to-reset**, not a
+> token or dollar count.
 
-### `Quota backend unavailable`
+## Privacy & safety
 
-1. Close every Hermes Desktop window.
-2. Reopen Hermes Desktop.
-3. Run:
-
-```bash
-hermes plugins doctor quota
-hermes quota refresh
-```
-
-Reloading Desktop JavaScript alone is not enough.
-
-### Grok: `no-session-cookies`
-
-Sign in to Grok in Firefox, close Firefox, and run `hermes quota refresh`.
-
-### Grok: `auth-failed` or `cloudflare-blocked`
-
-The session expired or Grok rejected it. Sign in again and refresh. Do not paste
-cookies into chat or an issue.
-
-### A provider is `unavailable`
-
-This is expected when that provider is not configured or does not expose a
-supported quota endpoint. Other providers continue to work.
-
-## Agent install contract
-
-For an automated agent installing this repository:
-
-1. inspect `install.sh`, `plugin.yaml`, `dashboard/plugin_api.py`,
-   `desktop/plugin.js`, and `quota_providers/`;
-2. record `git rev-parse HEAD`;
-3. run `bash -n install.sh uninstall.sh scripts/*.sh`;
-4. choose `python` or `python3`, then run `-m unittest discover -s tests -v`;
-5. run `./install.sh`;
-6. verify with `hermes plugins doctor quota`, `hermes quota refresh`, and
-   `hermes quota status`;
-7. tell the user that a complete Hermes Desktop restart is still required.
-
-Do not claim the Desktop page is working until the app has restarted and the
-backend has been mounted.
+- No telemetry. Cookies and tokens are never printed.
+- Grok cookies are used only for the Grok billing request, and only when you opt in.
+- Missing credentials produce an explicit `unavailable` state — no fake zeros.
+- The plugin does not request permission to override built-in Hermes tools.
 
 ## Development
 
-Main files:
-
-```text
-plugin.yaml                       runtime manifest
-__init__.py                       CLI, slash command, optional hooks
-commands.py                       command parsing and formatting
-quota_cache.py                    cache orchestration
-quota_providers/                  provider fetchers
-dashboard/plugin_api.py           authenticated Desktop API
-dashboard/manifest.json           dashboard API manifest
-desktop/plugin.js                 native Desktop widget
-scripts/hermes-home.sh             shared platform path resolution
-scripts/hermes-config.sh           shared config transaction helpers
-scripts/import-grok-cookies.ps1   manual Grok cookie fallback
-```
-
-Run all local checks:
-
 ```bash
-bash -n install.sh uninstall.sh scripts/*.sh
-PYTHON=
-for candidate in python python3; do
-  if command -v "$candidate" >/dev/null 2>&1 &&
-     "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
-    PYTHON="$candidate"; break
-  fi
-done
-[ -n "$PYTHON" ] || { echo "Python 3.9+ is required" >&2; exit 2; }
-"$PYTHON" -m py_compile \
-  __init__.py commands.py quota_cache.py dashboard/plugin_api.py \
-  quota_providers/*.py
-"$PYTHON" -m unittest discover -s tests -v
+bash -n install.sh uninstall.sh
+python -m py_compile __init__.py commands.py quota_cache.py quota_providers/*.py
+node --check desktop/plugin.js
+hermes plugins doctor quota
+hermes quota refresh
 ```
 
-## License
+To add a provider, write a fetcher in `quota_providers/` that returns a
+`QuotaResult` and register it. The cache and widget need no provider-specific changes.
 
-MIT. See [LICENSE](LICENSE).
+MIT.

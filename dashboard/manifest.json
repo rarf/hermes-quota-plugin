@@ -1,8 +1,0 @@
-{
-  "name": "quota",
-  "label": "Quota Widget",
-  "description": "Per-provider quota / rate-limit status surfaced as a desktop widget (statusbar chip + side pane) backed by the quota plugin's precomputed cache.",
-  "icon": "Gauge",
-  "version": "1.1.0",
-  "api": "plugin_api.py"
-}

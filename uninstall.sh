@@ -30,6 +30,7 @@ before_enabled_present=()
 before_disabled_present=()
 before_enabled=()
 before_disabled=()
+
 desired_enabled=()
 desired_disabled=()
 for profile in "${profiles[@]}"; do
@@ -95,10 +96,29 @@ for i in "${!profiles[@]}"; do
   hermes_config_apply "${profiles[$i]}" plugins.disabled "${before_disabled_present[$i]}" "${before_disabled[$i]}" "${desired_disabled[$i]}"
 done
 
+# Remove the per-profile symlinks install.sh creates (plugins/quota +
+# desktop-plugins/quota under every named profile). Only remove symlinks —
+# a real directory there was not created by us, so leave it alone.
+REMOVED_LINKS=0
+for profile in "${profiles[@]}"; do
+  [ -z "$profile" ] && continue   # "" = default profile -> global roots handled above
+  base="$HOME_DIR/profiles/$profile"
+  for rel in plugins/quota desktop-plugins/quota; do
+    link="$base/$rel"
+    if [ -L "$link" ]; then
+      rm "$link"
+      REMOVED_LINKS=$((REMOVED_LINKS + 1))
+    fi
+  done
+done
+
 trap - ERR
 if ! rm -rf "$BACKUP_PLUGIN" "$BACKUP_DESKTOP"; then
   echo "Warning: uninstall succeeded, but a temporary backup could not be removed: $STAGE_DIR" >&2
 fi
 
 printf '\nQuota plugin removed from %s\n' "$HOME_DIR"
+if [ "$REMOVED_LINKS" -gt 0 ]; then
+  printf '%s\n' "Removed $REMOVED_LINKS per-profile plugin links."
+fi
 printf '%s\n' 'Close every Hermes Desktop window, then reopen the app to unmount the Python backend.'
