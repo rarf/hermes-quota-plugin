@@ -131,12 +131,42 @@ fi
 mv "$STAGE_DESKTOP" "$DESKTOP_DIR"
 DESKTOP_INSTALLED=1
 
+# Per-profile roots. Both the Python backend scanner (plugins/) and the
+# Desktop runtime-plugin loader (desktop-plugins/) resolve under the ACTIVE
+# profile's hermes_home — only 'default' uses the global root — so a plugin
+# installed solely at $HOME_DIR is invisible to every named profile (the
+# widget shows "backend unavailable"). Symlink, don't copy: one real copy
+# stays the single source; updates propagate on every re-install.
+PROFILE_LINKS=0
+for profile in "${profiles[@]}"; do
+  [ -z "$profile" ] && continue   # "" = default profile -> already served by the global roots
+  base="$HOME_DIR/profiles/$profile"
+
+  for pair in "plugins/quota:$PLUGIN_DIR" "desktop-plugins/quota:$DESKTOP_DIR"; do
+    rel="${pair%%:*}"; target="${pair#*:}"
+    link="$base/$rel"
+    mkdir -p "$(dirname "$link")"
+    if [ -L "$link" ]; then
+      ln -sfn "$target" "$link"
+    elif [ -e "$link" ]; then
+      echo "Warning: $link exists and is not a symlink; leaving it untouched." >&2
+      continue
+    else
+      ln -s "$target" "$link"
+    fi
+    PROFILE_LINKS=$((PROFILE_LINKS + 1))
+  done
+done
+
 trap - ERR
 if ! rm -rf "$BACKUP_PLUGIN" "$BACKUP_DESKTOP"; then
   echo "Warning: installation succeeded, but a temporary backup could not be removed: $STAGE_DIR" >&2
 fi
 
 printf '\nQuota plugin installed in %s\n' "$HOME_DIR"
+if [ "$PROFILE_LINKS" -gt 0 ]; then
+  printf '%s\n' "Linked into $PROFILE_LINKS per-profile plugin roots (backend + desktop widget)."
+fi
 printf '%s\n' 'IMPORTANT: close every Hermes Desktop window, then reopen the app.'
 printf '%s\n' 'Desktop widget reloads on save; the backend is loaded at process start.'
 printf '%s\n' 'Verify with: hermes plugins doctor quota && hermes quota refresh && hermes quota status'

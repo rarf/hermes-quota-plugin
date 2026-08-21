@@ -55,13 +55,33 @@ cd hermes-quota-plugin
 One global backend + widget, enabled for every profile without touching other
 plugins. Re-run anytime to update; `./uninstall.sh` removes it symmetrically.
 
+### Multiple Hermes profiles
+
+Hermes resolves plugins **per profile**: both the Python backend scanner
+(`<profile>/plugins/`) and the Desktop widget loader
+(`<profile>/desktop-plugins/`) read from the *active profile's* hermes home —
+only the `default` profile uses the global `~/.hermes/` roots. A plugin
+installed solely at the global root loads in `default` and shows
+"backend unavailable" in every named profile.
+
+`./install.sh` handles this for you: besides the global install it symlinks
+`profiles/<name>/plugins/quota` and `profiles/<name>/desktop-plugins/quota`
+into every existing profile, so all profiles share the single real copy —
+re-running the installer after a `git pull` updates every profile at once.
+`./uninstall.sh` removes those links (symlinks only; real directories you
+created yourself are left untouched).
+
 > **Restart Hermes Desktop completely** after install/update. Reloading plugins
 > refreshes the widget only — the Python backend mounts at process start.
+> Each profile's backend also needs its own first data collection: run
+> `hermes quota refresh` once per profile (the quota cache is per-profile).
 
 Verify:
 
 ```bash
 hermes plugins doctor quota && hermes quota refresh && hermes quota status
+# per-profile check (example):
+HERMES_HOME=~/.hermes/profiles/guardian hermes plugins doctor quota
 ```
 
 ## Where the numbers come from
