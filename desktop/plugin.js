@@ -436,10 +436,12 @@ function useUpdateCheck() {
 		const run = async () => {
 			let installedSha = null;
 			try {
-				const stamp = await host.request("fs.read", {
-					path: "desktop-plugins/quota/version.json",
+				const result = await host.request("cli.exec", {
+					argv: ["quota", "status", "--version-json"],
 				});
-				installedSha = stamp ? JSON.parse(stamp).installed_sha : null;
+				if (!result?.blocked && result?.code === 0 && result.output) {
+					installedSha = JSON.parse(result.output).installed_sha || null;
+				}
 			} catch {
 				/* not stamped (older install) — skip check */
 			}

@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from .quota_cache import read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
@@ -168,6 +169,12 @@ def setup_argparse(subparser):
     status_p = subs.add_parser("status", help="Show per-provider quota (default)")
     status_p.add_argument("--json", action="store_true", help="Emit raw JSON for the desktop widget")
     status_p.add_argument(
+        "--version-json",
+        dest="version_json",
+        action="store_true",
+        help="Emit the installed build stamp (update self-check)",
+    )
+    status_p.add_argument(
         "--max-age",
         dest="max_age",
         type=int,
@@ -206,5 +213,14 @@ def _handle_cli(args):
             except Exception:
                 pass
         print(_render_quota_json())
+        return
+    if cmd == "status" and getattr(args, "version_json", False):
+        # Update self-check: emit the installed build stamp so the widget can
+        # compare it against GitHub master without any fs access.
+        stamp_path = Path(__file__).resolve().parent / "version.json"
+        try:
+            print(stamp_path.read_text(encoding="utf-8"))
+        except OSError:
+            print('{"installed_sha": null}')
         return
     print(_render_quota(None))

@@ -60,8 +60,122 @@ def _make_fetcher(provider_id: str):
     return _fetch
 
 
-for _pid in ("anthropic", "nous", "openrouter"):
+for _pid in ("anthropic", "openrouter"):
     _register(_pid)(_make_fetcher(_pid))
+
+
+# -- Nous Portal (direct account-info adapter) --------------------------------
+# The core ``fetch_account_usage`` dispatcher does not route "nous" (only
+# openai-codex / anthropic / openrouter), so the generic adapter above always
+# produced ``no-data`` for it — for every account, paid or not. This fetcher
+# reads the Portal account model directly (the same Hermes-managed OAuth state
+# ``hermes portal status`` shows) and mirrors the semantics of the proposed
+# ``portal usage --json`` contract (upstream hermes-agent PR #77791):
+#   * a usage percentage only ever appears with a real positive denominator;
+#   * free accounts render an honest status card (plan + free tool pool +
+#     published rate ceiling) instead of fabricated zeros.
+
+
+def _finite_usd(value) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _nous_tool_pool_labels(account_info) -> list[str]:
+    """Names of the free Tool-Gateway categories this account may use."""
+    try:
+        import dataclasses
+
+        coverage = getattr(getattr(account_info, "tool_access", None), "coverage", None)
+        if coverage is None:
+            return []
+        if isinstance(coverage, dict):
+            items = list(coverage.items())
+        elif dataclasses.is_dataclass(coverage):
+            items = [(f.name, getattr(coverage, f.name)) for f in dataclasses.fields(coverage)]
+        else:
+            return []
+        pretty = {"browser_use": "browser-use", "fal_video": "fal-video", "openai_audio": "openai-audio"}
+        return sorted(pretty.get(str(k), str(k)) for k, v in items if v is True)
+    except Exception:
+        return []
+
+
+def _credit_line(access, attr, label) -> Optional[str]:
+	"""Return a '$X.XX' detail line when the attribute is a finite USD amount."""
+	amount = _finite_usd(getattr(access, attr, None))
+	if amount is None:
+		return None
+	return f"{label}: ${amount:.2f}"
+
+
+def _fetch_nous_portal() -> QuotaResult:
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account = get_nous_portal_account_info()
+    except Exception:
+        return build_unavailable("nous", "fetcher-unavailable")
+    if account is None or not getattr(account, "logged_in", False):
+        return build_unavailable("nous", "not-logged-in")
+
+    access = getattr(account, "paid_service_access_info", None)
+    sub = getattr(account, "subscription", None)
+    paid = getattr(account, "paid_service_access", None)
+
+    windows: list[QuotaWindow] = []
+    details: list[str] = []
+
+    # Subscription gauge — only with a positive monthly denominator and a sane
+    # remaining value (remaining > cap means rollover across periods, where the
+    # monthly number stops being a meaningful denominator).
+    monthly = _finite_usd(getattr(sub, "monthly_credits", None)) if sub is not None else None
+    remaining = _finite_usd(getattr(sub, "credits_remaining", None)) if sub is not None else None
+    if monthly is not None and monthly > 0 and remaining is not None and remaining <= monthly:
+        used_pct = max(0.0, min(100.0, (monthly - remaining) / monthly * 100.0))
+        windows.append(QuotaWindow(label="Subscription", used_percent=round(used_pct, 2)))
+        details.append(f"${remaining:.2f} of ${monthly:.2f} subscription credits left")
+
+    if access is not None:
+        for attr, label in (
+            ("subscription_credits_remaining", "Subscription credits"),
+            ("purchased_credits_remaining", "Top-up credits"),
+            ("total_usable_credits", "Total usable"),
+        ):
+            line = _credit_line(access, attr, label)
+            if line is not None:
+                details.append(line)
+
+    if sub is not None:
+        rollover = _finite_usd(getattr(sub, "rollover_credits", None))
+        if rollover is not None and rollover > 0:
+            details.append(f"Rollover: ${rollover:.2f}")
+        period_end = getattr(sub, "current_period_end", None)
+        if period_end:
+            details.append(f"Renews: {period_end}")
+
+    plan = (getattr(sub, "plan", None) if sub is not None else None) or None
+
+    if not windows and not details:
+        if paid is False:
+            # Free tier: the portal exposes no credit/usage numbers at all
+            # (verified against a live free account). Show what IS true.
+            details.append("Free tier - free models only")
+            details.append("Rate ceiling: 50 RPM / 500k TPM (published)")
+            pool = _nous_tool_pool_labels(account)
+            if pool:
+                details.append("Tool pool: " + ", ".join(pool))
+            plan = plan or "Free"
+        else:
+            return build_unavailable("nous", "no-data")
+    elif paid is False:
+        details.append("Status: access depleted - top up to restore")
+
+    return QuotaResult(label="nous", windows=windows, plan=plan, details=details)
+
+
+_register("nous")(_fetch_nous_portal)
 
 
 # -- OpenAI Codex (with per-model Spark limits) ------------------------------

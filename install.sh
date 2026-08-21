@@ -160,7 +160,9 @@ done
 
 # Stamp the installed build with its source commit so the widget can check
 # GitHub for newer versions (same pattern as Hermes's own update check).
-INSTALLED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+# pwd -W yields a Windows-native path so native git resolves it (MSYS /tmp/...).
+REPO_ROOT_WIN="$(cd "$REPO_ROOT" && pwd -W 2>/dev/null || echo "$REPO_ROOT")"
+INSTALLED_SHA="$(git -C "$REPO_ROOT_WIN" rev-parse HEAD 2>/dev/null || echo unknown)"
 printf '{\n  "installed_sha": "%s",\n  "installed_at": "%s"\n}\n' \
   "$INSTALLED_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   > "$PLUGIN_DIR/version.json"
