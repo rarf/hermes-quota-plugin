@@ -158,6 +158,16 @@ for profile in "${profiles[@]}"; do
   done
 done
 
+# Stamp the installed build with its source commit so the widget can check
+# GitHub for newer versions (same pattern as Hermes's own update check).
+INSTALLED_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+printf '{\n  "installed_sha": "%s",\n  "installed_at": "%s"\n}\n' \
+  "$INSTALLED_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$PLUGIN_DIR/version.json"
+printf '{\n  "installed_sha": "%s",\n  "installed_at": "%s"\n}\n' \
+  "$INSTALLED_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  > "$DESKTOP_DIR/version.json"
+
 trap - ERR
 if ! rm -rf "$BACKUP_PLUGIN" "$BACKUP_DESKTOP"; then
   echo "Warning: installation succeeded, but a temporary backup could not be removed: $STAGE_DIR" >&2

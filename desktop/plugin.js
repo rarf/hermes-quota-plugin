@@ -420,6 +420,100 @@ function useNow(intervalMs = 30_000) {
 	return now;
 }
 
+// ---- update self-check (like Hermes's own) ---------------------------------
+
+const REPO_API_LATEST =
+	"https://api.github.com/repos/rarf/hermes-quota-plugin/commits/master";
+
+// Compare the installed commit stamp against GitHub master. One cheap
+// request per hour, cached in storage; never blocks rendering.
+function useUpdateCheck() {
+	const [update, setUpdate] = useState(null);
+	useEffect(() => {
+		let alive = true;
+		const CHECK_KEY = "updateCheck";
+		const ONE_HOUR = 60 * 60 * 1000;
+		const run = async () => {
+			let installedSha = null;
+			try {
+				const stamp = await host.request("fs.read", {
+					path: "desktop-plugins/quota/version.json",
+				});
+				installedSha = stamp ? JSON.parse(stamp).installed_sha : null;
+			} catch {
+				/* not stamped (older install) — skip check */
+			}
+			if (!installedSha || installedSha === "unknown") return;
+			// Throttle: at most one GitHub call per hour.
+			try {
+				const prev = CTX.storage.get(CHECK_KEY);
+				if (prev) {
+					const p = JSON.parse(prev);
+					if (
+						p.at &&
+						Date.now() - p.at < ONE_HOUR &&
+						p.latest
+					) {
+						if (p.latest !== installedSha) {
+							setUpdate({ latest: p.latest });
+						}
+						return;
+					}
+				}
+			} catch {
+				/* noop */
+			}
+			try {
+				const res = await fetch(REPO_API_LATEST, {
+					headers: { Accept: "application/vnd.github+json" },
+				});
+				if (!res.ok) return;
+				const j = await res.json();
+				const latest = j && j.sha;
+				if (!latest) return;
+				try {
+					CTX.storage.set(
+						CHECK_KEY,
+						JSON.stringify({ at: Date.now(), latest }),
+					);
+				} catch {
+					/* noop */
+				}
+				if (alive && latest !== installedSha) {
+					setUpdate({ latest });
+				}
+			} catch {
+				/* offline / rate-limited — stay quiet */
+			}
+		};
+		run();
+		return () => {
+			alive = false;
+		};
+	}, []);
+	return update;
+}
+
+function UpdateBanner({ update }) {
+	if (!update) return null;
+	return jsxs("button", {
+		type: "button",
+		className: cn(
+			"flex w-full items-center justify-between gap-2 rounded px-3 py-2 text-left text-[0.6875rem]",
+			"bg-(--chrome-action) text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
+		),
+		onClick: () =>
+			host.openExternal?.("https://github.com/rarf/hermes-quota-plugin"),
+		children: [
+			jsx("span", {
+				className: "font-medium",
+				children: "⬆ Update available — run ./install.sh to get it",
+			}),
+			jsx("span", { className: "text-(--ui-text-tertiary)", children: "↗" }),
+		],
+	});
+}
+
 // ---- data hook (cli.exec instead of REST) ----------------------------------
 
 function useQuota() {
@@ -427,9 +521,18 @@ function useQuota() {
 	return useQuery({
 		queryKey: ["quota", "widget"],
 		queryFn: async () => {
-			// Call Hermes CLI via the desktop gateway: quota status --json
+			// Call Hermes CLI via the desktop gateway. --max-age makes the
+			// backend re-fetch providers when the cache is older than our
+			// poll interval, so the configured cadence actually refreshes.
+			const maxAge = Math.max(10, Math.floor(intervalMs / 1000));
 			const result = await host.request("cli.exec", {
-				argv: ["quota", "status", "--json"],
+				argv: [
+					"quota",
+					"status",
+					"--json",
+					"--max-age",
+					String(maxAge),
+				],
 			});
 			if (result?.blocked || result?.code !== 0) {
 				throw new Error(
@@ -952,6 +1055,7 @@ function QuotaPane() {
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
 	const { data, isError, isLoading, refetch } = useQuota();
+	const update = useUpdateCheck();
 	const refresh = useMutation({
 		mutationFn: async () => {
 			const result = await host.request("cli.exec", {
@@ -1104,6 +1208,7 @@ function QuotaPane() {
 				],
 			}),
 			jsx("div", { className: "min-h-0 flex-1", children: body }),
+			jsx(UpdateBanner, { update }),
 			data && data.fetched_at
 				? jsx("div", {
 						className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",

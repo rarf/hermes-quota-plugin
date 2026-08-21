@@ -167,6 +167,13 @@ def setup_argparse(subparser):
     subs = subparser.add_subparsers(dest="quota_command")
     status_p = subs.add_parser("status", help="Show per-provider quota (default)")
     status_p.add_argument("--json", action="store_true", help="Emit raw JSON for the desktop widget")
+    status_p.add_argument(
+        "--max-age",
+        dest="max_age",
+        type=int,
+        default=None,
+        help="Refresh automatically when the cache is older than N seconds",
+    )
     subs.add_parser("refresh", help="Force a re-fetch of all providers")
     prov = subs.add_parser("provider", help="Show quota for one provider")
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
@@ -188,6 +195,16 @@ def _handle_cli(args):
         print(_render_quota(cmd))
         return
     if cmd == "status" and getattr(args, "json", False):
+        # Widget path: honor its poll cadence — refresh when the cache is
+        # older than the requested max age (defaults to MAX_AGE_S).
+        max_age = getattr(args, "max_age", None)
+        if max_age is None or max_age <= 0:
+            max_age = MAX_AGE_S
+        if (quota_cache_age_seconds() or 10**9) > max_age:
+            try:
+                refresh_quota_cache()
+            except Exception:
+                pass
         print(_render_quota_json())
         return
     print(_render_quota(None))
