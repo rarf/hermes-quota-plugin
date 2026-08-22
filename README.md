@@ -32,18 +32,6 @@ The OpenAI Codex fetcher goes beyond the core: it parses
 (`5.3 Codex Spark · 5h`, `5.3 Codex Spark · Weekly`) that would otherwise
 stay hidden.
 
-### OpenCode Go
-
-See `quota_providers/opencode_go.py` — reads the Zen usage endpoint with your
-API key (`OPENCODE_API_KEY` or OpenCode's local auth file).
-
-## GitHub Copilot
-
-Reads the Copilot internal usage API (same source CodexBar uses) with a GitHub
-OAuth token: env vars / `gh auth token` via Hermes core when available, its own
-`gh auth token` fallback otherwise. Shows Premium requests / Chat / Completions
-windows, plan, and monthly reset. No device flow, no cookies.
-
 ## Grok is opt-in
 
 Grok is the only provider read from your browser (Firefox `grok.com` cookies) —
