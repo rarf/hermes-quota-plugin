@@ -12,10 +12,7 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": false,
-      "style": {
-        "useSortedKeys": "off"
-      }
+      "recommended": false
     }
   },
   "assist": {
