@@ -92,6 +92,39 @@ class ChromeDiscoveryTests(unittest.TestCase):
         self.assertEqual(dbs[0], last / "Network" / "Cookies")
         self.assertIn(root / "Default" / "Cookies", dbs)
 
+    def test_does_not_invent_profile_dirs_when_listing_fails(self):
+        from quota_providers import browser_cookies as bc
+
+        with self._temp_chrome() as root:
+            (root / "Default").mkdir()
+            with mock.patch.object(Path, "iterdir", side_effect=PermissionError("denied")):
+                dirs = bc.chrome_profile_dirs(root)
+        self.assertEqual([p.name for p in dirs], ["Default"])
+
+    def test_rejects_traversing_last_used_profile(self):
+        from quota_providers import browser_cookies as bc
+
+        with self._temp_chrome() as root:
+            (root / "Default").mkdir()
+            (root / "Local State").write_text(
+                json.dumps({"profile": {"last_used": "../outside"}}),
+                encoding="utf-8",
+            )
+            dirs = bc.chrome_profile_dirs(root)
+        self.assertEqual([p.name for p in dirs], ["Default"])
+
+    def test_listing_tcc_without_profiles_is_typed_error(self):
+        from quota_providers import browser_cookies as bc
+        from quota_providers.browser_cookies import ChromeCookieError
+
+        with self._temp_chrome() as root:
+            with mock.patch.object(
+                Path, "iterdir", side_effect=PermissionError("Operation not permitted")
+            ):
+                with self.assertRaises(ChromeCookieError) as ctx:
+                    bc.chrome_profile_dirs(root)
+        self.assertEqual(ctx.exception.reason, "chrome-tcc-denied")
+
     def test_skips_missing_last_used_profile(self):
         from quota_providers import browser_cookies as bc
 
