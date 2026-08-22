@@ -11,7 +11,11 @@ import urllib.error
 from typing import Optional
 
 from .base import QuotaResult, QuotaWindow, build_unavailable
-from .browser_cookies import load_firefox_grok_cookies
+from .browser_cookies import (
+    ChromeCookieError,
+    load_chrome_grok_cookies,
+    load_firefox_grok_cookies,
+)
 
 _GROK_ENDPOINT = "https://grok.com/grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig"
 _REST_RATELIMITS_URL = "https://grok.com/rest/rate-limits"
@@ -61,9 +65,12 @@ def _load_cookies() -> Optional[str]:
     except Exception:
         pass
 
-    # Automatic local fallback for the logged-in Firefox profile. The helper
-    # copies the SQLite DB before reading it and only selects grok.com cookies.
-    return load_firefox_grok_cookies()
+    # Automatic local fallback: Firefox first (plaintext cookies), then
+    # Chrome (encrypted). Only grok.com cookies are selected.
+    firefox = load_firefox_grok_cookies()
+    if firefox:
+        return firefox
+    return load_chrome_grok_cookies()
 
 
 def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
@@ -287,7 +294,10 @@ def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
 
 
 def fetch_grok_quota() -> QuotaResult:
-    cookies = _load_cookies()
+    try:
+        cookies = _load_cookies()
+    except ChromeCookieError as exc:
+        return build_unavailable("grok", exc.reason)
     if not cookies:
         return build_unavailable("grok", "no-session-cookies")
 
@@ -336,8 +346,8 @@ def fetch_grok_quota() -> QuotaResult:
 
 from .registry import register as _register  # noqa: E402
 
-# Grok is opt-in: reads browser cookies (Firefox grok.com), which is the only
-# path we have right now and is sensitive. Disabled by default; enable with:
+# Grok is opt-in: reads browser cookies (Firefox grok.com, then Chrome on
+# macOS). Disabled by default; enable with:
 #   hermes config set plugins.entries.quota.settings.grokEnabled true
 import os as _os
 
