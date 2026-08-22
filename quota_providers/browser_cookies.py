@@ -8,6 +8,7 @@ leave this process.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -212,7 +213,29 @@ def _derive_chrome_key(password: str) -> bytes:
     ).derive(password.encode("utf-8"))
 
 
-def decrypt_chrome_cookie_value(key: bytes, blob: bytes) -> str:
+def _strip_chrome_host_hash(plaintext: bytes, host_key: Optional[str] = None) -> bytes:
+    """Chrome 127+ / cookie DB v24+ prefixes SHA256(host_key) before the value."""
+    if len(plaintext) < 32:
+        return plaintext
+    prefix, rest = plaintext[:32], plaintext[32:]
+    if host_key is not None:
+        expected = hashlib.sha256(host_key.encode("utf-8")).digest()
+        if prefix == expected:
+            return rest
+    try:
+        plaintext.decode("utf-8")
+        return plaintext
+    except UnicodeDecodeError:
+        try:
+            rest.decode("utf-8")
+            return rest
+        except UnicodeDecodeError:
+            return plaintext
+
+
+def decrypt_chrome_cookie_value(
+    key: bytes, blob: bytes, host_key: Optional[str] = None
+) -> str:
     if blob.startswith(b"v20"):
         raise ValueError("chrome-app-bound")
     if not blob.startswith((b"v10", b"v11")):
@@ -229,7 +252,11 @@ def decrypt_chrome_cookie_value(key: bytes, blob: bytes) -> str:
     pad = padded[-1]
     if pad < 1 or pad > 16 or padded[-pad:] != bytes([pad] * pad):
         raise ValueError("chrome-decrypt-failed")
-    return padded[:-pad].decode("utf-8")
+    plaintext = _strip_chrome_host_hash(padded[:-pad], host_key)
+    try:
+        return plaintext.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("chrome-decrypt-failed") from exc
 
 
 def _chrome_expires_ok(expires_utc: object, now: float) -> bool:
@@ -276,7 +303,7 @@ def load_chrome_grok_cookies() -> Optional[str]:
             try:
                 rows = conn.execute(
                     """
-                    SELECT name, encrypted_value, expires_utc
+                    SELECT name, host_key, encrypted_value, expires_utc
                     FROM cookies
                     WHERE host_key = 'grok.com' OR host_key LIKE '%.grok.com'
                     ORDER BY host_key, name
@@ -298,12 +325,12 @@ def load_chrome_grok_cookies() -> Optional[str]:
                     pass
 
         live_rows = []
-        for name, blob, expires_utc in rows:
+        for name, host_key, blob, expires_utc in rows:
             if not name or not _chrome_expires_ok(expires_utc, now):
                 continue
             if not isinstance(blob, (bytes, bytearray)):
                 continue
-            live_rows.append((str(name), bytes(blob)))
+            live_rows.append((str(name), str(host_key or ""), bytes(blob)))
         if not live_rows:
             continue
         saw_grok_rows = True
@@ -315,11 +342,11 @@ def load_chrome_grok_cookies() -> Optional[str]:
 
         pairs: list[str] = []
         seen: set[str] = set()
-        for name, blob in live_rows:
+        for name, host_key, blob in live_rows:
             if name in seen:
                 continue
             try:
-                value = decrypt_chrome_cookie_value(key, blob)
+                value = decrypt_chrome_cookie_value(key, blob, host_key=host_key)
             except ChromeCookieError:
                 raise
             except ValueError as exc:

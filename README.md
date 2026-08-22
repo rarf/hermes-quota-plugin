@@ -65,6 +65,7 @@ Chrome notes:
 - macOS will prompt for the `Chrome Safe Storage` Keychain item on first refresh.
 - If refresh returns `chrome-tcc-denied`, grant Full Disk Access to **Hermes.app**
   (Desktop) and/or the Terminal you use for `hermes quota refresh`, then retry.
+- Chrome 127+ cookies prefix a SHA256(`host_key`) digest before the value; that prefix is stripped after AES-CBC decrypt.
 - Chrome App-Bound `v20` cookies are not supported (`chrome-app-bound`).
 - Safari is not supported.
 
