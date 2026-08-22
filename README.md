@@ -24,7 +24,7 @@ network I/O of its own; it reads a local cache the backend refreshes on demand.
 ## Supported providers
 
 `anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`,
-`opencode-go`, plus `grok` (opt-in). Each fetcher is fail-open: a broken
+`opencode-go`, `copilot`, plus `grok` (opt-in). Each fetcher is fail-open: a broken
 provider shows `unavailable (<reason>)` and never blocks the rest.
 
 The OpenAI Codex fetcher goes beyond the core: it parses
@@ -34,12 +34,15 @@ stay hidden.
 
 ### OpenCode Go
 
-Provider fetcher for [OpenCode Go](https://opencode.ai/docs/go) ($10/month
-subscription; 5-hour / Weekly / Monthly usage windows). Reads the Zen usage
-endpoint (`GET https://opencode.ai/zen/go/v1/usage`) with your API key — set
-`OPENCODE_API_KEY`, or just run `opencode auth login` once and the key is
-picked up from OpenCode's local auth file. Then `hermes quota opencode-go`.
-No network auth is performed; see `quota_providers/opencode_go.py`.
+See `quota_providers/opencode_go.py` — reads the Zen usage endpoint with your
+API key (`OPENCODE_API_KEY` or OpenCode's local auth file).
+
+## GitHub Copilot
+
+Reads the Copilot internal usage API (same source CodexBar uses) with a GitHub
+OAuth token: env vars / `gh auth token` via Hermes core when available, its own
+`gh auth token` fallback otherwise. Shows Premium requests / Chat / Completions
+windows, plan, and monthly reset. No device flow, no cookies.
 
 ## Grok is opt-in
 
