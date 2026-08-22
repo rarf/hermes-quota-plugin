@@ -82,13 +82,13 @@ def resolve_github_token() -> Optional[str]:
         from hermes_cli.copilot_auth import resolve_copilot_token
 
         token, _source = resolve_copilot_token()
-        if token:
-            return token
+        # Core's resolver already covers env vars + `gh auth token`; only a
+        # missing core (ImportError) needs this module's own gh fallback.
+        return token or None
     except ImportError:
-        pass
+        return _gh_cli_token()
     except Exception:  # noqa: BLE001 - any resolver failure = no token
         return None
-    return _gh_cli_token()
 
 
 def _gh_cli_token() -> Optional[str]:
@@ -136,7 +136,12 @@ def _normalize_reset(value: Any) -> Optional[str]:
     text = value.strip()
     if not text or text in ("0", "0001-01-01"):
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",  # tz-less ISO: assume UTC like the Z variants
+    ):
         try:
             parsed = datetime.strptime(text.replace("Z", "+0000"), fmt)
         except ValueError:
@@ -167,11 +172,10 @@ def _parse_snapshot(snapshot: dict) -> Optional[float]:
     remaining = _as_float(snapshot.get("percent_remaining"))
     if remaining is None:
         return None
-    if 0.0 <= remaining <= 1.0 and "percent_remaining" in snapshot:
-        # Fraction form only when the value clearly is one: a bare 1.0 or
-        # 0.0 is ambiguous, so only rescale strict fractions.
-        if 0.0 < remaining < 1.0:
-            remaining *= 100.0
+    if 0.0 < remaining < 1.0:
+        # A strict fraction is unambiguously 0-1 scale; bare 0.0 and 1.0
+        # stay on the 0-100 scale (same convention as CodexBar).
+        remaining *= 100.0
     has_quota = snapshot.get("has_quota")
     entitlement = _as_float(snapshot.get("entitlement"))
     quota_remaining = _as_float(snapshot.get("quota_remaining"))
@@ -244,10 +248,7 @@ def fetch_usage(github_token: str) -> QuotaResult:
 
 
 def fetch_copilot_quota() -> QuotaResult:
-    try:
-        token = resolve_github_token()
-    except Exception:  # noqa: BLE001 - defensive: resolver must never crash us
-        token = None
+    token = resolve_github_token()
     if not token:
         return build_unavailable(_PROVIDER_ID, "no-credentials")
     return fetch_usage(token)

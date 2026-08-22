@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 import unittest
 from io import BytesIO
 from unittest import mock
@@ -82,13 +83,17 @@ class CredentialTests(unittest.TestCase):
             result = mod.fetch_copilot_quota()
         self.assertEqual(result.unavailable_reason, "no-credentials")
 
-    def test_resolver_crash_never_propagates(self):
+    def test_core_resolver_crash_returns_none(self):
+        # A non-import failure inside Hermes core's resolver must degrade to
+        # "no token", never propagate (fail-open contract).
         def boom():
-            raise RuntimeError("subprocess exploded")
+            raise RuntimeError("core exploded")
 
-        with mock.patch.object(mod, "resolve_github_token", side_effect=boom):
-            result = mod.fetch_copilot_quota()
-        self.assertEqual(result.unavailable_reason, "no-credentials")
+        fake = types.SimpleNamespace(
+            copilot_auth=types.SimpleNamespace(resolve_copilot_token=boom)
+        )
+        with mock.patch.dict(sys.modules, {"hermes_cli": fake, "hermes_cli.copilot_auth": fake.copilot_auth}):
+            self.assertIsNone(mod.resolve_github_token())
 
     def test_gh_cli_fallback_success(self):
         proc = mock.Mock(returncode=0, stdout="gho_abc\n")
@@ -101,6 +106,17 @@ class CredentialTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"hermes_cli": None}):
             with mock.patch.object(mod.subprocess, "run", return_value=proc):
                 self.assertIsNone(mod.resolve_github_token())
+
+    def test_core_present_no_subprocess_when_core_returns_empty(self):
+        # Core imported fine but has no token: it already tried `gh auth
+        # token` internally — spawning our own subprocess would be redundant.
+        fake = types.SimpleNamespace(
+            copilot_auth=types.SimpleNamespace(resolve_copilot_token=lambda: ("", ""))
+        )
+        with mock.patch.dict(sys.modules, {"hermes_cli": fake, "hermes_cli.copilot_auth": fake.copilot_auth}):
+            with mock.patch.object(mod.subprocess, "run") as run:
+                self.assertIsNone(mod.resolve_github_token())
+                run.assert_not_called()
 
 
 class PayloadParsingTests(unittest.TestCase):
@@ -177,11 +193,16 @@ class PayloadParsingTests(unittest.TestCase):
             {"quota_snapshots": {"chat": {"percent_remaining": 1.0}},
              "quota_reset_date": "2026-09-01"}
         )
+        naive, _, _ = mod.parse_usage_payload(
+            {"quota_snapshots": {"chat": {"percent_remaining": 1.0}},
+             "quota_reset_date_utc": "2026-09-01T12:30:00"}
+        )
         none, _, _ = mod.parse_usage_payload(
             {"quota_snapshots": {"chat": {"percent_remaining": 1.0}}}
         )
         self.assertTrue(iso[0].reset_at.startswith("2026-09-01T"))
         self.assertTrue(bare[0].reset_at.startswith("2026-09-01T"))
+        self.assertTrue(naive[0].reset_at.startswith("2026-09-01T"))
         self.assertIsNone(none[0].reset_at)
 
 
