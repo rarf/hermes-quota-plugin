@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python-tests:
+    name: Python tests (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Byte-compile all backend sources
+        run: python -m py_compile __init__.py commands.py quota_cache.py quota_providers/*.py
+
+      - name: Run offline unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+  widget-js:
+    name: Desktop widget syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: node --check every desktop JS file
+        run: |
+          for f in desktop/*.js; do
+            node --check "$f"
+            echo "OK $f"
+          done
+
+      - name: Biome lint (format gate intentionally off)
+        run: npx --yes @biomejs/biome lint desktop/
+
+  shell-scripts:
+    name: Shell script syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n install/uninstall/scripts
+        run: |
+          bash -n install.sh uninstall.sh scripts/hermes-config.sh scripts/hermes-home.sh
+          echo "shell syntax OK"
+
+  manifest:
+    name: plugin.yaml sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Version is valid semver and matches nothing stale
+        run: |
+          python - <<'PY'
+          import re, sys, pathlib
+          text = pathlib.Path("plugin.yaml").read_text(encoding="utf-8")
+          match = re.search(r'^version:\s*(\S+)', text, re.MULTILINE)
+          if not match:
+              sys.exit("plugin.yaml: missing version key")
+          version = match.group(1)
+          if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+              sys.exit(f"plugin.yaml: version '{version}' is not semver X.Y.Z")
+          print(f"plugin.yaml version {version} OK")
+          PY
