@@ -11,8 +11,11 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,22 @@ except ImportError:  # pragma: no cover - environment-dependent
 _TEST_PASSWORD = "test-chrome-safe-storage"
 _FUTURE_EXPIRES = 20_000_000_000_000_000  # Chrome epoch, far future
 _EXPIRED_EXPIRES = 1
+
+
+@contextmanager
+def _temp_chrome_root() -> Iterator[Path]:
+    """Yield a throwaway ``<tmp>/Chrome`` user-data root."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "Chrome"
+        root.mkdir()
+        yield root
+
+
+@contextmanager
+def _temp_cookies_db() -> Iterator[Path]:
+    """Yield the path of a throwaway (empty, not-yet-created) cookies DB."""
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp) / "Cookies"
 
 
 def _pbkdf2_key(password: bytes) -> bytes:
@@ -140,20 +159,7 @@ class ChromeDiscoveryTests(unittest.TestCase):
         self.assertEqual(dirs[0].name, "Default")
 
     def _temp_chrome(self):
-        import tempfile
-
-        class _Ctx:
-            def __enter__(self_inner):
-                self_inner._tmp = tempfile.TemporaryDirectory()
-                root = Path(self_inner._tmp.name) / "Chrome"
-                root.mkdir()
-                return root
-
-            def __exit__(self_inner, *exc):
-                self_inner._tmp.cleanup()
-                return False
-
-        return _Ctx()
+        return _temp_chrome_root()
 
 
 @unittest.skipUnless(_HAS_CRYPTO, "cryptography is required for Chrome decrypt tests")
@@ -166,13 +172,12 @@ class ChromeDecryptTests(unittest.TestCase):
         self.assertEqual(decrypt_chrome_cookie_value(key, blob), "s3cret-value")
 
     def test_rejects_v20_prefix(self):
-        from quota_providers.browser_cookies import decrypt_chrome_cookie_value
+        from quota_providers.browser_cookies import ChromeCookieError, decrypt_chrome_cookie_value
 
         key = _pbkdf2_key(_TEST_PASSWORD.encode("utf-8"))
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(ChromeCookieError) as ctx:
             decrypt_chrome_cookie_value(key, b"v20" + b"\x00" * 32)
-        msg = str(ctx.exception).lower()
-        self.assertTrue("v20" in msg or "app-bound" in msg)
+        self.assertEqual(ctx.exception.reason, "chrome-app-bound")
 
     def test_strips_chrome127_host_hash_prefix(self):
         from quota_providers.browser_cookies import decrypt_chrome_cookie_value
@@ -301,18 +306,7 @@ class ChromeLoaderTests(unittest.TestCase):
         self.assertEqual(ctx.exception.reason, "chrome-tcc-denied")
 
     def _db(self):
-        import tempfile
-
-        class _Ctx:
-            def __enter__(self_inner):
-                self_inner._tmp = tempfile.TemporaryDirectory()
-                return Path(self_inner._tmp.name) / "Cookies"
-
-            def __exit__(self_inner, *exc):
-                self_inner._tmp.cleanup()
-                return False
-
-        return _Ctx()
+        return _temp_cookies_db()
 
 
 class GrokChromeWireTests(unittest.TestCase):
