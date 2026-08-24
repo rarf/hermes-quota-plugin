@@ -135,7 +135,9 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
 
     # Field map (decoded from a live capture, cross-checked against the
     # grok.com usage screen):
-    #   fn1 float          — Weekly Limit % used
+    #   fn1 float          — Weekly Limit % used (ABSENT = 0% used; the
+    #                        grok.com panel renders "0% utilizado" when the
+    #                        field is missing, e.g. free/unused accounts)
     #   fn4 / fn5 msg      — Weekly window start / reset (fn1 = epoch seconds)
     #   fn7 msg            — typed sub-quota: fn1 = kind, fn2 float = % used
     #                        (kind 2 = "Grok Build" on the usage screen)
@@ -206,6 +208,10 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
             return None
 
     windows: list[QuotaWindow] = []
+    if used_percent is None and reset_epoch is not None:
+        # Weekly window present but no usage field: the grok.com panel
+        # renders this as "0% utilizado" (free/unused accounts).
+        used_percent = 0.0
     if used_percent is not None or reset_epoch is not None:
         windows.append(
             QuotaWindow(label="Weekly", used_percent=used_percent, reset_at=_iso(reset_epoch))

@@ -253,6 +253,41 @@ class GrokRestTests(unittest.TestCase):
             res = grok._fetch_grok_rest("cookie=1")
         self.assertEqual(res.unavailable_reason, "cloudflare-blocked")
 
+    def test_grpc_no_usage_field_means_zero_percent(self):
+        """Live capture from a free/unused account: the weekly window and
+        banked flag are present but the fn1 usage field is ABSENT — the
+        grok.com panel renders this as "0% utilizado", so the parser must
+        report 0.0 instead of hiding the number."""
+        import struct
+
+        from quota_providers import grok
+
+        def _vi(n: int) -> bytes:
+            out = bytearray()
+            while True:
+                b = n & 0x7F
+                n >>= 7
+                if n:
+                    out.append(b | 0x80)
+                else:
+                    out.append(b)
+                    return bytes(out)
+
+        sub = b"\x08" + _vi(1788109248)  # fn1 = weekly reset epoch
+        inner = b"\x2a" + _vi(len(sub)) + sub  # fn5 = weekly window (no fn1 %)
+        inner += b"\x58\x01"  # fn11 = reset banked
+        msg = b"\x0a" + _vi(len(inner)) + inner  # fn1 = response payload
+        raw = b"\x00" + struct.pack(">I", len(msg)) + msg
+
+        res = grok._parse_grok_protobuf(raw)
+        self.assertIsNotNone(res)
+        self.assertIsNone(res.unavailable_reason)
+        by_label = {w.label: w for w in res.windows}
+        self.assertIn("Weekly", by_label)
+        self.assertAlmostEqual(by_label["Weekly"].used_percent, 0.0, places=2)
+        self.assertIn("2026-08-30T17:00:48", by_label["Weekly"].reset_at)
+        self.assertTrue(any("Reset banked" in d for d in res.details))
+
     def test_optin_disabled_by_default(self):
         from quota_providers import grok
 
