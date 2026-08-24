@@ -58,6 +58,10 @@ Chrome notes:
   (Desktop) and/or the Terminal you use for `hermes quota refresh`, then retry.
 - Chrome 127+ cookies prefix a SHA256(`host_key`) digest before the value; that prefix is stripped after AES-CBC decrypt.
 - Chrome App-Bound `v20` cookies are not supported (`chrome-app-bound`).
+- Typed failure reasons surfaced by refresh: `chrome-tcc-denied`,
+  `chrome-keychain-denied`, `chrome-app-bound`, `chrome-unknown-prefix`
+  (unrecognized cookie format), `chrome-decrypt-failed`, and
+  `chrome-crypto-missing` (install the `cryptography` package).
 - Safari is not supported.
 
 ## Install

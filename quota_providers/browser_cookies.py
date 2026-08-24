@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -19,15 +20,46 @@ import tempfile
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator, NoReturn, Optional
+
+try:
+    import cryptography  # noqa: F401  # dependency probe
+
+    _HAS_CRYPTO = True
+except ImportError:  # pragma: no cover - environment-dependent
+    _HAS_CRYPTO = False
+
+logger = logging.getLogger(__name__)
+
+# Typed failures that must abort the whole Chrome import instead of
+# degrading to the next profile database.
+_HARD_CHROME_FAILURES = frozenset({"chrome-crypto-missing"})
 
 
-class ChromeCookieError(Exception):
-    """Typed Chrome import failure. ``reason`` is a kebab-case unavailable_reason."""
+class ChromeCookieError(ValueError):
+    """Typed Chrome import failure.
+
+    Subclasses ``ValueError`` so the decrypt primitive can raise typed
+    failures directly (no string re-parsing at the call site), while any
+    unexpected ``ValueError`` still degrades to ``chrome-decrypt-failed``.
+    """
 
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
+
+
+def _raise_chrome_tcc() -> NoReturn:
+    """Single spelling of the typed TCC-denied failure."""
+    raise ChromeCookieError("chrome-tcc-denied") from None
+
+
+def _is_tcc_error(exc: BaseException) -> bool:
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 1:
+        return True
+    return "not permitted" in str(exc).lower()
 
 
 # Chrome expires_utc is microseconds since 1601-01-01 UTC.
@@ -105,14 +137,6 @@ def load_firefox_grok_cookies() -> Optional[str]:
     return None
 
 
-def _is_tcc_error(exc: BaseException) -> bool:
-    if isinstance(exc, PermissionError):
-        return True
-    if isinstance(exc, OSError) and getattr(exc, "errno", None) == 1:
-        return True
-    return "not permitted" in str(exc).lower()
-
-
 def _chrome_user_data_roots() -> list[Path]:
     # Decrypt is macOS Keychain only. Do not scan Windows/Linux Chrome roots.
     if sys.platform != "darwin":
@@ -122,7 +146,7 @@ def _chrome_user_data_roots() -> list[Path]:
         return [path] if path.exists() else []
     except OSError as exc:
         if _is_tcc_error(exc):
-            raise ChromeCookieError("chrome-tcc-denied") from None
+            _raise_chrome_tcc()
         return []
 
 
@@ -152,7 +176,7 @@ def _safe_chrome_profile_dir(root: Path, name: str) -> Optional[Path]:
         return candidate if candidate.is_dir() else None
     except OSError as exc:
         if _is_tcc_error(exc):
-            raise ChromeCookieError("chrome-tcc-denied") from None
+            _raise_chrome_tcc()
         return None
 
 
@@ -190,7 +214,7 @@ def chrome_profile_dirs(root: Path) -> list[Path]:
         if path is not None:
             ordered.append(path)
     if not ordered and saw_tcc:
-        raise ChromeCookieError("chrome-tcc-denied")
+        _raise_chrome_tcc()
     return ordered
 
 
@@ -218,7 +242,7 @@ def chrome_cookie_dbs() -> list[Path]:
                     if _is_tcc_error(exc):
                         saw_tcc = True
     if not dbs and saw_tcc:
-        raise ChromeCookieError("chrome-tcc-denied")
+        _raise_chrome_tcc()
     return dbs
 
 
@@ -250,11 +274,11 @@ def _chrome_safe_storage_password() -> Optional[str]:
 
 
 def _derive_chrome_key(password: str) -> bytes:
-    try:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    except ImportError:
-        raise ChromeCookieError("chrome-crypto-missing") from None
+    if not _HAS_CRYPTO:
+        raise ChromeCookieError("chrome-crypto-missing")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
     return PBKDF2HMAC(
         algorithm=hashes.SHA1(),
         length=16,
@@ -293,27 +317,33 @@ def _strip_chrome_host_hash(plaintext: bytes, host_key: Optional[str] = None) ->
 def decrypt_chrome_cookie_value(
     key: bytes, blob: bytes, host_key: Optional[str] = None
 ) -> str:
+    """Decrypt one Chrome cookie value.
+
+    Raises ``ChromeCookieError`` with a kebab-case reason for every typed
+    failure (``chrome-app-bound``, ``chrome-unknown-prefix``,
+    ``chrome-decrypt-failed``, ``chrome-crypto-missing``).
+    """
+    if not _HAS_CRYPTO:
+        raise ChromeCookieError("chrome-crypto-missing")
     if blob.startswith(b"v20"):
-        raise ValueError("chrome-app-bound")
+        raise ChromeCookieError("chrome-app-bound")
     if not blob.startswith((b"v10", b"v11")):
-        raise ValueError("chrome-unknown-prefix")
-    try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    except ImportError:
-        raise ChromeCookieError("chrome-crypto-missing") from None
+        raise ChromeCookieError("chrome-unknown-prefix")
     ciphertext = blob[3:]
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
     decryptor = Cipher(algorithms.AES(key), modes.CBC(_CHROME_CBC_IV)).decryptor()
     padded = decryptor.update(ciphertext) + decryptor.finalize()
     if not padded:
-        raise ValueError("chrome-decrypt-failed")
+        raise ChromeCookieError("chrome-decrypt-failed")
     pad = padded[-1]
     if pad < 1 or pad > 16 or padded[-pad:] != bytes([pad] * pad):
-        raise ValueError("chrome-decrypt-failed")
+        raise ChromeCookieError("chrome-decrypt-failed")
     plaintext = _strip_chrome_host_hash(padded[:-pad], host_key)
     try:
         return plaintext.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError("chrome-decrypt-failed") from exc
+        raise ChromeCookieError("chrome-decrypt-failed") from exc
 
 
 def _chrome_expires_ok(expires_utc: object, now: float) -> bool:
@@ -342,7 +372,7 @@ def load_chrome_grok_cookies() -> Optional[str]:
         raise
     except OSError as exc:
         if _is_tcc_error(exc):
-            raise ChromeCookieError("chrome-tcc-denied") from None
+            _raise_chrome_tcc()
         return None
 
     now = time.time()
@@ -365,9 +395,14 @@ def load_chrome_grok_cookies() -> Optional[str]:
                 ).fetchall()
         except OSError as exc:
             if _is_tcc_error(exc):
-                raise ChromeCookieError("chrome-tcc-denied") from None
+                _raise_chrome_tcc()
             continue
         except sqlite3.Error:
+            logger.debug(
+                "browser_cookies ▸ unreadable Chrome cookie DB (skip): %s",
+                source,
+                exc_info=True,
+            )
             continue
 
         pairs: list[tuple[str, str]] = []
@@ -380,14 +415,15 @@ def load_chrome_grok_cookies() -> Optional[str]:
                 key = _chrome_aes_key()
             try:
                 value = decrypt_chrome_cookie_value(key, bytes(blob), host_key=str(host_key or ""))
-            except ChromeCookieError:
-                raise
-            except ValueError as exc:
-                reason = str(exc) if str(exc).startswith("chrome-") else "chrome-decrypt-failed"
-                decrypt_reason = reason
+            except ChromeCookieError as exc:
+                if exc.reason in _HARD_CHROME_FAILURES:
+                    raise
+                # Soft failure: record the typed reason and try the next
+                # source database instead of aborting the whole import.
+                decrypt_reason = exc.reason
                 continue
-            except Exception:
-                raise ChromeCookieError("chrome-decrypt-failed") from None
+            except Exception as exc:
+                raise ChromeCookieError("chrome-decrypt-failed") from exc
             if value:
                 pairs.append((str(name), value))
         header = _cookie_header(iter(pairs))
