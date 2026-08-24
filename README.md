@@ -34,15 +34,31 @@ stay hidden.
 
 ## Grok is opt-in
 
-Grok is the only provider read from your browser (Firefox `grok.com` cookies) —
-there is no clean API path right now. It is **disabled by default**. Turn it on:
+Grok is the only provider read from your browser — there is no clean API path
+right now. It is **disabled by default**. Turn it on:
 
 ```bash
 hermes config set plugins.entries.quota.settings.grokEnabled true
 hermes quota refresh
 ```
 
-When off, Grok simply reports `opt-in-disabled`. No cookies are read, no files written.
+When off, Grok reports `opt-in-disabled`. No cookies are read, no files written.
+
+Cookie sources, in order:
+
+1. `~/grok_session.json` if you created one yourself
+2. Firefox `grok.com` cookies
+3. Google Chrome `grok.com` cookies (macOS)
+
+Chrome notes:
+
+- Sign into https://grok.com in Chrome at least once.
+- macOS will prompt for the `Chrome Safe Storage` Keychain item on first refresh.
+- If refresh returns `chrome-tcc-denied`, grant Full Disk Access to **Hermes.app**
+  (Desktop) and/or the Terminal you use for `hermes quota refresh`, then retry.
+- Chrome 127+ cookies prefix a SHA256(`host_key`) digest before the value; that prefix is stripped after AES-CBC decrypt.
+- Chrome App-Bound `v20` cookies are not supported (`chrome-app-bound`).
+- Safari is not supported.
 
 ## Install
 
@@ -98,6 +114,7 @@ the widget reads that file via `host.request('cli.exec', ['quota','status','--js
 
 - No telemetry. Cookies and tokens are never printed.
 - Grok cookies are used only for the Grok billing request, and only when you opt in.
+- Chrome/Firefox cookie values are never printed, cached, or written back to disk.
 - Missing credentials produce an explicit `unavailable` state — no fake zeros.
 - The plugin does not request permission to override built-in Hermes tools.
 
@@ -106,6 +123,8 @@ the widget reads that file via `host.request('cli.exec', ['quota','status','--js
 ```bash
 bash -n install.sh uninstall.sh
 python -m py_compile __init__.py commands.py quota_cache.py quota_providers/*.py
+python tests/test_fetchers.py
+python tests/test_browser_cookies.py
 node --check desktop/plugin.js
 hermes plugins doctor quota
 hermes quota refresh
