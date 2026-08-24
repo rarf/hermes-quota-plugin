@@ -449,7 +449,10 @@ const REPO_API_LATEST =
 	"https://api.github.com/repos/rarf/hermes-quota-plugin/commits/master";
 
 // Compare the installed commit stamp against GitHub master. One cheap
-// request per hour, cached in storage; never blocks rendering.
+// request per hour, cached in storage; never blocks rendering. The cache
+// entry is bound to the stamp it was taken with (`seen`) — so installing
+// a new version invalidates it immediately instead of serving a stale
+// "update available" verdict for the rest of the hour.
 function useUpdateCheck() {
 	const [update, setUpdate] = useState(null);
 	useEffect(() => {
@@ -469,7 +472,9 @@ function useUpdateCheck() {
 				/* not stamped (older install) — skip check */
 			}
 			if (!installedSha || installedSha === "unknown") return;
-			// Throttle: at most one GitHub call per hour.
+			// Throttle: at most one GitHub call per hour. The cached verdict
+			// is only valid for the installed stamp it was taken with — a
+			// fresh install must re-check immediately.
 			try {
 				const prev = CTX.storage.get(CHECK_KEY);
 				if (prev) {
@@ -477,7 +482,8 @@ function useUpdateCheck() {
 					if (
 						p.at &&
 						Date.now() - p.at < ONE_HOUR &&
-						p.latest
+						p.latest &&
+						p.seen === installedSha
 					) {
 						if (p.latest !== installedSha) {
 							setUpdate({ latest: p.latest });
@@ -499,7 +505,11 @@ function useUpdateCheck() {
 				try {
 					CTX.storage.set(
 						CHECK_KEY,
-						JSON.stringify({ at: Date.now(), latest }),
+						JSON.stringify({
+							at: Date.now(),
+							latest,
+							seen: installedSha,
+						}),
 					);
 				} catch {
 					/* noop */
