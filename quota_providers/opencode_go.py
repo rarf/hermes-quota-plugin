@@ -238,8 +238,9 @@ def _window_percent(window: dict) -> Optional[float]:
     if percent is None:
         return None
     # A direct percent may arrive as a fraction (0..1); computed used/limit
-    # values are already 0..100 and must not be rescaled.
-    if direct and 0.0 <= percent <= 1.0:
+    # values are already 0..100 and must not be rescaled. Integral values are
+    # face-value percentages (for example OpenCode Go's ``percent: 1``).
+    if direct and 0.0 < percent <= 1.0 and percent != int(percent):
         percent *= 100.0
     return max(0.0, min(100.0, percent))
 

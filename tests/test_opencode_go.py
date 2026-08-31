@@ -75,6 +75,12 @@ class PayloadParsingTests(unittest.TestCase):
         windows = mod.parse_usage_payload(payload, now=0)
         self.assertAlmostEqual(windows[0].used_percent, 25.0)
 
+    def test_integer_percent_one_is_not_rescaled(self):
+        mod = load_module()
+        payload = {"rollingUsage": {"percent": 1, "resetInSec": 60}}
+        windows = mod.parse_usage_payload(payload, now=0)
+        self.assertAlmostEqual(windows[0].used_percent, 1.0)
+
     def test_used_over_limit_computation(self):
         mod = load_module()
         payload = {"rollingUsage": {"used": 3.0, "limit": 12.0, "resetInSec": 30}}
