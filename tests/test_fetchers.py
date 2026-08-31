@@ -98,6 +98,26 @@ class NousPortalFetcherTests(unittest.TestCase):
         self.assertAlmostEqual(w.used_percent, (110.0 - 88.42) / 110.0 * 100.0, places=2)
         self.assertTrue(any("$88.42 of $110.00" in d for d in res.details))
 
+    def test_paid_spend_without_credit_cap_gets_details(self):
+        acct = _nous_account(
+            paid_service_access=True,
+            raw_claims={
+                "member_spend_usd": "21.77",
+                "member_spend_cap_usd": None,
+                "subscription_tier": 2,
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+                "rate_limit_rph": 16_800,
+            },
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Tier 2")
+        self.assertEqual(res.windows, [])
+        joined = "\n".join(res.details)
+        self.assertIn("Spend this period: $21.77 (no cap reported)", joined)
+        self.assertIn("Rate limits: 400 RPM · 4M TPM · 16.8k RPH", joined)
+
     def test_not_logged_in_is_unavailable(self):
         res = self._fetch_with(_nous_account(logged_in=False))
         self.assertEqual(res.unavailable_reason, "not-logged-in")

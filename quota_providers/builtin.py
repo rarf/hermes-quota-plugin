@@ -8,6 +8,7 @@ builder treats them uniformly with the Grok/Gemini/Kimi fetchers.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from .base import QuotaResult, QuotaWindow, build_unavailable
@@ -77,9 +78,35 @@ for _pid in ("anthropic", "openrouter"):
 
 
 def _finite_usd(value) -> Optional[float]:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool):
         return None
-    return float(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    if not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _nous_claim(account_info, name):
+    claims = getattr(account_info, "raw_claims", None)
+    return claims.get(name) if isinstance(claims, dict) else None
+
+
+def _format_rate_limit(value) -> Optional[str]:
+    number = _finite_usd(value)
+    if number is None or number < 0:
+        return None
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:g}M"
+    if number >= 1_000:
+        return f"{number / 1_000:g}k"
+    return f"{number:g}"
 
 
 def _nous_tool_pool_labels(account_info) -> list[str]:
@@ -156,6 +183,28 @@ def _fetch_nous_portal() -> QuotaResult:
             details.append(f"Renews: {period_end}")
 
     plan = (getattr(sub, "plan", None) if sub is not None else None) or None
+
+    # Some paid Portal accounts expose spend and subscription rate limits in
+    # raw claims without a subscription object or credit cap. These are useful
+    # details, but spend is not a quota denominator and must not become a
+    # percentage window.
+    member_spend = _finite_usd(_nous_claim(account, "member_spend_usd"))
+    member_spend_cap = _finite_usd(_nous_claim(account, "member_spend_cap_usd"))
+    if member_spend is not None:
+        suffix = " (no cap reported)" if member_spend_cap is None else ""
+        details.append(f"Spend this period: ${member_spend:.2f}{suffix}")
+
+    tier = _finite_usd(_nous_claim(account, "subscription_tier"))
+    if plan is None and tier is not None and tier >= 0 and tier.is_integer():
+        plan = f"Tier {int(tier)}"
+
+    rate_limits = []
+    for claim, unit in (("rate_limit_rpm", "RPM"), ("rate_limit_tpm", "TPM"), ("rate_limit_rph", "RPH")):
+        formatted = _format_rate_limit(_nous_claim(account, claim))
+        if formatted is not None:
+            rate_limits.append(f"{formatted} {unit}")
+    if rate_limits:
+        details.append("Rate limits: " + " · ".join(rate_limits))
 
     if not windows and not details:
         if paid is False:
