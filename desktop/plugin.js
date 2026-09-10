@@ -466,7 +466,7 @@ function useUpdateCheck() {
 					argv: ["quota", "status", "--version-json"],
 				});
 				if (!result?.blocked && result?.code === 0 && result.output) {
-					installedSha = JSON.parse(result.output).installed_sha || null;
+					installedSha = parseJsonOutput(result.output).installed_sha || null;
 				}
 			} catch {
 				/* not stamped (older install) — skip check */
@@ -551,6 +551,62 @@ function UpdateBanner({ update }) {
 
 // ---- data hook (cli.exec instead of REST) ----------------------------------
 
+// The gateway's cli.exec response currently joins stdout and stderr. Hermes
+// may emit a startup/update diagnostic on stderr after the CLI's JSON payload;
+// parse the complete value first, then fall back to the first balanced JSON
+// object/array so diagnostics cannot turn valid quota data into `{}`.
+function parseJsonOutput(output) {
+	const text = String(output ?? "").trim();
+	if (!text) throw new Error("empty JSON output");
+
+	let firstError;
+	try {
+		return JSON.parse(text);
+	} catch (error) {
+		firstError = error;
+	}
+
+	let start = -1;
+	const stack = [];
+	let inString = false;
+	let escaped = false;
+	for (let i = 0; i < text.length; i += 1) {
+		const ch = text[i];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (ch === "\\") escaped = true;
+			else if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') {
+			inString = true;
+			continue;
+		}
+		if (ch === "{" || ch === "[") {
+			if (stack.length === 0) start = i;
+			stack.push(ch);
+			continue;
+		}
+		if (ch !== "}" && ch !== "]") continue;
+
+		const expected = ch === "}" ? "{" : "[";
+		if (stack.length === 0 || stack[stack.length - 1] !== expected) {
+			stack.length = 0;
+			start = -1;
+			continue;
+		}
+		stack.pop();
+		if (stack.length === 0 && start >= 0) {
+			try {
+				return JSON.parse(text.slice(start, i + 1));
+			} catch {
+				start = -1;
+			}
+		}
+	}
+	throw firstError || new Error("invalid JSON output");
+}
+
 function useQuota() {
 	const intervalMs = useValue(refreshIntervalAtom) * 1000;
 	return useQuery({
@@ -574,10 +630,11 @@ function useQuota() {
 					result?.hint || result?.output || "quota status failed",
 				);
 			}
-			// CLI prints JSON to stdout; parse it
+			// cli.exec exposes stdout and stderr as one string; parse the JSON
+			// value while ignoring any trailing gateway diagnostics.
 			let data;
 			try {
-				data = JSON.parse(result.output || "{}");
+				data = parseJsonOutput(result.output || "{}");
 			} catch {
 				data = {};
 			}
