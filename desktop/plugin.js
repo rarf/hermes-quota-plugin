@@ -320,6 +320,7 @@ const PROVIDER_META = {
 	grok: { name: "xAI Grok", mono: "X" },
 	"opencode-go": { name: "OpenCode Go", mono: "OC" },
 	copilot: { name: "Copilot", mono: "CP" },
+	zai: { name: "Z.ai Coding Plan", mono: "Z" },
 };
 
 function providerMeta(pid) {

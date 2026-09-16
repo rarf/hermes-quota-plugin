@@ -134,6 +134,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `kimi` | local CLI | — |
 | `openrouter` | API key | Balance/credits style detail lines |
 | `opencode-go` | API key | See the OpenCode note below |
+| `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
