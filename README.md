@@ -24,8 +24,9 @@ network I/O of its own; it reads a local cache the backend refreshes on demand.
 ## Supported providers
 
 `anthropic`, `openai-codex`, `nous`, `openrouter`, `gemini`, `kimi`,
-`opencode-go`, `copilot`, plus `grok` (opt-in). Each fetcher is fail-open: a broken
-provider shows `unavailable (<reason>)` and never blocks the rest.
+`opencode-go`, `copilot`, `zai` (GLM Coding Plan), plus `grok` (opt-in). Each
+fetcher is fail-open: a broken provider shows `unavailable (<reason>)` and
+never blocks the rest.
 
 The OpenAI Codex fetcher goes beyond the core: it parses
 `additional_rate_limits` to surface **per-model Spark limits**
