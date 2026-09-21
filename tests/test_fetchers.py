@@ -34,6 +34,162 @@ def _urlopen_returning(payload: dict):
     return _opener
 
 
+# -- OpenAI Codex -------------------------------------------------------------
+
+
+class OpenAICodexFetcherTests(unittest.TestCase):
+    def test_legacy_usage_url_helper_is_supported(self):
+        from quota_providers.builtin import _fetch_codex_with_models
+
+        captured = {}
+        payload = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 21, "reset_at": 1_700_000_000},
+            },
+        }
+
+        fake_usage = types.ModuleType("agent.account_usage")
+        setattr(
+            fake_usage,
+            "_resolve_codex_usage_credentials",
+            lambda *_args: (
+                "test-token",
+                "https://chatgpt.com/backend-api/codex",
+                "account-1",
+            ),
+        )
+        setattr(
+            fake_usage,
+            "_resolve_codex_usage_url",
+            lambda base: f"{base.removesuffix('/codex')}/wham/usage",
+        )
+        fake_agent = types.ModuleType("agent")
+        setattr(fake_agent, "account_usage", fake_usage)
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get(self, url, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return FakeResponse()
+
+        fake_httpx = types.ModuleType("httpx")
+        setattr(fake_httpx, "Client", FakeClient)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "agent": fake_agent,
+                "agent.account_usage": fake_usage,
+                "httpx": fake_httpx,
+            },
+        ):
+            result = _fetch_codex_with_models()
+
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(captured["url"], "https://chatgpt.com/backend-api/wham/usage")
+        self.assertEqual(captured["headers"]["ChatGPT-Account-Id"], "account-1")
+
+    def test_current_account_usage_helpers_are_supported(self):
+        from quota_providers.builtin import _fetch_codex_with_models
+
+        captured = {}
+        payload = {
+            "plan_type": "plus",
+            "rate_limit": {
+                "primary_window": {"used_percent": 21, "reset_at": 1_700_000_000},
+                "secondary_window": {"used_percent": 42, "reset_at": 1_700_100_000},
+            },
+            "additional_rate_limits": [
+                {
+                    "limit_name": "GPT-5-Codex-Spark",
+                    "rate_limit": {
+                        "primary_window": {"used_percent": 7, "reset_at": 1_700_000_000}
+                    },
+                }
+            ],
+        }
+
+        fake_usage = types.ModuleType("agent.account_usage")
+        setattr(
+            fake_usage,
+            "_resolve_codex_usage_credentials",
+            lambda *_args: (
+                "test-token",
+                "https://chatgpt.com/backend-api/codex",
+                "account-1",
+            ),
+        )
+        setattr(
+            fake_usage,
+            "_codex_backend_urls",
+            lambda base: (
+                f"{base.removesuffix('/codex')}/wham/usage",
+                "",
+                "",
+            ),
+        )
+        fake_agent = types.ModuleType("agent")
+        setattr(fake_agent, "account_usage", fake_usage)
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class FakeClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def get(self, url, headers):
+                captured["url"] = url
+                captured["headers"] = headers
+                return FakeResponse()
+
+        fake_httpx = types.ModuleType("httpx")
+        setattr(fake_httpx, "Client", FakeClient)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "agent": fake_agent,
+                "agent.account_usage": fake_usage,
+                "httpx": fake_httpx,
+            },
+        ):
+            result = _fetch_codex_with_models()
+
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(captured["url"], "https://chatgpt.com/backend-api/wham/usage")
+        self.assertEqual(captured["headers"]["ChatGPT-Account-Id"], "account-1")
+        self.assertEqual(
+            [w.label for w in result.windows],
+            ["Session", "Weekly", "5 Codex Spark · 5h"],
+        )
+
+
 # -- Nous Portal --------------------------------------------------------------
 
 

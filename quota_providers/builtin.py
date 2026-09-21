@@ -235,10 +235,17 @@ _register("nous")(_fetch_nous_portal)
 
 def _fetch_codex_with_models() -> QuotaResult:
     try:
-        from agent.account_usage import (
-            _resolve_codex_usage_credentials,
-            _codex_backend_urls,
-        )
+        from agent.account_usage import _resolve_codex_usage_credentials
+        try:
+            from agent.account_usage import _codex_backend_urls
+        except ImportError:
+            _codex_backend_urls = None
+        try:
+            from agent.account_usage import _resolve_codex_usage_url
+        except ImportError:
+            _resolve_codex_usage_url = None
+        if _codex_backend_urls is None and _resolve_codex_usage_url is None:
+            raise ImportError("no Codex usage URL helper")
     except Exception:
         return build_unavailable("openai-codex", "fetcher-unavailable")
 
@@ -253,8 +260,12 @@ def _fetch_codex_with_models() -> QuotaResult:
         }
         if account_id:
             headers["ChatGPT-Account-Id"] = account_id
+        if _codex_backend_urls is not None:
+            usage_url = _codex_backend_urls(base_url)[0]
+        else:
+            usage_url = _resolve_codex_usage_url(base_url)
         with httpx.Client(timeout=15.0) as client:
-            response = client.get(_codex_backend_urls(base_url)[0], headers=headers)
+            response = client.get(usage_url, headers=headers)
             response.raise_for_status()
         payload = response.json() or {}
     except Exception:
