@@ -329,6 +329,7 @@ const PROVIDER_META = {
 	"opencode-go": { name: "OpenCode Go", mono: "OC" },
 	copilot: { name: "Copilot", mono: "CP" },
 	zai: { name: "Z.ai", mono: "Z" },
+	commandcode: { name: "CommandCode", mono: "CC" },
 };
 
 function providerMeta(pid) {

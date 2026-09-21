@@ -135,10 +135,26 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `openrouter` | API key | Balance/credits style detail lines |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
+| `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### CommandCode
+
+CommandCode reads the API key from `~/.commandcode/auth.json` and follows the
+billing calls used by the official Command Code CLI 1.53.0. It first requests
+`/alpha/whoami?limits=1`, then scopes billing and usage calls with the returned
+organization ID; `currentPeriodStart` is passed as the usage-summary `since`
+value when the subscription response provides it. These alpha routes are not a
+public API, so the fetcher fails open on unknown response shapes and shows only
+known plan labels/denominators. It accepts both observed locations for
+`windowLimits` (`credits.windowLimits` and the older top-level form), shows
+rolling **5h** and **Weekly** windows, and shows a **Cycle** percentage only for
+a known plan. Unknown plans retain a balance-only detail instead of an invented
+label or percentage. The provider's request group has its own 10-second
+wall-clock deadline, below the cache sweep budget.
 
 ### OpenCode (Go)
 
