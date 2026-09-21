@@ -586,6 +586,112 @@ const SNAPSHOT_KEY = "lastPayload";
 const CLI_TIMEOUT_MS = 15_000;
 let _refreshInFlight = false;
 
+// cli.exec currently joins stdout and stderr. Find a complete JSON value while
+// ignoring diagnostics, but only accept the shape needed by the caller. Each
+// opener is considered independently so an unmatched delimiter in a diagnostic
+// cannot swallow the real payload.
+function parseJsonOutput(output, requiredKey) {
+	const text = String(output ?? "").trim();
+	if (!text) throw new Error("empty JSON output");
+
+	const matchesSchema = (value) => {
+		if (!requiredKey) return true;
+		if (
+			value === null ||
+			typeof value !== "object" ||
+			Array.isArray(value) ||
+			!Object.prototype.hasOwnProperty.call(value, requiredKey)
+		) {
+			return false;
+		}
+		if (requiredKey === "providers") {
+			return (
+				value.providers !== null &&
+				typeof value.providers === "object" &&
+				!Array.isArray(value.providers)
+			);
+		}
+		return (
+			requiredKey !== "installed_sha" ||
+			value.installed_sha == null ||
+			typeof value.installed_sha === "string"
+		);
+	};
+
+	let firstError;
+	try {
+		const value = JSON.parse(text);
+		if (matchesSchema(value)) return value;
+		firstError = new Error(`JSON output missing ${requiredKey || "expected"} schema`);
+	} catch (error) {
+		firstError = error;
+	}
+
+	let cursor = 0;
+	while (cursor < text.length) {
+		let start = cursor;
+		while (
+			start < text.length &&
+			text[start] !== "{" &&
+			text[start] !== "["
+		) {
+			start += 1;
+		}
+		if (start >= text.length) break;
+
+		const stack = [];
+		let inString = false;
+		let escaped = false;
+		let end = -1;
+		for (let i = start; i < text.length; i += 1) {
+			const ch = text[i];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (ch === "\\") escaped = true;
+				else if (ch === '"') inString = false;
+				continue;
+			}
+			if (ch === '"') {
+				inString = true;
+				continue;
+			}
+			if (ch === "{" || ch === "[") {
+				stack.push(ch);
+				continue;
+			}
+			if (ch !== "}" && ch !== "]") continue;
+
+			const expected = ch === "}" ? "{" : "[";
+			if (stack.length === 0 || stack[stack.length - 1] !== expected) {
+				break;
+			}
+			stack.pop();
+			if (stack.length === 0) {
+				end = i;
+				break;
+			}
+		}
+
+		if (end < 0) {
+			cursor = start + 1;
+			continue;
+		}
+		try {
+			const value = JSON.parse(text.slice(start, end + 1));
+			if (matchesSchema(value)) return value;
+			// A valid but unrelated JSON value is a complete diagnostic; do not
+			// mistake an object nested inside it for the command response.
+			cursor = end + 1;
+		} catch {
+			// An invalid balanced span may contain the real payload; retry from
+			// its next opener instead of skipping over it.
+			cursor = start + 1;
+		}
+	}
+
+	throw firstError || new Error("invalid JSON output");
+}
+
 function readSnapshot() {
 	try {
 		const raw = CTX.storage.get(SNAPSHOT_KEY);
@@ -655,10 +761,12 @@ function useQuota() {
 				"--json",
 				"--cached",
 			]);
-			// CLI prints JSON to stdout; parse it
+			// cli.exec exposes stdout and stderr as one string; parse the quota
+			// value while ignoring gateway diagnostics. Keep the full envelope so
+			// its installed_sha still feeds the update check.
 			let data;
 			try {
-				data = JSON.parse(result.output || "{}");
+				data = parseJsonOutput(result.output || "{}", "providers");
 			} catch {
 				data = {};
 			}
