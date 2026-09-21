@@ -153,7 +153,7 @@ def _parse_reset(value: Any) -> Optional[str]:
             return None
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.isoformat()
+        return parsed.astimezone(timezone.utc).isoformat()
     return None
 
 
@@ -251,7 +251,7 @@ def parse_quota_payload(data: Any) -> QuotaResult:
     if monthly is not None:
         windows.append(monthly)
 
-    if not windows:
+    if not windows and not details:
         return build_unavailable(PROVIDER_ID, "no-data")
 
     plan = _plan_label(inner.get("level"))

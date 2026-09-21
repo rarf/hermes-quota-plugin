@@ -27,6 +27,14 @@ class _FakeResponse(BytesIO):
         return False
 
 
+def _raise_closed_http_error(error):
+    """Raise a mocked HTTPError without leaking its response buffer."""
+    try:
+        raise error
+    finally:
+        error.close()
+
+
 def _urlopen_returning(payload: dict):
     def _opener(_req, timeout=None):  # noqa: ANN001, ARG001
         return _FakeResponse(json.dumps(payload).encode("utf-8"))
@@ -423,7 +431,7 @@ class GrokRestTests(unittest.TestCase):
         from quota_providers import grok
 
         def _opener(_req, timeout=None):  # noqa: ANN001, ARG001
-            raise urllib.error.HTTPError("url", 403, "forbidden", {}, BytesIO(b"cf"))
+            _raise_closed_http_error(urllib.error.HTTPError("url", 403, "forbidden", {}, None))
 
         with mock.patch.object(grok.urllib.request, "urlopen", _opener):
             res = grok._fetch_grok_rest("cookie=1")
@@ -536,14 +544,14 @@ def _zai_urlopen(quota_payload=None, subscription_payload=None, quota_error=None
         url = str(getattr(req, "full_url", req))
         if "/api/biz/subscription/list" in url:
             if subscription_payload is None:
-                raise urllib.error.HTTPError(url, 404, "not found", {}, BytesIO(b""))
+                _raise_closed_http_error(urllib.error.HTTPError(url, 404, "not found", {}, None))
             return _FakeResponse(json.dumps(subscription_payload).encode("utf-8"))
         if quota_error is not None:
-            raise quota_error
+            _raise_closed_http_error(quota_error)
         if raw_body is not None:
             return _FakeResponse(raw_body)
         if quota_payload is None:
-            raise urllib.error.HTTPError(url, 500, "server error", {}, BytesIO(b""))
+            _raise_closed_http_error(urllib.error.HTTPError(url, 500, "server error", {}, None))
         return _FakeResponse(json.dumps(quota_payload).encode("utf-8"))
 
     return _opener
@@ -635,11 +643,13 @@ class ZaiFetcherTests(unittest.TestCase):
     def test_time_limit_without_positive_limit_lands_in_details_only(self):
         payload = _zai_full_payload()
         time_limit = payload["data"]["limits"][2]
+        payload["data"]["limits"] = [time_limit]
         time_limit["usage"] = 0
         time_limit.pop("percentage")
         res = self._fetch(_zai_urlopen(quota_payload=payload))
-        by_label = {w.label: w for w in res.windows}
-        self.assertNotIn("Monthly web tools", by_label)  # no fake percent without a limit
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.windows, [])
+        self.assertTrue(res.has_data())
         self.assertIn("1828", "\n".join(res.details))
 
     def test_subscription_enriches_plan_and_renews_detail(self):
@@ -671,14 +681,14 @@ class ZaiFetcherTests(unittest.TestCase):
         import urllib.error
 
         res = self._fetch(_zai_urlopen(
-            quota_error=urllib.error.HTTPError("u", 401, "unauthorized", {}, BytesIO(b""))))
+            quota_error=urllib.error.HTTPError("u", 401, "unauthorized", {}, None)))
         self.assertEqual(res.unavailable_reason, "auth-failed")
 
     def test_http_500_and_bad_json(self):
         import urllib.error
 
         res = self._fetch(_zai_urlopen(
-            quota_error=urllib.error.HTTPError("u", 502, "bad gateway", {}, BytesIO(b""))))
+            quota_error=urllib.error.HTTPError("u", 502, "bad gateway", {}, None)))
         self.assertEqual(res.unavailable_reason, "http-502")
         res = self._fetch(_zai_urlopen(raw_body=b"not-json{"))
         self.assertEqual(res.unavailable_reason, "bad-json")
@@ -711,6 +721,10 @@ class ZaiFetcherTests(unittest.TestCase):
         self.assertEqual(zai._parse_reset("1770648402389"), _iso_from_ms(1770648402389))
         self.assertEqual(
             zai._parse_reset("2026-09-20T12:00:00Z"), "2026-09-20T12:00:00+00:00")
+        self.assertEqual(
+            zai._parse_reset("2026-09-20T14:00:00+02:00"),
+            "2026-09-20T12:00:00+00:00",
+        )
         for absent in (0, None, "", "garbage", -5):
             self.assertIsNone(zai._parse_reset(absent), msg=repr(absent))
 

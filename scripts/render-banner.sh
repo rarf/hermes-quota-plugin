@@ -15,7 +15,7 @@ set -Eeuo pipefail
 
 SRC="${1:?screenshot path}"
 OUT="${2:?output dir}"
-VERSION="${3:-2.3.4}"
+VERSION="${3:-2.4.0}"
 mkdir -p "$OUT"
 
 # Pane: a sliver of workspace on the left for a natural edge, from just under
@@ -48,7 +48,7 @@ magick -size 1200x600 gradient:'#141b25-#0a0d11' \
   -annotate +62+266 'in the desktop pane and the status bar.' \
   -pointsize 21 -fill '#8c98a8' \
   -annotate +62+328 'Copilot · OpenAI Codex · OpenCode Go · Grok · Gemini' \
-  -annotate +62+360 'Anthropic · Kimi · Nous Portal · OpenRouter' \
+  -annotate +62+360 'Anthropic · Kimi · Nous Portal · OpenRouter · Z.ai' \
   -pointsize 20 -fill '#6d7887' \
   -annotate +62+524 "v${VERSION}  ·  community plugin  ·  github.com/rarf/hermes-quota-plugin" \
   /tmp/_bg.png
