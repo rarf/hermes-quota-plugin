@@ -61,8 +61,46 @@ def _make_fetcher(provider_id: str):
     return _fetch
 
 
-for _pid in ("anthropic", "openrouter"):
+def _core_fetch_account_usage(provider_id: str):
+    """Thin seam over the core dispatcher (kept importable/mockable for tests)."""
+    from agent.account_usage import fetch_account_usage
+
+    return fetch_account_usage(provider_id)
+
+
+def _core_anthropic_token() -> Optional[str]:
+    """Resolvable Anthropic token per core auth, or None. Never raises."""
+    try:
+        from agent.anthropic_credentials import resolve_anthropic_token
+
+        token = (resolve_anthropic_token() or "").strip()
+        return token or None
+    except Exception:  # noqa: BLE001 - standalone install / locked store
+        return None
+
+
+def _fetch_anthropic() -> QuotaResult:
+    """Anthropic adapter: like the generic one, but a ``None`` snapshot is
+    diagnosed — no resolvable token means ``no-credentials``; a token that
+    still produced no snapshot means the vendor call failed (``fetch-error``).
+    The core collapses every failure to ``None`` (fail-open), so this extra
+    read is the only way to keep the reason honest."""
+    try:
+        snap = _core_fetch_account_usage("anthropic")
+    except ImportError:
+        return build_unavailable("anthropic", "fetcher-unavailable")
+    except Exception:
+        return build_unavailable("anthropic", "fetch-error")
+    if snap is None:
+        reason = "fetch-error" if _core_anthropic_token() else "no-credentials"
+        return build_unavailable("anthropic", reason)
+    return _snapshot_to_result(snap)
+
+
+for _pid in ("openrouter",):
     _register(_pid)(_make_fetcher(_pid))
+
+_register("anthropic")(_fetch_anthropic)
 
 
 # -- Nous Portal (direct account-info adapter) --------------------------------

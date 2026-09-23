@@ -11,6 +11,7 @@ import os
 import sys
 import types
 import unittest
+import urllib.error
 from io import BytesIO
 from unittest import mock
 
@@ -591,14 +592,220 @@ class GrokRestTests(unittest.TestCase):
 
 # -- Kimi ---------------------------------------------------------------------
 
+# Live-captured response shape of GET https://api.kimi.com/coding/v1/usages
+# (2026-09-23, Hermes-resolved sk-kimi-* key): an RPM-style `limits` list whose
+# numeric fields are STRINGS, plus a `usages` map of ratio-based plan windows.
+_KIMI_LIVE_PAYLOAD = {
+    "limits": [
+        {
+            "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+            "detail": {
+                "limit": "100",
+                "used": "57",
+                "remaining": "43",
+                "resetTime": "2026-09-23T04:08:05.435444Z",
+            },
+        }
+    ],
+    "usages": {
+        "limit_5h": {"used_ratio": 0, "reset_time": "2026-09-23T04:08:05Z"},
+        "limit_month_total": {"used_ratio": 0.1559, "reset_time": "2026-10-19T00:00:00Z"},
+        "limit_month_code": {"used_ratio": 0, "reset_time": "2026-10-19T00:00:00Z"},
+    },
+}
+
 
 class KimiFetcherTests(unittest.TestCase):
-    def test_no_credentials(self):
+    def test_no_credentials_anywhere(self):
+        """Neither Hermes auth nor the legacy session file -> no-credentials."""
         from quota_providers import kimi
 
-        with mock.patch.object(kimi, "_load_creds", return_value=(None, None)):
+        with mock.patch.object(kimi, "_load_hermes_creds", return_value=(None, None)), \
+             mock.patch.object(kimi, "_load_creds", return_value=(None, None)):
             res = kimi.fetch_kimi_quota()
         self.assertEqual(res.unavailable_reason, "no-credentials")
+
+    def test_hermes_auth_used_when_session_file_missing(self):
+        """Hermes-managed kimi-coding credential must work without ~/kimi_session.json."""
+        from quota_providers import kimi
+
+        captured = {}
+
+        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
+            captured["req"] = req
+            return _FakeResponse(json.dumps(_KIMI_LIVE_PAYLOAD).encode("utf-8"))
+
+        with mock.patch.object(kimi, "_load_hermes_creds",
+                               return_value=("sk-kimi-test", "https://api.kimi.com/coding")), \
+             mock.patch.object(kimi, "_load_creds", return_value=(None, None)), \
+             mock.patch.object(kimi.urllib.request, "urlopen", _opener):
+            res = kimi.fetch_kimi_quota()
+        self.assertIsNone(res.unavailable_reason)
+        self.assertTrue(res.has_data())
+        # The Hermes-resolved base URL drives the usages endpoint.
+        req = captured["req"]
+        self.assertEqual(req.full_url, "https://api.kimi.com/coding/v1/usages")
+        self.assertEqual(req.get_header("Authorization"), "Bearer sk-kimi-test")
+
+    def test_hermes_dotenv_base_url_override_is_honored(self):
+        """Use the core dotenv-aware resolver, rather than process env only."""
+        from quota_providers import kimi
+
+        pconfig = types.SimpleNamespace(
+            auth_type="api_key", inference_base_url="https://api.moonshot.ai/v1",
+            base_url_env_var="KIMI_BASE_URL")
+        base_url = mock.Mock(return_value="https://proxy.example/v1")
+        auth = types.ModuleType("hermes_cli.auth")
+        config = types.ModuleType("hermes_cli.config")
+        setattr(auth, "PROVIDER_REGISTRY", {"kimi-coding": pconfig})
+        setattr(auth, "_resolve_api_key_provider_secret", mock.Mock(
+            return_value=("sk-kimi-test", "dotenv")))
+        setattr(config, "get_env_value_prefer_dotenv", base_url)
+        setattr(auth, "_resolve_kimi_base_url",
+                lambda _key, default, override: override or default)
+        with mock.patch.dict(sys.modules, {"hermes_cli.auth": auth,
+                                           "hermes_cli.config": config}):
+            key, resolved_url = kimi._load_hermes_creds()
+        self.assertEqual(key, "sk-kimi-test")
+        self.assertEqual(resolved_url, "https://proxy.example/v1")
+        base_url.assert_called_once_with("KIMI_BASE_URL")
+
+    def test_live_payload_shape_parsed(self):
+        """Real 2026-09 payload: usages ratios + string-valued RPM limits."""
+        from quota_providers import kimi
+
+        with mock.patch.object(kimi, "_load_hermes_creds",
+                               return_value=("sk-kimi-test", "https://api.kimi.com/coding")), \
+             mock.patch.object(kimi, "_load_creds", return_value=(None, None)), \
+             mock.patch.object(kimi.urllib.request, "urlopen",
+                               _urlopen_returning(_KIMI_LIVE_PAYLOAD)):
+            res = kimi.fetch_kimi_quota()
+        by_label = {w.label: w for w in res.windows}
+        session = by_label["Session (5h)"]
+        self.assertEqual(session.used_percent, 0.0)
+        self.assertEqual(session.reset_at, "2026-09-23T04:08:05Z")
+        monthly = by_label["Monthly total"]
+        self.assertAlmostEqual(monthly.used_percent, 15.59, places=2)
+        self.assertEqual(monthly.reset_at, "2026-10-19T00:00:00Z")
+        self.assertIn("Monthly code", by_label)
+        rate = by_label["Rate (5h)"]
+        self.assertEqual(rate.used_percent, 57.0)
+        self.assertEqual(rate.reset_at, "2026-09-23T04:08:05.435444Z")
+
+    def test_session_file_fallback_when_hermes_auth_absent(self):
+        """Standalone installs keep the legacy ~/kimi_session.json path."""
+        from quota_providers import kimi
+
+        captured = {}
+
+        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
+            captured["req"] = req
+            return _FakeResponse(json.dumps(_KIMI_LIVE_PAYLOAD).encode("utf-8"))
+
+        with mock.patch.object(kimi, "_load_hermes_creds", return_value=(None, None)), \
+             mock.patch.object(kimi, "_load_creds", return_value=("legacy-key", None)), \
+             mock.patch.object(kimi.urllib.request, "urlopen", _opener):
+            res = kimi.fetch_kimi_quota()
+        self.assertIsNone(res.unavailable_reason)
+        req = captured["req"]
+        self.assertEqual(req.get_header("Authorization"), "Bearer legacy-key")
+
+    def test_auth_failed_maps_401(self):
+        from quota_providers import kimi
+
+        def _opener(_req, timeout=None):
+            _raise_closed_http_error(
+                urllib.error.HTTPError("url", 401, "unauthorized", {}, None))
+
+        with mock.patch.object(kimi, "_load_hermes_creds",
+                               return_value=("sk-kimi-test", "https://api.kimi.com/coding")), \
+             mock.patch.object(kimi, "_load_creds", return_value=(None, None)), \
+             mock.patch.object(kimi.urllib.request, "urlopen", _opener):
+            res = kimi.fetch_kimi_quota()
+        self.assertEqual(res.unavailable_reason, "auth-failed")
+
+    def test_empty_payload_is_no_data(self):
+        from quota_providers import kimi
+
+        with mock.patch.object(kimi, "_load_hermes_creds",
+                               return_value=("sk-kimi-test", "https://api.kimi.com/coding")), \
+             mock.patch.object(kimi, "_load_creds", return_value=(None, None)), \
+             mock.patch.object(kimi.urllib.request, "urlopen", _urlopen_returning({})):
+            res = kimi.fetch_kimi_quota()
+        self.assertEqual(res.unavailable_reason, "no-data")
+
+
+# -- Anthropic (builtin adapter over core fetch_account_usage) -----------------
+
+
+class AnthropicBuiltinFetcherTests(unittest.TestCase):
+    """When the core usage fetch returns no snapshot, the reason must be useful."""
+
+    def _fetch(self):
+        from quota_providers.builtin import _fetch_anthropic
+
+        return _fetch_anthropic()
+
+    def test_no_snapshot_without_token_is_no_credentials(self):
+        import quota_providers.builtin as builtin
+
+        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=None), \
+             mock.patch.object(builtin, "_core_anthropic_token", return_value=None):
+            res = self._fetch()
+        self.assertEqual(res.unavailable_reason, "no-credentials")
+
+    def test_no_snapshot_with_token_is_fetch_error(self):
+        """A resolvable token + no snapshot = the vendor call failed (e.g. 401)."""
+        import quota_providers.builtin as builtin
+
+        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=None), \
+             mock.patch.object(builtin, "_core_anthropic_token", return_value="sk-ant-oauth-x"):
+            res = self._fetch()
+        self.assertEqual(res.unavailable_reason, "fetch-error")
+
+    def test_snapshot_windows_passthrough(self):
+        """Regression: a real snapshot still maps into QuotaResult windows."""
+        import quota_providers.builtin as builtin
+        from datetime import datetime, timezone
+
+        class _W:
+            label = "Current session"
+            used_percent = 42.0
+            reset_at = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
+
+        class _Snap:
+            provider = "anthropic"
+            windows = (_W(),)
+            plan = "Max"
+            unavailable_reason = None
+            details = ("Extra usage: 1.00 / 5.00 USD",)
+
+        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=_Snap()):
+            res = self._fetch()
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Max")
+        self.assertEqual(res.windows[0].label, "Current session")
+        self.assertEqual(res.windows[0].used_percent, 42.0)
+        self.assertEqual(res.windows[0].reset_at, "2026-09-23T09:00:00+00:00")
+        self.assertEqual(res.details, ["Extra usage: 1.00 / 5.00 USD"])
+
+    def test_snapshot_unavailable_reason_passthrough(self):
+        """Regression: core-provided reasons (e.g. api-key-only) are kept verbatim."""
+        import quota_providers.builtin as builtin
+
+        class _Snap:
+            provider = "anthropic"
+            windows = ()
+            plan = None
+            unavailable_reason = ("Anthropic account limits are only available "
+                                  "for OAuth-backed Claude accounts.")
+            details = ()
+
+        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=_Snap()):
+            res = self._fetch()
+        self.assertEqual(res.unavailable_reason,
+                         "Anthropic account limits are only available "
+                         "for OAuth-backed Claude accounts.")
 
 
 # -- Z.ai ---------------------------------------------------------------------

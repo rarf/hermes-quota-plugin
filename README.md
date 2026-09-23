@@ -131,7 +131,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
-| `kimi` | local CLI | — |
+| `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | API key | Balance/credits style detail lines |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
