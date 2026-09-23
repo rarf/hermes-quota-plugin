@@ -50,7 +50,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.4.2";
+const WIDGET_VERSION = "2.5.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -313,6 +313,12 @@ const PROVIDER_SVGS = {
 		viewBox: "0 0 24 24",
 		body: '<path d="M4.17 3.46H11.81L10.15 5.89H2.51ZM14.23 3.46H21.87L9.64 20.41H2ZM13.59 17.99H21.24L19.45 20.41H11.81Z"></path>',
 	},
+	// Cursor mark from @lobehub/icons 1.95.1. The source sets fill-rule on the
+	// <svg>; the wrapper here sets none, so it moves onto the path.
+	cursor: {
+		viewBox: "0 0 24 24",
+		body: '<path fill-rule="evenodd" d="M22.106 5.68L12.5.135a.998.998 0 00-.998 0L1.893 5.68a.84.84 0 00-.419.726v11.186c0 .3.16.577.42.727l9.607 5.547a.999.999 0 00.998 0l9.608-5.547a.84.84 0 00.42-.727V6.407a.84.84 0 00-.42-.726zm-.603 1.176L12.228 22.92c-.063.108-.228.064-.228-.061V12.34a.59.59 0 00-.295-.51l-9.11-5.26c-.107-.062-.063-.228.062-.228h18.55c.264 0 .428.286.296.514z"></path>',
+	},
 };
 
 // Display names mirror hermes_cli/models.py CANONICAL_PROVIDERS/_PROVIDER_LABELS
@@ -330,6 +336,7 @@ const PROVIDER_META = {
 	copilot: { name: "Copilot", mono: "CP" },
 	zai: { name: "Z.ai", mono: "Z" },
 	commandcode: { name: "CommandCode", mono: "CC" },
+	cursor: { name: "Cursor", mono: "CU" },
 };
 
 function providerMeta(pid) {

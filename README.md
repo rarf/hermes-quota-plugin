@@ -136,6 +136,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
+| `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Included and API billing-cycle percents; personal on-demand cap as a window, team pool as a detail |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
