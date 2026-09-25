@@ -1,6 +1,6 @@
 """Built-in provider quota fetchers and their normalized adapters.
 
-OpenAI Codex, Nous, and OpenRouter reuse the core account-usage path. Anthropic
+OpenAI Codex and Nous adapt core account data. Anthropic
 is fetched directly because its single OAuth payload contains both the legacy
 windows and newer model-scoped limits. We adapt those snapshots into the
 plugin's QuotaResult shape and register them so the cache builder treats them
@@ -267,9 +267,6 @@ def _fetch_anthropic() -> QuotaResult:
         details=details,
     )
 
-
-for _pid in ("openrouter",):
-    _register(_pid)(_make_fetcher(_pid))
 
 _register("anthropic")(_fetch_anthropic)
 
