@@ -749,65 +749,54 @@ class AnthropicBuiltinFetcherTests(unittest.TestCase):
     def test_no_snapshot_without_token_is_no_credentials(self):
         import quota_providers.builtin as builtin
 
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=None), \
-             mock.patch.object(builtin, "_core_anthropic_token", return_value=None):
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value=None):
             res = self._fetch()
         self.assertEqual(res.unavailable_reason, "no-credentials")
 
     def test_no_snapshot_with_token_is_fetch_error(self):
-        """A resolvable token + no snapshot = the vendor call failed (e.g. 401)."""
+        """A resolvable token + failed request is reported as a fetch error."""
         import quota_providers.builtin as builtin
 
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=None), \
-             mock.patch.object(builtin, "_core_anthropic_token", return_value="sk-ant-oauth-x"):
+        with mock.patch.object(builtin, "_anthropic_usage_payload",
+                               return_value=(None, "fetch-error:OSError")):
             res = self._fetch()
-        self.assertEqual(res.unavailable_reason, "fetch-error")
+        self.assertEqual(res.unavailable_reason, "fetch-error:OSError")
 
-    def test_snapshot_windows_passthrough(self):
-        """Regression: a real snapshot still maps into QuotaResult windows."""
+    def test_payload_windows_and_details_are_mapped(self):
+        """The direct adapter maps legacy windows and extra usage in one read."""
         import quota_providers.builtin as builtin
-        from datetime import datetime, timezone
 
-        class _W:
-            label = "Current session"
-            used_percent = 42.0
-            reset_at = datetime(2026, 9, 23, 9, 0, tzinfo=timezone.utc)
-
-        class _Snap:
-            provider = "anthropic"
-            windows = (_W(),)
-            plan = "Max"
-            unavailable_reason = None
-            details = ("Extra usage: 1.00 / 5.00 USD",)
-
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=_Snap()), \
-             mock.patch.object(builtin, "_anthropic_scoped_windows", return_value=[]):
+        payload = {
+            "five_hour": {
+                "utilization": 0.42,
+                "resets_at": "2026-09-23T09:00:00Z",
+            },
+            "extra_usage": {
+                "is_enabled": True,
+                "used_credits": 1.0,
+                "monthly_limit": 5.0,
+                "currency": "USD",
+            },
+        }
+        with mock.patch.object(builtin, "_anthropic_usage_payload",
+                               return_value=(payload, None)):
             res = self._fetch()
         self.assertIsNone(res.unavailable_reason)
-        self.assertEqual(res.plan, "Max")
+        self.assertIsNone(res.plan)
         self.assertEqual(res.windows[0].label, "Current session")
         self.assertEqual(res.windows[0].used_percent, 42.0)
         self.assertEqual(res.windows[0].reset_at, "2026-09-23T09:00:00+00:00")
         self.assertEqual(res.details, ["Extra usage: 1.00 / 5.00 USD"])
 
-    def test_snapshot_unavailable_reason_passthrough(self):
-        """Regression: core-provided reasons (e.g. api-key-only) are kept verbatim."""
+    def test_api_key_is_rejected_before_network(self):
         import quota_providers.builtin as builtin
 
-        class _Snap:
-            provider = "anthropic"
-            windows = ()
-            plan = None
-            unavailable_reason = ("Anthropic account limits are only available "
-                                  "for OAuth-backed Claude accounts.")
-            details = ()
-
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=_Snap()):
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="api-key"), \
+             mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=False), \
+             mock.patch.object(builtin.urllib.request, "urlopen") as urlopen:
             res = self._fetch()
-        self.assertEqual(res.unavailable_reason,
-                         "Anthropic account limits are only available "
-                         "for OAuth-backed Claude accounts.")
-
+        self.assertEqual(res.unavailable_reason, builtin._ANTHROPIC_OAUTH_REQUIRED_REASON)
+        urlopen.assert_not_called()
 
 # Live-captured /api/oauth/usage ``limits`` list (2026-09-23, Team plan).
 _ANTHROPIC_LIMITS_PAYLOAD = {
@@ -826,29 +815,32 @@ _ANTHROPIC_LIMITS_PAYLOAD = {
 
 
 class AnthropicScopedLimitTests(unittest.TestCase):
-    """Model-scoped weekly limits (Fable) the core snapshot does not map."""
-
-    def _snap(self):
-        class _W:
-            label = "Current week"
-            used_percent = 11.0
-            reset_at = None
-
-        class _Snap:
-            provider = "anthropic"
-            windows = (_W(),)
-            plan = None
-            unavailable_reason = None
-            details = ()
-
-        return _Snap()
+    """Model-scoped weekly limits from the single usage payload."""
 
     def test_scoped_limit_uses_display_name_not_codename(self):
         from quota_providers.builtin import parse_anthropic_scoped_limits
 
         windows = parse_anthropic_scoped_limits(_ANTHROPIC_LIMITS_PAYLOAD)
         self.assertEqual([(w.label, w.used_percent, w.reset_at) for w in windows],
-                         [("Fable week", 7.0, "2026-09-30T08:00:00+00:00")])
+                         [("Current session", 66.0, "2026-09-23T23:19:59+00:00"),
+                          ("Current week", 11.0, "2026-09-30T07:59:59+00:00"),
+                          ("Fable week", 7.0, "2026-09-30T08:00:00+00:00")])
+
+    def test_scoped_limit_falls_back_to_identifiers(self):
+        from quota_providers.builtin import parse_anthropic_scoped_limits
+
+        payload = {"limits": [
+            {"kind": "session", "percent": 4,
+             "resets_at": "2026-09-23T23:19:59Z"},
+            {"kind": "weekly_scoped", "percent": 6,
+             "scope": {"model": {"id": "model-id"}}},
+            {"kind": "weekly_scoped", "percent": 8,
+             "scope": {"model": {}, "surface": "surface-id"}},
+        ]}
+        windows = parse_anthropic_scoped_limits(payload)
+        self.assertEqual([w.label for w in windows],
+                         ["Current session", "model-id week", "surface-id week"])
+        self.assertEqual(windows[0].reset_at, "2026-09-23T23:19:59+00:00")
 
     def test_unscoped_or_malformed_entries_are_ignored(self):
         from quota_providers.builtin import parse_anthropic_scoped_limits
@@ -864,47 +856,91 @@ class AnthropicScopedLimitTests(unittest.TestCase):
         self.assertEqual(parse_anthropic_scoped_limits(payload), [])
         self.assertEqual(parse_anthropic_scoped_limits(["not", "a", "dict"]), [])
 
-    def test_scoped_windows_append_to_core_snapshot(self):
+    def test_scoped_windows_append_to_usage_payload(self):
         import quota_providers.builtin as builtin
 
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=self._snap()), \
-             mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin.urllib.request, "urlopen",
                                _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
             res = builtin._fetch_anthropic()
+        self.assertEqual(
+            [w.label for w in res.windows],
+            ["Current session", "Current week", "Fable week"],
+        )
+
+
+    def test_weekly_all_limit_fills_core_snapshot_gap(self):
+        import quota_providers.builtin as builtin
+
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin.urllib.request, "urlopen",
+                               _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
+            res = builtin._fetch_anthropic()
+        self.assertEqual(
+            [w.label for w in res.windows],
+            ["Current session", "Current week", "Fable week"],
+        )
+
+    def test_scoped_limits_are_used_without_core_windows(self):
+        import quota_providers.builtin as builtin
+
+        payload = {
+            "limits": [
+                {"kind": "weekly_all", "percent": 11,
+                 "resets_at": "2026-09-30T07:59:59+00:00", "scope": None},
+                {"kind": "weekly_scoped", "percent": 7,
+                 "resets_at": "2026-09-30T08:00:00+00:00",
+                 "scope": {"model": {"display_name": "Fable"}}},
+            ]
+        }
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin.urllib.request, "urlopen",
+                               _urlopen_returning(payload)):
+            res = builtin._fetch_anthropic()
         self.assertEqual([w.label for w in res.windows], ["Current week", "Fable week"])
 
-    def test_scoped_read_failure_keeps_core_windows(self):
+
+    def test_scoped_reset_z_is_normalized_for_python_39(self):
+        import quota_providers.builtin as builtin
+
+        payload = {
+            "limits": [{
+                "kind": "weekly_scoped",
+                "percent": 5,
+                "resets_at": "2026-09-30T08:00:00Z",
+                "scope": {"model": {"display_name": "Fable"}},
+            }]
+        }
+        windows = builtin.parse_anthropic_scoped_limits(payload)
+        self.assertEqual(windows[0].reset_at, "2026-09-30T08:00:00+00:00")
+
+    def test_usage_read_failure_is_fail_open(self):
         import quota_providers.builtin as builtin
 
         def _boom(_req, timeout=None):  # noqa: ANN001, ARG001
             raise OSError("down")
 
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=self._snap()), \
-             mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin.urllib.request, "urlopen", _boom):
             res = builtin._fetch_anthropic()
-        self.assertIsNone(res.unavailable_reason)
-        self.assertEqual([w.label for w in res.windows], ["Current week"])
+        self.assertEqual(res.unavailable_reason, "fetch-error:OSError")
 
-    def test_scoped_read_gets_only_the_remaining_budget(self):
-        """A slow core fetch leaves the scoped read less time, never more."""
+    def test_usage_read_is_single_request_with_bounded_timeout(self):
         import quota_providers.builtin as builtin
 
         seen = []
-        clock = iter([100.0, 100.0 + builtin._ANTHROPIC_BUDGET_S - 2.0])
 
         def _opener(_req, timeout=None):  # noqa: ANN001
             seen.append(timeout)
             return _FakeResponse(json.dumps(_ANTHROPIC_LIMITS_PAYLOAD).encode())
 
-        with mock.patch.object(builtin, "_core_fetch_account_usage", return_value=self._snap()), \
-             mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
-             mock.patch.object(builtin.time, "monotonic", lambda: next(clock)), \
+        with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin.urllib.request, "urlopen", _opener):
-            builtin._fetch_anthropic()
+            res = builtin._fetch_anthropic()
+        self.assertIsNone(res.unavailable_reason)
         self.assertEqual(len(seen), 1)
-        self.assertAlmostEqual(seen[0], 2.0)
+        self.assertEqual(seen[0], builtin._ANTHROPIC_TIMEOUT_S)
+
 
 
 # -- Z.ai ---------------------------------------------------------------------
