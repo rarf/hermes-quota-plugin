@@ -8,8 +8,11 @@ builder treats them uniformly with the Grok/Gemini/Kimi fetchers.
 
 from __future__ import annotations
 
+import json
 import math
-from typing import Optional
+import time
+import urllib.request
+from typing import Any, Optional
 
 from .base import QuotaResult, QuotaWindow, build_unavailable
 from .registry import register as _register
@@ -79,12 +82,76 @@ def _core_anthropic_token() -> Optional[str]:
         return None
 
 
+_ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+# The core fetch and the scoped-limit read run back to back inside one sweep
+# slot (quota_cache.REFRESH_BUDGET_S = 20s); the second read only gets what is
+# left of this provider-local budget.
+_ANTHROPIC_BUDGET_S = 18.0
+_ANTHROPIC_SCOPED_TIMEOUT_S = 5.0
+
+
+def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
+    """Model-scoped weekly limits (e.g. Fable) from ``/api/oauth/usage``.
+
+    Core maps only the fixed ``five_hour``/``seven_day*`` keys. Newer models
+    get opaque codenamed keys instead; the display name lives in the
+    ``limits`` list::
+
+        {"kind": "weekly_scoped", "group": "weekly", "percent": 0,
+         "resets_at": "2026-09-30T08:00:00+00:00",
+         "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null}}
+    """
+    limits = payload.get("limits") if isinstance(payload, dict) else None
+    windows: list[QuotaWindow] = []
+    for entry in limits if isinstance(limits, list) else ():
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        scope = entry.get("scope") or {}
+        model = scope.get("model") if isinstance(scope, dict) else None
+        name = model.get("display_name") if isinstance(model, dict) else None
+        percent = entry.get("percent")
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if isinstance(percent, bool) or not isinstance(percent, (int, float)):
+            continue
+        reset = entry.get("resets_at")
+        windows.append(QuotaWindow(
+            label=f"{name.strip()} week",
+            used_percent=max(0.0, min(100.0, float(percent))),
+            reset_at=reset if isinstance(reset, str) and reset else None,
+        ))
+    return windows
+
+
+def _anthropic_scoped_windows(timeout: float) -> list[QuotaWindow]:
+    """One extra usage read for scoped limits. Fail-open: empty on any error."""
+    token = _core_anthropic_token()
+    if not token or timeout < 1.0:
+        return []
+    request = urllib.request.Request(
+        _ANTHROPIC_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "claude-code/2.1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return parse_anthropic_scoped_limits(json.loads(resp.read()))
+    except Exception:  # noqa: BLE001 - scoped limits are additive only
+        return []
+
+
 def _fetch_anthropic() -> QuotaResult:
     """Anthropic adapter: like the generic one, but a ``None`` snapshot is
     diagnosed — no resolvable token means ``no-credentials``; a token that
     still produced no snapshot means the vendor call failed (``fetch-error``).
     The core collapses every failure to ``None`` (fail-open), so this extra
     read is the only way to keep the reason honest."""
+    started = time.monotonic()
     try:
         snap = _core_fetch_account_usage("anthropic")
     except ImportError:
@@ -94,7 +161,14 @@ def _fetch_anthropic() -> QuotaResult:
     if snap is None:
         reason = "fetch-error" if _core_anthropic_token() else "no-credentials"
         return build_unavailable("anthropic", reason)
-    return _snapshot_to_result(snap)
+    result = _snapshot_to_result(snap)
+    if result.unavailable_reason is None and result.windows:
+        remaining = _ANTHROPIC_BUDGET_S - (time.monotonic() - started)
+        known = {w.label for w in result.windows}
+        for window in _anthropic_scoped_windows(min(_ANTHROPIC_SCOPED_TIMEOUT_S, remaining)):
+            if window.label not in known:
+                result.windows.append(window)
+    return result
 
 
 for _pid in ("openrouter",):

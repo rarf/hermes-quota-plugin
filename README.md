@@ -126,7 +126,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 | Provider | Source | Notes |
 | --- | --- | --- |
-| `anthropic` | local CLI / OAuth | Session, Weekly windows |
+| `anthropic` | local CLI / OAuth | Session, Weekly windows, plus model-scoped weekly limits such as **Fable week** |
 | `openai-codex` | local OAuth | Also parses `additional_rate_limits` to surface **per-model Spark limits** (`5.3 Codex Spark · 5h`, `· Weekly`) that stay hidden elsewhere |
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
