@@ -26,6 +26,7 @@ from . import copilot  # noqa: F401
 from . import zai  # noqa: F401
 from . import commandcode  # noqa: F401
 from . import cursor  # noqa: F401
+from . import deepseek  # noqa: F401
 
 __all__ = [
     "PROVIDER_FETCHERS",

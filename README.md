@@ -85,10 +85,11 @@ icon).
 - Detail lines where the API offers them: credits, banked resets, extra limits.
 - Providers without data collapse into a quiet **"No data (n)"** section — the
   default view shows only providers with live numbers.
-- **Pane detail**: `clean` (windows only) or `dense` (every window, reset time
-  and detail line) — dense is the default.
-- Footer: `fetched 12:35 PM · 46s old · poll 60s`, so the real cadence is always
-  visible.
+- **Pane detail**: `clean` (percentage windows and balance headlines) or `dense`
+  (every window, reset time and detail line). Dense is the default.
+- Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
+  localized with the full date, seconds and timezone. Provider cards scroll
+  separately so long balance details cannot overlap the footer.
 - Notices when something is off: an **update available** banner (checked against
   the installed build) and a **version-skew** notice when the widget and the
   backend are not the same build.
@@ -133,6 +134,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | API key | Balance/credits style detail lines |
+| `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
@@ -141,6 +143,28 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### DeepSeek
+
+Reads the documented [`GET /user/balance`](https://api-docs.deepseek.com/api/get-user-balance)
+endpoint at `https://api.deepseek.com`. Credentials come from Hermes' native
+`resolve_api_key_provider_credentials("deepseek")` helper, including its dotenv
+and `key_env` precedence. Configure `DEEPSEEK_API_KEY` through Hermes as usual.
+The plugin does not enumerate, rotate, or write credential pools.
+
+This is the direct DeepSeek account balance, not usage of DeepSeek models through
+OpenRouter. Each returned USD/CNY balance stays separate, with total, granted and
+topped-up amounts preserved as decimal strings in the cache. No account balances
+are added together, no per-key spending limit is inferred, and no plan or quota
+percentage is invented. Zero balances and `is_available: false` are valid data.
+
+The pane shows a balance headline and API-call availability in both clean and
+dense modes. Dense mode and `/quota deepseek` also show the detailed breakdown.
+The status-bar chip displays money instead of an empty percentage; worst-only
+mode uses balance chips only when no percentage windows are available.
+Missing credentials and failed requests remain explicit unavailable states.
+Requests have a timeout, bounded response size, and no redirects; error details
+and credentials are never written into the display cache.
 
 ### CommandCode
 
@@ -218,9 +242,9 @@ its previous value. The last payload is cached in the widget's storage too, so a
 plugin reload or a gateway switch paints immediately instead of waiting on a
 backend spawn.
 
-> The usage APIs expose only `used_percent` and `reset_at` per window — not an
-> absolute cap. The plugin shows remaining **%** and **time-to-reset**, not a
-> token or dollar count.
+> Quota windows show remaining **%** and **time-to-reset** when the API exposes
+> a percentage or denominator. Account balances, such as DeepSeek, are separate
+> monetary facts, never converted into a quota percentage.
 
 ## Troubleshooting
 
@@ -271,6 +295,10 @@ hermes quota status --json --cached > .widget-fixture.json
 node scripts/render-widget.cjs                        # pane
 AREA=statusbar.right node scripts/render-widget.cjs   # status bar chip
 ```
+
+The offline widget render tests require Node.js (no npm dependencies). They
+execute the actual widget with SDK hooks stubbed and a fixed locale/timezone.
+For optional real Chromium geometry tests, see [widget layout tests](docs/widget-balance-layout.md).
 
 To add a provider, write a fetcher in `quota_providers/` that returns a
 `QuotaResult` and register it. The cache and the widget need no

@@ -95,8 +95,12 @@ def _render_quota(provider_filter: Optional[str]) -> str:
             lines.append(f"• **{label}**: unavailable ({reason})")
             continue
         windows = rec.get("windows") or []
+        details = rec.get("details") or []
+        for detail in details:
+            lines.append(f"• **{label}** · {detail}")
         if not windows:
-            lines.append(f"• **{label}**: no window data")
+            if not details:
+                lines.append(f"• **{label}**: no window data")
             continue
         for w in windows:
             wlabel = w.get("label") or "window"
