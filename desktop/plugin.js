@@ -50,7 +50,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.5.0";
+const WIDGET_VERSION = "2.6.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -329,6 +329,7 @@ const PROVIDER_META = {
 	"openai-codex": { name: "OpenAI Codex", mono: "O" },
 	nous: { name: "Nous Portal", mono: "N" },
 	openrouter: { name: "OpenRouter", mono: "OR" },
+	deepseek: { name: "DeepSeek", mono: "DS" },
 	gemini: { name: "Google Gemini", mono: "G" },
 	kimi: { name: "Kimi / Moonshot", mono: "K" },
 	grok: { name: "xAI Grok", mono: "X" },
@@ -412,6 +413,46 @@ function worstWindow(provider) {
 		if (worst == null || r < worst) worst = r;
 	}
 	return worst;
+}
+
+// Monetary account facts never become percentage windows or key caps.
+function accountFacts(provider) {
+	if (!provider || provider.unavailable_reason) return { balances: [], available: null };
+	const rows = provider.account_balances;
+	const available = typeof provider.api_calls_available === "boolean" ? provider.api_calls_available : null;
+	const balances = (Array.isArray(rows) ? rows : []).filter((b) =>
+		b && /^[A-Z]{3}$/.test(b.currency) &&
+		(typeof b.total_balance === "number" || (typeof b.total_balance === "string" && /^-?\d+(?:\.\d+)?$/.test(b.total_balance))) &&
+		Number.isFinite(Number(b.total_balance)),
+	);
+	return { balances, available };
+}
+
+function balanceText(balance) {
+	const n = Number(balance.total_balance);
+	const money = new Intl.NumberFormat(undefined, {
+		style: "currency", currency: balance.currency,
+		minimumFractionDigits: 2, maximumFractionDigits: 6,
+	}).format(n);
+	return `${money} ${balance.currency}`;
+}
+
+function providerTone(provider) {
+	if (provider.unavailable_reason) return "muted";
+	const r = worstWindow(provider);
+	if (r != null) return toneForRemaining(r);
+	const { available } = accountFacts(provider);
+	return available === true ? "good" : available === false ? "bad" : "muted";
+}
+
+function checkedDateTime(iso) {
+	if (!iso) return "";
+	const dt = new Date(iso);
+	if (!Number.isFinite(dt.getTime())) return "";
+	return new Intl.DateTimeFormat(undefined, {
+		year: "numeric", month: "short", day: "2-digit",
+		hour: "2-digit", minute: "2-digit", second: "2-digit", timeZoneName: "short",
+	}).format(dt);
 }
 
 // Short absolute reset: today/tomorrow/time, else "Aug 11, 2:30 PM".
@@ -829,7 +870,13 @@ function QuotaChipWithBar() {
 			worstLabel = providerMeta(pid).name;
 		}
 	}
-	if (worst == null) return jsx("span", { children: "Q:none" });
+	if (worst == null) {
+		// Money in different currencies has no meaningful "worst" percentage.
+		const balances = providers.filter(([pid, p]) => isProviderEnabled(pid) && accountFacts(p).balances.length);
+		return balances.length
+			? jsx("span", { className: "inline-flex h-full items-center", children: balances.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
+			: jsx("span", { children: "Q:none" });
+	}
 	const tone = toneForRemaining(worst);
 	const fill = toneColor(tone);
 	const tip = makeWorstTip(worstLabel, worst, data && data.providers);
@@ -859,8 +906,10 @@ function QuotaChipWithBar() {
 }
 
 function ProviderChip({ pid, provider }) {
-	const r = worstWindow(provider);
-	const tone = toneForRemaining(r);
+	const r = provider.unavailable_reason ? null : worstWindow(provider);
+	const facts = accountFacts(provider);
+	const value = provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
+	const tone = providerTone(provider);
 	const dot = toneColor(tone);
 	const label = providerMeta(pid).name;
 	const tip = makeProviderTip(pid, provider);
@@ -879,7 +928,7 @@ function ProviderChip({ pid, provider }) {
 			children: [
 				jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
-				jsx("span", { className: "tabular-nums", children: r == null ? "—" : `${r}%` }),
+				jsx("span", { className: "tabular-nums", children: value }),
 			],
 		},
 	);
@@ -903,7 +952,11 @@ function makeWorstTip(worstLabel, worst, providersObj) {
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
 	const meta = providerMeta(pid);
+	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
 	const lines = providerWindowLines(pid, provider);
+	const facts = accountFacts(provider);
+	lines.push(...facts.balances.map((b) => `Account balance: ${balanceText(b)}`));
+	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
 	lines.unshift(meta.name);
 	const details = provider.details || [];
@@ -975,12 +1028,17 @@ function ProviderRow({ id, provider }) {
 	const dense = paneDetail !== "clean";
 	const reason = provider.unavailable_reason;
 	const details = provider.details || [];
+	const facts = accountFacts(provider);
 	const displayName = providerMeta(id).name;
+	// Inline sizing is intentional: plugin-only utility classes might not be
+	// in the host's compiled Tailwind stylesheet.
+	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
 
 	if (reason) {
 		return jsxs("div", {
 			className:
 				"flex flex-col gap-0.5 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5 opacity-60",
+			style: cardStyle,
 			children: [
 				jsxs("div", {
 					className: "flex items-center gap-2 text-sm",
@@ -1001,10 +1059,11 @@ function ProviderRow({ id, provider }) {
 	}
 
 	const windows = provider.windows || [];
-	if (windows.length === 0 && details.length === 0) {
+	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null) {
 		return jsxs("div", {
 			className:
 				"flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5 text-sm opacity-60",
+			style: cardStyle,
 			children: [
 				jsx(ProviderBadge, { pid: id }),
 				jsx("span", {
@@ -1022,6 +1081,7 @@ function ProviderRow({ id, provider }) {
 	return jsxs("div", {
 		className:
 			"flex flex-col gap-2 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-elevated) px-3 py-2.5",
+		style: cardStyle,
 		children: [
 			jsxs("div", {
 				className: "flex items-center justify-between gap-2",
@@ -1033,10 +1093,7 @@ function ProviderRow({ id, provider }) {
 							jsx(ProviderBadge, { pid: id }),
 							displayName,
 							jsx(StatusDot, {
-								tone:
-									worstWindow(provider) == null
-										? "muted"
-										: toneForRemaining(worstWindow(provider)),
+								tone: providerTone(provider),
 							}),
 						],
 					}),
@@ -1049,6 +1106,17 @@ function ProviderRow({ id, provider }) {
 						: null,
 				],
 			}),
+			...facts.balances.map((b) => jsxs("div", {
+				key: `balance-${b.currency}`,
+				children: [
+					jsx("div", { className: "text-[0.6875rem] text-(--ui-text-tertiary)", children: "Account balance" }),
+					jsx("div", { className: "tabular-nums font-semibold text-(--ui-text-primary)", style: { fontSize: "1.25rem", lineHeight: 1.3 }, children: balanceText(b) }),
+				],
+			})),
+			facts.available != null ? jsx("div", {
+				className: "text-xs text-(--ui-text-secondary)",
+				children: `API calls available: ${facts.available ? "yes" : "no"}`,
+			}) : null,
 			...windows.map((w, i) => {
 				const r = remainingPct(w);
 				const tone = toneForRemaining(r);
@@ -1084,7 +1152,7 @@ function ProviderRow({ id, provider }) {
 				);
 			}),
 			...(dense
-				? details.map((d, i) =>
+				? details.filter((d) => facts.available == null || !/^API calls available: (yes|no)$/.test(d)).map((d, i) =>
 						jsx(
 							"div",
 							{
@@ -1354,7 +1422,8 @@ function QuotaPane() {
 		receivedAt.current = Date.now();
 	}, [data]);
 	const ageSeconds = (() => {
-		const base = Number(data && data.age_s);
+		if (data?.age_s == null) return null;
+		const base = Number(data.age_s);
 		if (!Number.isFinite(base)) return null;
 		return Math.max(0, Math.round(base + (nowTick - receivedAt.current) / 1000));
 	})();
@@ -1448,9 +1517,11 @@ function QuotaPane() {
 
 	return jsxs("div", {
 		className: "flex h-full flex-col gap-2 p-3",
+		style: { minHeight: 0, minWidth: 0, overflow: "auto", boxSizing: "border-box" },
 		children: [
 			jsxs("div", {
 				className: "flex items-center justify-between",
+				style: { flexShrink: 0, flexWrap: "wrap", gap: "0.5rem" },
 				children: [
 					jsx("div", {
 						className: "text-sm font-medium",
@@ -1519,16 +1590,22 @@ function QuotaPane() {
 					}),
 				],
 			}),
-			jsx("div", { className: "min-h-0 flex-1", children: body }),
-			jsx(UpdateBanner, { update }),
-			versionSkew,
+			jsx("div", {
+				className: "min-h-0 flex-1",
+				"data-quota-scroll": true,
+				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%" },
+				children: jsxs("div", { children: [body, jsx(UpdateBanner, { update }), versionSkew] }),
+			}),
 			data && data.fetched_at
 				? jsx("div", {
 						className: "pt-2 text-[0.6875rem] text-(--ui-text-quaternary)",
+						"data-quota-checked": true,
+						style: { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" },
+						title: data.fetched_at,
 						children:
 							t(
 								"fetched",
-								absoluteReset(data.fetched_at) || data.fetched_at,
+								checkedDateTime(data.fetched_at) || data.fetched_at,
 							) +
 							(ageSeconds == null
 								? ""
@@ -1601,7 +1678,7 @@ export default {
 				noData: "no window data",
 				noDataSection: (n) => `No data (${n}) — click to expand`,
 				reset: (when) => `reset ${when}`,
-				fetched: (when) => `fetched ${when}`,
+				fetched: (when) => `Checked ${when}`,
 				fetchedAge: (age, interval) => `${age} old · poll ${interval}s`,
 				versionSkew: (widget, backend) =>
 					`Widget v${widget} · backend v${backend} — reload desktop plugins (or restart the app) to line them up.`,

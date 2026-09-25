@@ -100,6 +100,12 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
         "plan": res.plan,
         "unavailable_reason": res.unavailable_reason,
         "details": list(res.details or []),
+        "account_balances": [
+            {"currency": b.currency, "total_balance": b.total_balance,
+             "granted_balance": b.granted_balance, "topped_up_balance": b.topped_up_balance}
+            for b in res.account_balances
+        ],
+        "api_calls_available": res.api_calls_available,
         "windows": [
             {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
             for w in res.windows

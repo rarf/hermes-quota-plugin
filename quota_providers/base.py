@@ -26,6 +26,19 @@ class QuotaWindow:
 
 
 @dataclass
+class AccountBalance:
+    """Account money, not a key cap or a percentage denominator.
+
+    Decimal strings preserve the precision returned by the provider.
+    """
+
+    currency: str
+    total_balance: str
+    granted_balance: Optional[str] = None
+    topped_up_balance: Optional[str] = None
+
+
+@dataclass
 class QuotaResult:
     """Normalized quota for one provider, ready to cache."""
 
@@ -36,9 +49,11 @@ class QuotaResult:
     # Extra provider facts shown under the windows in the widget (e.g. Codex
     # "Credits balance: $12.50", "You have 2 resets banked").
     details: list[str] = field(default_factory=list)
+    account_balances: list[AccountBalance] = field(default_factory=list)
+    api_calls_available: Optional[bool] = None
 
     def has_data(self) -> bool:
-        return (bool(self.windows) or bool(self.details)) and self.unavailable_reason is None
+        return (bool(self.windows) or bool(self.details) or bool(self.account_balances)) and self.unavailable_reason is None
 
 
 def build_unavailable(label: str, reason: str) -> QuotaResult:
