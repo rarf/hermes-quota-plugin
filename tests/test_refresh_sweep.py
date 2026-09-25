@@ -71,6 +71,18 @@ class _SweepTest(unittest.TestCase):
         finally:
             qc.PROVIDER_FETCHERS = original
 
+    def test_account_balance_survives_cache_serialization(self) -> None:
+        from quota_plugin_under_test.quota_providers.base import AccountBalance
+        result = QuotaResult(label='deepseek', account_balances=[
+            AccountBalance('USD', '12.50', '0', '12.50')], api_calls_available=True)
+        self.assertTrue(result.has_data())
+        cache, _ = self._run({'deepseek': lambda: result})
+        record = self._cache()['providers']['deepseek']
+        self.assertEqual(record['account_balances'][0]['total_balance'], '12.50')
+        self.assertIs(record['api_calls_available'], True)
+        self.assertEqual(record['windows'], [])
+        self.assertEqual(record, cache['providers']['deepseek'])
+
     def test_providers_run_concurrently(self) -> None:
         """Four 0.4s fetchers finish together, not one after the other."""
         fetchers = {

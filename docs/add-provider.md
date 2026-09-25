@@ -77,8 +77,12 @@ Contract rules (all enforced in review):
   off) mean different things to users staring at the muted card.
 - **Percentages need denominators.** Emit `used_percent` only from
   used/limit, remaining/limit, or a server-reported percent. Never fabricate a
-  percent from a bare balance. No denominator → put the number in `details`
-  instead ("$X left").
+  percent from a bare balance. No denominator: use `account_balances` for
+  structured monetary facts and `details` for the CLI breakdown ("$X left").
+  `AccountBalance` holds `currency`, `total_balance`, and optional
+  `granted_balance` / `topped_up_balance` as decimal strings. A provider may set
+  `api_calls_available` to a reported boolean; `None` means unknown. These fields
+  survive cache serialization and render without percentage bars.
 - **Free tiers get honest cards.** If the API exposes nothing numeric for the
   tier, return a card with `plan="Free"` and `details` describing what IS true
   (published limits, tool pool). See `_fetch_nous_portal()` in `builtin.py`
