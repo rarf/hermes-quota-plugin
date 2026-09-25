@@ -126,7 +126,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 | Provider | Source | Notes |
 | --- | --- | --- |
-| `anthropic` | local CLI / OAuth | Session, Weekly windows, plus model-scoped weekly limits such as **Fable week** |
+| `anthropic` | Anthropic OAuth usage API | One bounded read maps session/weekly windows, model-scoped weekly limits such as **Fable week**, and extra usage |
 | `openai-codex` | local OAuth | Also parses `additional_rate_limits` to surface **per-model Spark limits** (`5.3 Codex Spark · 5h`, `· Weekly`) that stay hidden elsewhere |
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
@@ -136,7 +136,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
-| `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Included and API billing-cycle percents; personal on-demand cap as a window, team pool as a detail |
+| `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details; refreshes expired sessions once |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`

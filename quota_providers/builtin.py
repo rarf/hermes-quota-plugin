@@ -1,16 +1,17 @@
-"""Built-in provider quota fetchers reusing the core account-usage path.
+"""Built-in provider quota fetchers and their normalized adapters.
 
-OpenAI Codex, Anthropic, Nous, and OpenRouter already expose quota via
-``agent.account_usage.fetch_account_usage`` (shipped in core).  We adapt those
-snapshots into the plugin's QuotaResult shape and register them so the cache
-builder treats them uniformly with the Grok/Gemini/Kimi fetchers.
+OpenAI Codex, Nous, and OpenRouter reuse the core account-usage path. Anthropic
+is fetched directly because its single OAuth payload contains both the legacy
+windows and newer model-scoped limits. We adapt those snapshots into the
+plugin's QuotaResult shape and register them so the cache builder treats them
+uniformly with the other fetchers.
 """
 
 from __future__ import annotations
 
 import json
 import math
-import time
+import urllib.error
 import urllib.request
 from typing import Any, Optional
 
@@ -64,13 +65,6 @@ def _make_fetcher(provider_id: str):
     return _fetch
 
 
-def _core_fetch_account_usage(provider_id: str):
-    """Thin seam over the core dispatcher (kept importable/mockable for tests)."""
-    from agent.account_usage import fetch_account_usage
-
-    return fetch_account_usage(provider_id)
-
-
 def _core_anthropic_token() -> Optional[str]:
     """Resolvable Anthropic token per core auth, or None. Never raises."""
     try:
@@ -82,16 +76,31 @@ def _core_anthropic_token() -> Optional[str]:
         return None
 
 
+def _core_anthropic_is_oauth(token: str) -> Optional[bool]:
+    """Use the core token classifier when it is available."""
+    try:
+        from agent.anthropic_adapter import _is_oauth_token
+
+        return bool(_is_oauth_token(token))
+    except Exception:
+        # Standalone plugin installs may not ship the core classifier; the
+        # vendor response remains the source of truth in that case.
+        return None
+
+
+_ANTHROPIC_OAUTH_REQUIRED_REASON = (
+    "Anthropic account limits are only available for OAuth-backed Claude accounts."
+)
+
+
 _ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-# The core fetch and the scoped-limit read run back to back inside one sweep
-# slot (quota_cache.REFRESH_BUDGET_S = 20s); the second read only gets what is
-# left of this provider-local budget.
-_ANTHROPIC_BUDGET_S = 18.0
-_ANTHROPIC_SCOPED_TIMEOUT_S = 5.0
+# Keep one direct usage read below the cache refresh budget. The response is
+# parsed for both the legacy top-level windows and the newer ``limits`` list.
+_ANTHROPIC_TIMEOUT_S = 15.0
 
 
 def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
-    """Model-scoped weekly limits (e.g. Fable) from ``/api/oauth/usage``.
+    """Model-scoped and all-model weekly limits from ``/api/oauth/usage``.
 
     Core maps only the fixed ``five_hour``/``seven_day*`` keys. Newer models
     get opaque codenamed keys instead; the display name lives in the
@@ -103,72 +112,160 @@ def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
     """
     limits = payload.get("limits") if isinstance(payload, dict) else None
     windows: list[QuotaWindow] = []
+    seen: set[str] = set()
     for entry in limits if isinstance(limits, list) else ():
-        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+        if not isinstance(entry, dict):
             continue
-        scope = entry.get("scope") or {}
-        model = scope.get("model") if isinstance(scope, dict) else None
-        name = model.get("display_name") if isinstance(model, dict) else None
+        kind = entry.get("kind")
+        if kind not in {"session", "weekly_all", "weekly_scoped"}:
+            continue
         percent = entry.get("percent")
-        if not isinstance(name, str) or not name.strip():
-            continue
         if isinstance(percent, bool) or not isinstance(percent, (int, float)):
             continue
+        percent = float(percent)
+        if not math.isfinite(percent):
+            continue
+
+        if kind == "session":
+            label = "Current session"
+        elif kind == "weekly_all":
+            label = "Current week"
+        else:
+            scope = entry.get("scope") or {}
+            model = scope.get("model") if isinstance(scope, dict) else None
+            if not isinstance(model, dict):
+                model = {}
+            name = model.get("display_name") or model.get("id")
+            if not isinstance(name, str) or not name.strip():
+                surface = scope.get("surface") if isinstance(scope, dict) else None
+                name = surface
+            if not isinstance(name, str) or not name.strip():
+                continue
+            label = f"{name.strip()} week"
+
+        if label in seen:
+            continue
+        seen.add(label)
         reset = entry.get("resets_at")
+        if isinstance(reset, str) and reset.endswith("Z"):
+            reset = reset[:-1] + "+00:00"
         windows.append(QuotaWindow(
-            label=f"{name.strip()} week",
-            used_percent=max(0.0, min(100.0, float(percent))),
+            label=label,
+            used_percent=max(0.0, min(100.0, percent)),
             reset_at=reset if isinstance(reset, str) and reset else None,
         ))
     return windows
 
 
-def _anthropic_scoped_windows(timeout: float) -> list[QuotaWindow]:
-    """One extra usage read for scoped limits. Fail-open: empty on any error."""
+def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Fetch the OAuth usage payload once, including all supported shapes."""
     token = _core_anthropic_token()
-    if not token or timeout < 1.0:
-        return []
+    if not token:
+        return None, "no-credentials"
+    if _core_anthropic_is_oauth(token) is False:
+        return None, _ANTHROPIC_OAUTH_REQUIRED_REASON
     request = urllib.request.Request(
         _ANTHROPIC_USAGE_URL,
         headers={
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
+            "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20",
             "User-Agent": "claude-code/2.1.0",
         },
         method="GET",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
-            return parse_anthropic_scoped_limits(json.loads(resp.read()))
-    except Exception:  # noqa: BLE001 - scoped limits are additive only
-        return []
+        with urllib.request.urlopen(request, timeout=_ANTHROPIC_TIMEOUT_S) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return None, "auth-failed"
+        return None, f"http-{exc.code}"
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        return None, f"fetch-error:{type(exc).__name__}"
+    if not isinstance(payload, dict):
+        return None, "bad-json"
+    return payload, None
+
+
+def _parse_anthropic_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], list[str]]:
+    windows: list[QuotaWindow] = []
+    seen: set[str] = set()
+    for key, label in (
+        ("five_hour", "Current session"),
+        ("seven_day", "Current week"),
+        ("seven_day_opus", "Opus week"),
+        ("seven_day_sonnet", "Sonnet week"),
+    ):
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        utilization = window.get("utilization")
+        if isinstance(utilization, bool):
+            continue
+        try:
+            used = float(utilization)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(used):
+            continue
+        if used <= 1:
+            used *= 100
+        if label in seen:
+            continue
+        seen.add(label)
+        reset = window.get("resets_at")
+        if isinstance(reset, str) and reset.endswith("Z"):
+            reset = reset[:-1] + "+00:00"
+        windows.append(QuotaWindow(
+            label=label,
+            used_percent=max(0.0, min(100.0, used)),
+            reset_at=reset if isinstance(reset, str) and reset else None,
+        ))
+
+    for window in parse_anthropic_scoped_limits(payload):
+        if window.label not in seen:
+            seen.add(window.label)
+            windows.append(window)
+
+    details: list[str] = []
+    extra = payload.get("extra_usage")
+    if isinstance(extra, dict) and extra.get("is_enabled"):
+        used = extra.get("used_credits")
+        monthly = extra.get("monthly_limit")
+        currency = extra.get("currency") or "USD"
+        if (
+            isinstance(used, (int, float))
+            and not isinstance(used, bool)
+            and isinstance(monthly, (int, float))
+            and not isinstance(monthly, bool)
+        ):
+            details.append(f"Extra usage: {used:.2f} / {monthly:.2f} {currency}")
+    return windows, details
 
 
 def _fetch_anthropic() -> QuotaResult:
-    """Anthropic adapter: like the generic one, but a ``None`` snapshot is
-    diagnosed — no resolvable token means ``no-credentials``; a token that
-    still produced no snapshot means the vendor call failed (``fetch-error``).
-    The core collapses every failure to ``None`` (fail-open), so this extra
-    read is the only way to keep the reason honest."""
-    started = time.monotonic()
+    """Fetch and parse Anthropic's usage payload in one network request."""
     try:
-        snap = _core_fetch_account_usage("anthropic")
+        payload, reason = _anthropic_usage_payload()
     except ImportError:
         return build_unavailable("anthropic", "fetcher-unavailable")
     except Exception:
         return build_unavailable("anthropic", "fetch-error")
-    if snap is None:
-        reason = "fetch-error" if _core_anthropic_token() else "no-credentials"
-        return build_unavailable("anthropic", reason)
-    result = _snapshot_to_result(snap)
-    if result.unavailable_reason is None and result.windows:
-        remaining = _ANTHROPIC_BUDGET_S - (time.monotonic() - started)
-        known = {w.label for w in result.windows}
-        for window in _anthropic_scoped_windows(min(_ANTHROPIC_SCOPED_TIMEOUT_S, remaining)):
-            if window.label not in known:
-                result.windows.append(window)
-    return result
+    if payload is None:
+        return build_unavailable("anthropic", reason or "no-data")
+
+    windows, details = _parse_anthropic_usage(payload)
+    if not windows and not details:
+        return build_unavailable("anthropic", "no-data")
+    return QuotaResult(
+        label="anthropic",
+        windows=windows,
+        plan=None,
+        unavailable_reason=None,
+        details=details,
+    )
 
 
 for _pid in ("openrouter",):
