@@ -970,7 +970,7 @@ function ProviderRow({ id, provider }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
-	// percentage bars (label + % left), no resets/details.
+	// percentage bars, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider.unavailable_reason;
@@ -1083,7 +1083,7 @@ function ProviderRow({ id, provider }) {
 					`${id}-w-${i}`,
 				);
 			}),
-			...(dense
+			...(dense || id === "openrouter"
 				? details.map((d, i) =>
 						jsx(
 							"div",

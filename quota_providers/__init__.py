@@ -19,6 +19,7 @@ from .registry import PROVIDER_FETCHERS, register, get_fetcher
 
 from . import grok  # noqa: F401
 from . import builtin  # noqa: F401
+from . import openrouter  # noqa: F401
 from . import kimi  # noqa: F401
 from . import gemini  # noqa: F401
 from . import opencode_go  # noqa: F401
