@@ -134,7 +134,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
 | `antigravity` | Antigravity OAuth: Windows Credential Manager, macOS Keychain, or the `agy` token file on Linux | Google AI Pro pools — Gemini and Claude/GPT each with a 5-hour and a weekly window; plan from `loadCodeAssist` (`paidTier` wins over `currentTier`) |
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
-| `openrouter` | API key | Balance/credits style detail lines |
+| `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
@@ -166,6 +166,37 @@ mode uses balance chips only when no percentage windows are available.
 Missing credentials and failed requests remain explicit unavailable states.
 Requests have a timeout, bounded response size, and no redirects; error details
 and credentials are never written into the display cache.
+### OpenRouter
+
+Reads `GET https://openrouter.ai/api/v1/key` separately for each distinct locally
+configured credential, using Hermes' native OpenRouter resolution plus its saved
+credential pool. Duplicate secrets are queried once even if their saved labels
+differ. Native resolution is pinned to the canonical OpenRouter endpoint to
+avoid selecting, rotating or seeding the runtime pool. Environment-backed saved
+rows are resolved through Hermes' profile-aware credential lookup. This is not
+an inventory of all keys on an OpenRouter account: the management `/keys`
+endpoint is never queried, and no management key is required.
+
+Each key has a generated label such as `Key 1 (native)` or `Key 2 (saved)`.
+Saved/vendor labels, key suffixes, hashes, account IDs and emails are never
+included in display data. The ordinal follows discovery order, not a stable
+account identity or the runtime pool's current selection.
+
+- Key-specific spending cap, remaining allowance and daily/weekly/monthly usage
+  are shown when supplied by the API. A percentage requires a positive cap and
+  remaining allowance within that cap. An uncapped key does not mean unlimited
+  account credit; an exhausted key cap does not mean an empty account wallet.
+- `/credits` is queried **once**, through the native credential (or the first
+  resolved saved credential if native resolution is unavailable). The displayed
+  wallet belongs to that credential's account. Other keys' account membership is
+  **unverified**: wallets are never summed, duplicated or inferred from equal
+  balances. The wallet is not a total across accounts.
+- Key and wallet requests run independently under one 10-second deadline. One
+  failed or timed-out key does not hide successful keys or the wallet. If every
+  request fails, the provider is unavailable rather than reporting false data.
+- The Desktop pane retains these details in **both clean and dense modes**, so
+  wallet scope, uncapped keys and per-key failures remain visible. They are also
+  present in `hermes quota status --json`.
 
 ### CommandCode
 
