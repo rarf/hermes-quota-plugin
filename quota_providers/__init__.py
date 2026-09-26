@@ -18,6 +18,7 @@ from .base import QuotaResult, QuotaWindow, build_unavailable
 from .registry import PROVIDER_FETCHERS, register, get_fetcher
 
 from . import grok  # noqa: F401
+from . import antigravity  # noqa: F401
 from . import builtin  # noqa: F401
 from . import kimi  # noqa: F401
 from . import gemini  # noqa: F401
