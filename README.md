@@ -137,6 +137,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details; refreshes expired sessions once |
+| `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
