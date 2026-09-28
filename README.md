@@ -135,7 +135,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `openrouter` | API key | Balance/credits style detail lines |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
-| `commandcode` | `~/.commandcode/auth.json` + Command Code CLI billing routes | 5h, Weekly, and a known-plan Cycle window |
+| `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details; refreshes expired sessions once |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
@@ -144,8 +144,10 @@ and never blocks the rest.
 
 ### CommandCode
 
-CommandCode reads the API key from `~/.commandcode/auth.json` and follows the
-billing calls used by the official Command Code CLI 1.53.0. It first requests
+CommandCode prefers the API key from `~/.commandcode/auth.json`. When that
+file has no usable key, it uses Hermes' `commandcode` API-key resolver (including
+Hermes dotenv and credential-pool sources). It follows the billing calls used
+by the official Command Code CLI 1.53.0. It first requests
 `/alpha/whoami?limits=1`, then scopes billing and usage calls with the returned
 organization ID; `currentPeriodStart` is passed as the usage-summary `since`
 value when the subscription response provides it. These alpha routes are not a

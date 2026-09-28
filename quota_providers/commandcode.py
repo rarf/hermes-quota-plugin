@@ -56,15 +56,28 @@ class _RequestTimeout(Exception):
 
 
 def _load_api_key() -> Optional[str]:
+    # Prefer the official CLI identity when present; otherwise use the same
+    # credential selection as Hermes (env and credential pool).
     try:
         with open(_AUTH_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-    except Exception:
-        return None
-    if isinstance(data, dict):
-        key = data.get("apiKey")
-        if isinstance(key, str) and key.strip():
-            return key.strip()
+        if isinstance(data, dict):
+            key = data.get("apiKey")
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+    except (OSError, ValueError):
+        pass
+
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
+
+        config = PROVIDER_REGISTRY.get(_PROVIDER)
+        if config is not None and getattr(config, "auth_type", "") == "api_key":
+            key, _source = _resolve_api_key_provider_secret(_PROVIDER, config)
+            if isinstance(key, str) and key.strip():
+                return key.strip()
+    except Exception:  # Hermes core may be absent or credential storage unavailable.
+        pass
     return None
 
 
