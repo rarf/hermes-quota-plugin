@@ -63,6 +63,38 @@ Updating the backend and updating the widget are therefore two separate steps �
 a stale widget shows fresh numbers with old names or icons. A build mismatch is
 called out in the pane (see [Troubleshooting](#troubleshooting)).
 
+### Updating
+
+How the plugin updates depends on how it was installed.
+
+**From this repo** (`git clone` + `./install.sh`): `git pull`, then re-run
+`./install.sh`. It refreshes the backend, the widget and the per-profile
+links, and stamps the new build so the update banner settles.
+
+**Through the Hermes plugin catalog** (`hermes plugins install quota`):
+Hermes pins the install to the commit recorded in its catalog entry, and
+`hermes plugins update quota` — or the update action in Settings — moves it
+only to that pin. While the pin trails this repo, the pane can show
+*Update available* (the banner compares the installed build against the
+default branch) even though Hermes reports the install **is already at
+catalog pin**. To move ahead of the catalog, reinstall at the desired commit:
+
+```bash
+hermes plugins install quota --ref <commit> --force --enable
+```
+
+Hermes does not write the build stamp into a catalog-managed install. Add
+`version.json` in the plugin directory (`~/.hermes/plugins/quota/`, alongside
+`plugin.yaml`) so the pane's update check can tell which build is installed —
+without a stamp the check stays silent:
+
+```json
+{ "installed_sha": "<commit>", "installed_at": "<ISO-8601 UTC>" }
+```
+
+Either path updates the backend only. On a remote app the widget is a
+separate file on the app machine — update it too and reload desktop plugins.
+
 ## What you get
 
 ### Status-bar chip
@@ -288,6 +320,7 @@ backend spawn.
 | "backend unavailable" in a named profile | Plugin installed only at the global root | Re-run `./install.sh` (it links every profile), then restart |
 | Old provider names or icons | The widget on the app machine is an older build than the backend | Update the widget copy there and reload desktop plugins; restart for backend changes |
 | Notice: *Widget vX · backend vY* | The two halves are different builds | Reload desktop plugins; restart the app if the backend is the older one |
+| *Update available* banner while `hermes plugins update` reports **already at catalog pin** | The install is Hermes-managed and pinned to the catalog entry's commit; the banner compares the installed build against the default branch | Update past the pin as described under [Updating](#updating), or wait for the catalog entry to advance |
 | `unavailable (opt-in-disabled)` for grok | Grok is opt-in | `hermes config set plugins.entries.quota.settings.grokEnabled true` |
 | `unavailable (timeout)` after a refresh | A provider endpoint hung past the sweep budget | It keeps its previous value; check the provider's status page |
 | `unavailable (503 …)` for opencode-go | Upstream flakiness, not your key | The fetcher already retries; it recovers on a later poll |
