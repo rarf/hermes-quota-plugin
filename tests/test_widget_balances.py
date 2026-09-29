@@ -70,6 +70,16 @@ class WidgetBalanceTests(unittest.TestCase):
         self.assertIn('API calls available: no', text(tree))
         self.assertIn('bad', [n['props'].get('data-tone') for n in nodes(tree)])
 
+    def test_small_nonzero_balance_keeps_reported_precision(self):
+        # Regression: a nonzero total must not be rounded down into "$0.00".
+        for value, expected in (('0.00000001', '0.00000001'), ('0.5', '0.50')):
+            with self.subTest(value=value):
+                p = dict(BALANCE, account_balances=[dict(BALANCE['account_balances'][0], total_balance=value)])
+                for component in ('row', 'chip'):
+                    rendered = text(render(component=component, provider=p))
+                    self.assertIn(expected, rendered)
+                    self.assertNotIn('$0.00 USD', rendered)
+
     def test_failure_does_not_claim_healthy_stale_balance(self):
         p = dict(BALANCE, unavailable_reason='http-429')
         for component in ('row', 'chip'):

@@ -439,12 +439,25 @@ function accountFacts(provider) {
 	return { balances, available };
 }
 
+// Fraction digits the endpoint actually reported, so a sub-cent total is not
+// rendered as a rounded zero (a nonzero balance reading "$0.00" looks empty).
+function balanceFractionDigits(raw) {
+	const dot = raw.indexOf(".");
+	if (dot === -1) return 2;
+	return Math.min(Math.max(2, raw.length - dot - 1), 20);
+}
+
 function balanceText(balance) {
-	const n = Number(balance.total_balance);
-	const money = new Intl.NumberFormat(undefined, {
+	const raw = String(balance.total_balance).trim();
+	const n = Number(raw);
+	const format = (value) => new Intl.NumberFormat(undefined, {
 		style: "currency", currency: balance.currency,
-		minimumFractionDigits: 2, maximumFractionDigits: 6,
-	}).format(n);
+		minimumFractionDigits: 2, maximumFractionDigits: balanceFractionDigits(raw),
+	}).format(value);
+	const money = format(n);
+	// Past Intl's precision ceiling the reported value is shown verbatim rather
+	// than a rounded zero.
+	if (n !== 0 && money === format(0)) return `${raw} ${balance.currency}`;
 	return `${money} ${balance.currency}`;
 }
 

@@ -14,7 +14,11 @@ function renderWidget(options = {}) {
     useQueryClient: () => ({invalidateQueries: () => {}}), useMutation: () => ({}),
     StatusDot: ({tone}) => jsx('span', {'data-tone': tone}),
     Input: 'input', Switch: 'input', SegmentedControl: 'span', icons: {},
-    host: {}, PANES_AREA: '', ROUTES_AREA: '', SIDEBAR_NAV_AREA: '', STATUSBAR_AREAS: {right: ''},
+    // Quota commands route to the focused profile's owner (#26); the pane reads
+    // `host.state.focusedSessionOwner` before it can render, so the offline
+    // harness has to provide the same read-only atom shape as the SDK.
+    host: {state: {focusedSessionOwner: {get: () => null, set: () => {}, subscribe: () => () => {}}}},
+    PANES_AREA: '', ROUTES_AREA: '', SIDEBAR_NAV_AREA: '', STATUSBAR_AREAS: {right: ''},
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,
     Date, Intl, setTimeout, clearTimeout,
   };
