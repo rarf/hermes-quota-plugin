@@ -1,4 +1,4 @@
-"""MiniMax (Token Plan) quota fetcher — plugin standalone copy.
+"""MiniMax (Token Plan) quota fetcher.
 
 Reads the same ``/v1/token_plan/remains`` endpoint MiniMax's own subscription
 UI uses (documented in MiniMax's official Token Plan FAQ:
@@ -66,18 +66,26 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .base import QuotaResult, QuotaWindow, build_unavailable
+from .registry import register
 
 PROVIDER_ID = "minimax"
 _QUOTA_PATH = "/v1/token_plan/remains"
 # Official FAQ host. The third-party ``api.minimax.io`` mirror is also known to
 # work — the plugin falls back to it when the canonical host 404s.
 _HOSTS = ("https://www.minimax.io", "https://api.minimax.io")
+# The whole provider must stay inside the cache sweep's budget (20 s), so the
+# two hosts share one deadline instead of timing out twice in sequence.
+_DEADLINE_S = 10.0
+_REQUEST_TIMEOUT_S = 8.0
+_MAX_BYTES = 1024 * 1024
 # Env vars Hermes core's ``minimax`` / ``minimax-cn`` providers check.
 _ENV_KEYS = ("MINIMAX_API_KEY", "MINIMAX_CN_API_KEY", "MINIMAX_OAUTH_TOKEN")
 
@@ -307,20 +315,35 @@ def parse_quota_payload(payload: Any) -> QuotaResult:
 # -- network ------------------------------------------------------------------
 
 
-def _get_json(url: str, bearer: str) -> Any:
+class _ResponseTooLarge(Exception):
+    """The endpoint answered with more than the plugin is willing to read."""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never forward a bearer credential to a redirected host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001, ARG002
+        return None
+
+
+_urlopen = urllib.request.build_opener(_NoRedirect()).open
+
+
+def _get_json(url: str, bearer: str, timeout: float) -> Any:
     """GET ``url`` with the Bearer; raises on HTTP/parse failure."""
     request = urllib.request.Request(
         url,
         headers={
             "Authorization": f"Bearer {bearer}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
             "User-Agent": "hermes-quota-plugin",
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=15) as resp:
-        raw = resp.read()
+    with _urlopen(request, timeout=timeout) as resp:
+        raw = resp.read(_MAX_BYTES + 1)
+    if len(raw) > _MAX_BYTES:
+        raise _ResponseTooLarge()
     return json.loads(raw)
 
 
@@ -331,33 +354,37 @@ def _http_reason(exc: Exception) -> str:
         if exc.code == 404:
             return "host-not-found"
         return f"http-{exc.code}"
+    if isinstance(exc, _ResponseTooLarge):
+        return "response-too-large"
     if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
         return "bad-json"
-    return f"fetch-error:{type(exc).__name__}"
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return "timeout"
+    return "fetch-error"
 
 
+@register(PROVIDER_ID)
 def fetch_minimax_quota() -> QuotaResult:
     bearer = resolve_bearer()
     if not bearer:
         return build_unavailable(PROVIDER_ID, "no-credentials")
 
-    last_exc: Optional[Exception] = None
-    for host in _HOSTS:
+    deadline = time.monotonic() + _DEADLINE_S
+    last_reason = "host-not-found"
+    for index, host in enumerate(_HOSTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return build_unavailable(PROVIDER_ID, "timeout")
         try:
-            payload = _get_json(f"{host}{_QUOTA_PATH}", bearer)
+            payload = _get_json(f"{host}{_QUOTA_PATH}", bearer, min(_REQUEST_TIMEOUT_S, remaining))
             return parse_quota_payload(payload)
         except urllib.error.HTTPError as exc:
             # A 404 on the canonical host → try the mirror before giving up.
-            if exc.code == 404 and host != _HOSTS[-1]:
-                last_exc = exc
+            if exc.code == 404 and index < len(_HOSTS) - 1:
+                last_reason = "host-not-found"
                 continue
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
         except Exception as exc:  # noqa: BLE001 - fail-open by contract
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
 
-    return build_unavailable(PROVIDER_ID, _http_reason(last_exc) if last_exc else "host-not-found")
-
-
-from .registry import register as _register  # noqa: E402
-
-_register(PROVIDER_ID)(fetch_minimax_quota)
+    return build_unavailable(PROVIDER_ID, last_reason)
