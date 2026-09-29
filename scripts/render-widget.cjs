@@ -156,7 +156,9 @@ const checks =
         'no raw provider id': !/>\s*opencode-go\s*</.test(html),
         'brand mark path present': /M4 2h16v20H4zM8 6v12h8V6z/.test(html),
         'footer age + cadence': /old · poll \d+s/.test(html),
-        'footer fetched line': /fetched /.test(html)
+        // The pane labels the timestamp "Checked <date, time, zone>" (#23); it
+        // used to read "fetched <relative day>".
+        'footer checked line': /Checked /.test(html)
       }
     : {
         'name "OpenCode Go"': /OpenCode Go/.test(html),
