@@ -32,10 +32,13 @@ class DeepSeekTests(unittest.TestCase):
         self.assertNotIn('SYNTHETIC_SECRET', repr(result))
         return result
 
-    def test_registered_without_replacing_builtin_openrouter(self):
+    def test_registered_without_taking_over_another_provider(self):
         self.module()
         from quota_providers import PROVIDER_FETCHERS
-        self.assertEqual(PROVIDER_FETCHERS['openrouter'].__module__, 'quota_providers.builtin')
+        # Adding DeepSeek must not rewire another provider's slot; OpenRouter has
+        # had its own module since #24.
+        self.assertEqual(PROVIDER_FETCHERS['deepseek'].__module__, 'quota_providers.deepseek')
+        self.assertNotEqual(PROVIDER_FETCHERS['openrouter'].__module__, 'quota_providers.deepseek')
         self.assertIn('cursor', PROVIDER_FETCHERS)
 
     def test_account_balances_preserve_currency_and_precision(self):

@@ -7,7 +7,7 @@ import importlib
 import json
 from io import BytesIO
 from pathlib import Path
-import subprocess
+import shutil
 import sys
 import threading
 import time
@@ -16,6 +16,8 @@ from typing import Optional
 import unittest
 from unittest import mock
 from urllib.error import HTTPError
+
+from widget_harness import render, text
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -250,42 +252,38 @@ class OpenRouterTests(unittest.TestCase):
             self.assertIsNone(mod._amount(value))
 
 
+@unittest.skipUnless(shutil.which("node"), "Node.js is required for widget render tests")
 class OpenRouterWidgetTests(unittest.TestCase):
     def test_details_visible_in_clean_and_dense_only_for_openrouter(self):
-        # Execute the actual ProviderRow with minimal element/hook shims, not a
-        # copied renderer. No React install, browser or live widget required.
-        runner = r'''
-const fs = require("fs");
-const src = fs.readFileSync(process.argv[1], "utf8");
-const start = src.indexOf("function ProviderRow(");
-const end = src.indexOf("\nfunction ResetFormatControl(", start);
-if (start < 0 || end < 0) throw Error("ProviderRow not found");
-let mode = "clean";
-const ID = "quota", resetFormatAtom = {}, paneDetailAtom = {};
-const usePluginI18n = () => (key) => key;
-const useValue = (a) => a === paneDetailAtom ? mode : "relative";
-const providerMeta = id => ({name: id});
-const ProviderBadge = () => null, StatusDot = () => null, QuotaBar = () => null;
-const worstWindow = () => null, toneForRemaining = () => "muted", toneColor = () => "gray";
-const remainingPct = () => 50, formatReset = () => "later";
-const jsx = (type, props) => ({type: typeof type === "string" ? type : "component", ...props});
-const jsxs = jsx;
-// Only trusted, checked-in widget code is evaluated, never fixture/user data.
-const render = eval(`(${src.slice(start, end)})`);
-const detail = "Account wallet via Key 1; other account membership unverified";
-const results = [];
-for (mode of ["clean", "dense"]) {
-  for (const id of ["openrouter", "nous"]) {
-    for (const windows of [[], [{label: "Key quota", used_percent: 50}]]) {
-      results.push({mode, id, visible: JSON.stringify(render({id, provider: {windows, details: [detail]}})).includes(detail)});
-    }
-  }
-}
-process.stdout.write(JSON.stringify(results));
-'''
-        run = subprocess.run(["node", "-e", runner, str(ROOT / "desktop/plugin.js")], capture_output=True, text=True, check=True)
-        for row in json.loads(run.stdout):
-            self.assertEqual(row["visible"], row["id"] == "openrouter" or row["mode"] == "dense", row)
+        # Render the real ProviderRow through the shared offline harness, so the
+        # helpers it calls are shipped code rather than per-test shims.
+        detail = "Account wallet via Key 1; other account membership unverified"
+        for mode in ("clean", "dense"):
+            for provider_id in ("openrouter", "nous"):
+                for windows in ([], [{"label": "Key quota", "used_percent": 50}]):
+                    with self.subTest(mode=mode, provider=provider_id, windows=bool(windows)):
+                        tree = render(component="row", mode=mode, id=provider_id,
+                                      provider={"windows": windows, "details": [detail]})
+                        self.assertEqual(detail in text(tree),
+                                         provider_id == "openrouter" or mode == "dense")
+
+    def test_all_keys_failed_keeps_failure_lines_visible(self):
+        # A total failure must not collapse into a bare "unavailable (no-data)":
+        # the per-key and wallet errors are what explain the state.
+        details = [
+            "Locally configured credentials: 2 (deduplicated); not an inventory of all account keys",
+            "Key 1 (native): unavailable (http-429)",
+            "Key 2 (saved): unavailable (timeout)",
+            "Account credits unavailable via Key 1 (native) (timeout)",
+        ]
+        provider = {"windows": [], "details": details, "unavailable_reason": "no-data"}
+        for mode in ("clean", "dense"):
+            with self.subTest(mode=mode):
+                rendered = text(render(component="row", mode=mode, id="openrouter",
+                                       provider=provider))
+                self.assertIn("unavailable (no-data)", rendered)
+                for line in details:
+                    self.assertIn(line, rendered)
 
 
 if __name__ == "__main__":

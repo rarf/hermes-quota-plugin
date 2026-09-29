@@ -30,7 +30,8 @@ function renderWidget(options = {}) {
     TEST_CTX: {storage: {get: () => undefined}, i18n: {register: v => {translations = v.en;}}, register: () => () => {}},
   }));
   context.PROVIDER = options.provider;
-  const expression = options.component === 'chip' ? 'ProviderChip({pid:"deepseek",provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:"deepseek",provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  context.WIDGET_ID = options.id || 'deepseek';
+  const expression = options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
   return vm.runInContext(expression, context);
 }
 module.exports = {renderWidget};

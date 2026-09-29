@@ -1,38 +1,11 @@
 """Render real widget components in Node; no network or credentials."""
-import json
-import os
 import shutil
-import subprocess
 import unittest
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from widget_harness import nodes, render, text  # noqa: F401  (used by the tests below)
+
 BALANCE = {'windows': [], 'details': [], 'account_balances': [
     {'currency': 'USD', 'total_balance': '12.50', 'granted_balance': '0', 'topped_up_balance': '12.50'}], 'api_calls_available': True}
-
-
-def render(**options):
-    p = subprocess.run(['node', str(ROOT / 'tests/widget_renderer.cjs')], input=json.dumps(options), text=True, capture_output=True, timeout=15, env={**os.environ, 'LANG': 'en_US.UTF-8', 'LC_ALL': 'en_US.UTF-8', 'TZ': 'UTC'})
-    if p.returncode:
-        raise AssertionError(p.stderr)
-    return json.loads(p.stdout)
-
-
-def nodes(tree):
-    if isinstance(tree, dict):
-        yield tree
-        yield from nodes(tree.get('props', {}).get('children'))
-    elif isinstance(tree, list):
-        for item in tree:
-            yield from nodes(item)
-
-
-def text(tree):
-    if isinstance(tree, dict):
-        return text(tree.get('props', {}).get('children'))
-    if isinstance(tree, list):
-        return ' '.join(text(v) for v in tree)
-    return '' if tree is None or isinstance(tree, bool) else str(tree)
 
 
 @unittest.skipUnless(shutil.which('node'), 'Node.js is required for widget render tests')

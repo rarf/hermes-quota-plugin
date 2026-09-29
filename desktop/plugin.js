@@ -1115,6 +1115,11 @@ function ProviderRow({ id, provider }) {
 	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
 
 	if (reason) {
+		// The failure lines stay visible here: for a provider whose keys failed
+		// individually, `unavailable (no-data)` alone hides the very errors that
+		// explain it. Clean mode stays compact, dense shows every line.
+		const shown = dense ? details : details.slice(0, 6);
+		const hidden = details.length - shown.length;
 		return jsxs("div", {
 			className:
 				"flex flex-col gap-0.5 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2.5 opacity-60",
@@ -1134,6 +1139,20 @@ function ProviderRow({ id, provider }) {
 					className: "pl-7 text-xs text-(--ui-text-tertiary)",
 					children: t("unavailable", reason),
 				}),
+				shown.length
+					? jsx("div", {
+							className:
+								"flex flex-col gap-0.5 pl-7 text-[0.6875rem] text-(--ui-text-tertiary)",
+							children: [
+								...shown.map((d, i) =>
+									jsx("div", { children: d }, `${id}-u-${i}`),
+								),
+								hidden > 0
+									? jsx("div", { children: t("moreDetails", hidden) }, `${id}-u-more`)
+									: null,
+							],
+						})
+					: null,
 			],
 		});
 	}
@@ -1753,6 +1772,7 @@ export default {
 				empty: "No quota data yet.",
 				emptyHint: "Quota data is being initialized automatically…",
 				unavailable: (reason) => `unavailable (${reason})`,
+				moreDetails: (n) => `+${n} more`,
 				noData: "no window data",
 				noDataSection: (n) => `No data (${n}) — click to expand`,
 				reset: (when) => `reset ${when}`,
