@@ -89,6 +89,10 @@ PLUGIN_BACKED_UP=0
 PLUGIN_INSTALLED=0
 DESKTOP_BACKED_UP=0
 DESKTOP_INSTALLED=0
+# Per-profile symlinks this run created, removed again by rollback(). Declared
+# with the other rollback state, before rollback() is defined and the ERR trap
+# is armed below.
+CREATED_LINKS=()
 
 rollback() {
   status=$?
@@ -99,6 +103,12 @@ rollback() {
   if [ "$DESKTOP_BACKED_UP" -eq 1 ]; then mv "$BACKUP_DESKTOP" "$DESKTOP_DIR" || true; fi
   if [ "$PLUGIN_INSTALLED" -eq 1 ]; then rm -rf "$PLUGIN_DIR"; fi
   if [ "$PLUGIN_BACKED_UP" -eq 1 ]; then mv "$BACKUP_PLUGIN" "$PLUGIN_DIR" || true; fi
+
+  # Drop the per-profile symlinks this run created, otherwise they are left
+  # dangling at a plugin dir that no longer exists.
+  for link in "${CREATED_LINKS[@]+"${CREATED_LINKS[@]}"}"; do
+    if [ -L "$link" ]; then rm -f "$link"; fi
+  done
 
   i=0
   while [ "$i" -lt "$CONFIG_APPLIED" ]; do
@@ -155,6 +165,10 @@ for profile in "${profiles[@]}"; do
       ln -s "$target" "$link"
     fi
     PROFILE_LINKS=$((PROFILE_LINKS + 1))
+    # Remember exactly what we linked, so a rollback removes these and only
+    # these. Previously a failure later in the script left every link created so
+    # far pointing at a plugin dir rollback had just deleted.
+    CREATED_LINKS+=("$link")
   done
 done
 
@@ -175,9 +189,24 @@ if ! rm -rf "$BACKUP_PLUGIN" "$BACKUP_DESKTOP"; then
   echo "Warning: installation succeeded, but a temporary backup could not be removed: $STAGE_DIR" >&2
 fi
 
+# Verify before claiming success: a link that does not resolve leaves the
+# profile silently unlinked, and the install used to exit 0 saying it linked.
+BROKEN_LINKS=0
+for link in "${CREATED_LINKS[@]+"${CREATED_LINKS[@]}"}"; do
+  if [ ! -e "$link" ]; then
+    echo "Warning: $link does not resolve." >&2
+    BROKEN_LINKS=$((BROKEN_LINKS + 1))
+  fi
+done
+
 printf '\nQuota plugin installed in %s\n' "$HOME_DIR"
 if [ "$PROFILE_LINKS" -gt 0 ]; then
-  printf '%s\n' "Linked into $PROFILE_LINKS per-profile plugin roots (backend + desktop widget)."
+  if [ "$BROKEN_LINKS" -gt 0 ]; then
+    printf 'Linked into %s per-profile plugin roots, but %s did not resolve.\n' \
+      "$PROFILE_LINKS" "$BROKEN_LINKS" >&2
+  else
+    printf '%s\n' "Linked into $PROFILE_LINKS per-profile plugin roots (backend + desktop widget)."
+  fi
 fi
 printf '%s\n' 'IMPORTANT: close every Hermes Desktop window, then reopen the app.'
 printf '%s\n' 'Desktop widget reloads on save; the backend is loaded at process start.'

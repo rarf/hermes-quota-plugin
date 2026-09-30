@@ -310,8 +310,8 @@ cadence: every `refreshInterval` seconds it reads the cache with
 payload is older than the interval, fires `hermes quota refresh` out-of-band and
 redraws when it lands. The sweep itself runs every provider **concurrently**
 under a wall-clock budget (`REFRESH_BUDGET_S`, 20s), so one slow or hung endpoint
-cannot stretch a poll past its interval — it is recorded as `timeout` and keeps
-its previous value. The last payload is cached in the widget's storage too, so a
+cannot stretch a poll past its interval — it is recorded as `timeout` and drops
+its previous value until a refresh succeeds. The last payload is cached in the widget's storage too, so a
 plugin reload or a gateway switch paints immediately instead of waiting on a
 backend spawn.
 
@@ -328,7 +328,7 @@ backend spawn.
 | Notice: *Widget vX · backend vY* | The two halves are different builds | Reload desktop plugins; restart the app if the backend is the older one |
 | *Update available* banner while `hermes plugins update` reports **already at catalog pin** | The install is Hermes-managed and pinned to the catalog entry's commit; the banner compares the installed build against the default branch | Update past the pin as described under [Updating](#updating), or wait for the catalog entry to advance |
 | `unavailable (opt-in-disabled)` for grok | Grok is opt-in | `hermes config set plugins.entries.quota.settings.grokEnabled true` |
-| `unavailable (timeout)` after a refresh | A provider endpoint hung past the sweep budget | It keeps its previous value; check the provider's status page |
+| `unavailable (timeout)` after a refresh | A provider endpoint hung past the sweep budget | It drops its previous value until a refresh succeeds; check the provider's status page |
 | `unavailable (503 …)` for opencode-go | Upstream flakiness, not your key | The fetcher already retries; it recovers on a later poll |
 | Numbers not changing | Check the pane footer: `· <age> old · poll <N>s` | If the age grows past the interval, report it — the poll should be exact |
 | `chrome-tcc-denied` / `chrome-keychain-denied` | macOS privacy prompts | Grant Full Disk Access / approve the Keychain item, then retry |

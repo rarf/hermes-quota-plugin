@@ -105,9 +105,21 @@ for profile in "${profiles[@]}"; do
   base="$HOME_DIR/profiles/$profile"
   for rel in plugins/quota desktop-plugins/quota; do
     link="$base/$rel"
+    # Only remove a link that points at the tree we installed. The comment
+    # above says "a real directory there was not created by us, so leave it
+    # alone" -- but a symlink to the user's own dev checkout was removed too,
+    # and never restored.
     if [ -L "$link" ]; then
-      rm "$link"
-      REMOVED_LINKS=$((REMOVED_LINKS + 1))
+      target="$(readlink "$link")"
+      case "$target" in
+        "$QUOTA_PLUGIN"|"$QUOTA_DESKTOP")
+          rm "$link"
+          REMOVED_LINKS=$((REMOVED_LINKS + 1))
+          ;;
+        *)
+          echo "Leaving $link in place (points at $target, not this install)." >&2
+          ;;
+      esac
     fi
   done
 done

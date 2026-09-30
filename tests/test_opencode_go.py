@@ -257,16 +257,23 @@ class FetcherContractTests(unittest.TestCase):
         self.assertTrue(callable(mod.fetch_opencode_go_quota))
 
     def test_missing_credentials_is_fail_open(self):
-        from quota_providers.base import QuotaResult
+        """No credentials must be no-credentials, with nothing sent.
+
+        This previously called the fetcher directly, which resolved
+        opencode.ai for real whenever a key was present anywhere on the
+        machine, and asserted only isinstance(result, QuotaResult) -- true for
+        a correct result and a total failure alike.
+        """
+        from unittest import mock
 
         mod = load_module()
-        result = mod.fetch_opencode_go_quota.__wrapped__() if hasattr(
-            mod.fetch_opencode_go_quota, "__wrapped__"
-        ) else None
-        # Direct call may hit the network only if a real key exists; assert the
-        # contract instead: whatever comes back is a QuotaResult, never an raise.
-        result = result or _safe_call(mod)
-        self.assertIsInstance(result, QuotaResult)
+        with mock.patch.object(mod, "_read_env_api_key", return_value=None), \
+             mock.patch.object(mod, "_load_auth_file_key", return_value=None), \
+             mock.patch.object(mod.urllib.request, "urlopen") as urlopen:
+            result = mod.fetch_opencode_go_quota()
+        self.assertEqual(result.unavailable_reason, "no-credentials")
+        self.assertEqual(result.windows, [])
+        urlopen.assert_not_called()
 
     def test_http_error_mapping(self):
         mod = load_module()

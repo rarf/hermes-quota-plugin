@@ -145,8 +145,10 @@ class MiniMaxParseTests(unittest.TestCase):
                 self.assertEqual(self.parse(payload).unavailable_reason, "no-data")
 
     def test_video_bucket_is_opt_in(self):
-        self.assertEqual(self.parse(_HAPPY).windows and
-                         [w.label for w in self.parse(_HAPPY).windows], ["Session", "Weekly"])
+        # Was `self.parse(...).windows and [...]`, which returns the falsy
+        # left side when there are no windows and parses the payload twice.
+        default_windows = self.parse(_HAPPY).windows
+        self.assertEqual([w.label for w in default_windows], ["Session", "Weekly"])
         opted_in = self.parse(_HAPPY, video=True)
         self.assertEqual([w.label for w in opted_in.windows],
                          ["Session", "Weekly", "Video Session", "Video Weekly"])

@@ -39,9 +39,12 @@ jobs:
         with:
           node-version: "22"
 
-      - name: node --check every desktop JS file
+      - name: node --check every JS file
+        # desktop/*.js alone missed scripts/render-widget.cjs and
+        # tests/widget_renderer.cjs, so neither harness was ever syntax-checked.
         run: |
-          for f in desktop/*.js; do
+          for f in desktop/*.js desktop/*.cjs scripts/*.cjs tests/*.cjs; do
+            [ -e "$f" ] || continue
             node --check "$f"
             echo "OK $f"
           done

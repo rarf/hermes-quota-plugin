@@ -141,7 +141,7 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
     Bounded by ``budget`` seconds (``REFRESH_BUDGET_S`` default) and run on
     daemon threads, so one hung provider can neither stretch the call nor hold
     the short-lived CLI process open: whatever finished is written, the rest is
-    recorded as ``timeout`` and keeps its previous value. Fail-open per
+    recorded as ``timeout`` and drops the previous value. Fail-open per
     provider: a fetcher that raises, returns nothing, or misses the deadline
     leaves an ``unavailable_reason`` record rather than aborting the sweep.
     Returns the cache dict that was written.

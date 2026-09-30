@@ -399,10 +399,14 @@ class GrokRestTests(unittest.TestCase):
     )
 
     def test_grpc_fixture_reports_the_single_panel_meter(self):
-        """The usage panel renders ONE bar ("Weekly Limit … 3% used / Resets …")
-        with "Grok Build 3%" as its legend line. Reporting the kind entry as a
-        second quota showed two quotas with the same % and the same reset date
-        but different names — the panel has only one."""
+        """The usage panel renders ONE bar for this capture.
+
+        The class comment records what the live capture showed: "Weekly Limit
+        100% used (resets Aug 23 17:00Z)" with "Grok Build 3%" as its legend.
+        This docstring previously said the bar read 3%, copied from the kind-2
+        test below -- which is the legend, not the bar. The assertion below
+        expects the 100% the parser actually returns.
+        """
         from quota_providers import grok
 
         raw = bytes.fromhex(self._GRPC_FIXTURE_HEX)
@@ -859,7 +863,13 @@ class AnthropicScopedLimitTests(unittest.TestCase):
     def test_scoped_windows_append_to_usage_payload(self):
         import quota_providers.builtin as builtin
 
+        # _core_anthropic_is_oauth must be stubbed too: builtin rejects a
+        # non-OAuth token before parsing, so without this these tests only pass
+        # when Hermes core is unimportable, and they exercise the parser rather
+        # than the path that ships.
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
+             mock.patch.object(builtin.urllib.request, "urlopen",
              mock.patch.object(builtin, "urlopen_no_redirect",
                                _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
             res = builtin._fetch_anthropic()
@@ -872,7 +882,13 @@ class AnthropicScopedLimitTests(unittest.TestCase):
     def test_weekly_all_limit_fills_core_snapshot_gap(self):
         import quota_providers.builtin as builtin
 
+        # _core_anthropic_is_oauth must be stubbed too: builtin rejects a
+        # non-OAuth token before parsing, so without this these tests only pass
+        # when Hermes core is unimportable, and they exercise the parser rather
+        # than the path that ships.
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
+             mock.patch.object(builtin.urllib.request, "urlopen",
              mock.patch.object(builtin, "urlopen_no_redirect",
                                _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
             res = builtin._fetch_anthropic()
@@ -921,6 +937,8 @@ class AnthropicScopedLimitTests(unittest.TestCase):
             raise OSError("down")
 
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
+             mock.patch.object(builtin.urllib.request, "urlopen", _boom):
              mock.patch.object(builtin, "urlopen_no_redirect", _boom):
             res = builtin._fetch_anthropic()
         self.assertEqual(res.unavailable_reason, "fetch-error:OSError")
@@ -935,6 +953,8 @@ class AnthropicScopedLimitTests(unittest.TestCase):
             return _FakeResponse(json.dumps(_ANTHROPIC_LIMITS_PAYLOAD).encode())
 
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
+             mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
+             mock.patch.object(builtin.urllib.request, "urlopen", _opener):
              mock.patch.object(builtin, "urlopen_no_redirect", _opener):
             res = builtin._fetch_anthropic()
         self.assertIsNone(res.unavailable_reason)
