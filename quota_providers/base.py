@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-<<<<<<< HEAD
-import urllib.request
-=======
 import time
->>>>>>> origin/fix/refresh-budget
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -83,7 +80,6 @@ def build_unavailable(label: str, reason: str) -> QuotaResult:
     return QuotaResult(label=label, windows=[], plan=None, unavailable_reason=reason)
 
 
-<<<<<<< HEAD
 def opt_in_flag(value: object) -> bool:
     """Strictly parse a boolean-ish opt-in setting.
 
@@ -103,7 +99,8 @@ def opt_in_flag(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
-=======
+
+
 class Deadline:
     """A wall-clock budget shared across a fetcher's serial requests.
 
@@ -137,4 +134,3 @@ class Deadline:
         what is left. Returns 0.0 once spent, which fails fast rather than
         blocking for the full per-request timeout."""
         return min(float(cap), self.remaining())
->>>>>>> origin/fix/refresh-budget

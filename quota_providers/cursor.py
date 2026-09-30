@@ -251,11 +251,7 @@ def _post(method: str, token: str,
         method="POST",
     )
     try:
-<<<<<<< HEAD
-        with urlopen_no_redirect(request, timeout=_HTTP_TIMEOUT_S) as resp:
-=======
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
->>>>>>> origin/fix/refresh-budget
+        with urlopen_no_redirect(request, timeout=timeout) as resp:
             body = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -284,11 +280,7 @@ def _refresh_access_token(refresh_token: str,
         method="POST",
     )
     try:
-<<<<<<< HEAD
-        with urlopen_no_redirect(request, timeout=_REFRESH_TIMEOUT_S) as resp:
-=======
-        with urllib.request.urlopen(request, timeout=timeout) as resp:
->>>>>>> origin/fix/refresh-budget
+        with urlopen_no_redirect(request, timeout=timeout) as resp:
             body = resp.read()
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):

@@ -869,7 +869,6 @@ class AnthropicScopedLimitTests(unittest.TestCase):
         # than the path that ships.
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
-             mock.patch.object(builtin.urllib.request, "urlopen",
              mock.patch.object(builtin, "urlopen_no_redirect",
                                _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
             res = builtin._fetch_anthropic()
@@ -888,7 +887,6 @@ class AnthropicScopedLimitTests(unittest.TestCase):
         # than the path that ships.
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
-             mock.patch.object(builtin.urllib.request, "urlopen",
              mock.patch.object(builtin, "urlopen_no_redirect",
                                _urlopen_returning(_ANTHROPIC_LIMITS_PAYLOAD)):
             res = builtin._fetch_anthropic()
@@ -938,7 +936,6 @@ class AnthropicScopedLimitTests(unittest.TestCase):
 
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
-             mock.patch.object(builtin.urllib.request, "urlopen", _boom):
              mock.patch.object(builtin, "urlopen_no_redirect", _boom):
             res = builtin._fetch_anthropic()
         self.assertEqual(res.unavailable_reason, "fetch-error:OSError")
@@ -954,7 +951,6 @@ class AnthropicScopedLimitTests(unittest.TestCase):
 
         with mock.patch.object(builtin, "_core_anthropic_token", return_value="tok"), \
              mock.patch.object(builtin, "_core_anthropic_is_oauth", return_value=True), \
-             mock.patch.object(builtin.urllib.request, "urlopen", _opener):
              mock.patch.object(builtin, "urlopen_no_redirect", _opener):
             res = builtin._fetch_anthropic()
         self.assertIsNone(res.unavailable_reason)
