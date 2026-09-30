@@ -86,7 +86,13 @@ def _valid_token(creds: dict) -> Optional[str]:
     tok = creds.get("access_token")
     if not tok:
         return None
-    if exp and time.time() * 1000 >= float(exp) - 30000:
+    try:
+        # A non-numeric expiry_date is a schema surprise, not a crash: this
+        # runs before the fetcher's own error handling.
+        expires_at_ms = float(exp) if exp else 0.0
+    except (TypeError, ValueError):
+        expires_at_ms = 0.0
+    if exp and time.time() * 1000 >= expires_at_ms - 30000:
         return _refresh(creds) or tok
     return tok
 
@@ -136,7 +142,15 @@ def _post_json(url: str, body: dict, token: str):
             txt = e.read().decode("utf-8", "replace")
         except Exception:
             txt = ""
+        if e.fp is not None:
+            e.close()
         return None, {"code": e.code, "body": txt}
+    except urllib.error.URLError as e:
+        # A DNS or connection failure is a transport error, not an HTTP status;
+        # without this it escaped the fetcher as URLError/OSError.
+        return None, {"code": None, "body": "", "transport": type(e).__name__}
+    except (TimeoutError, OSError) as e:
+        return None, {"code": None, "body": "", "transport": type(e).__name__}
 
 
 def _load_code_assist(token: str) -> Optional[dict]:
@@ -207,6 +221,10 @@ def fetch_gemini_quota() -> QuotaResult:
         project = str(la["cloudaicompanionProject"])
     data, err = _post_json(_QUOTA_URL, {"project": project}, tok)
     if err is not None:
+        if err.get("transport"):
+            # No HTTP status was ever received; a reason of "http-None" would
+            # read as a server answer that never arrived.
+            return build_unavailable("gemini", "fetch-error")
         txt = err.get("body") or ""
         if err.get("code") in (401, 403) or "UNSUPPORTED_CLIENT" in txt or "IneligibleTier" in txt:
             return build_unavailable("gemini", "consumer-tier-deprecated")

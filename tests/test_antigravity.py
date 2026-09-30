@@ -329,8 +329,12 @@ class RegistrationTests(unittest.TestCase):
         from quota_providers import PROVIDER_FETCHERS
 
         self.assertIn("antigravity", PROVIDER_FETCHERS)
-        # Registered ungated, like every other provider except grok.
-        self.assertIs(PROVIDER_FETCHERS["antigravity"], mod.fetch_antigravity_quota)
+        # Registered ungated, like every other provider except grok. The
+        # registry stores register()'s fail-open wrapper, so compare against
+        # the function it wraps rather than the wrapper's identity.
+        registered = PROVIDER_FETCHERS["antigravity"]
+        self.assertIs(getattr(registered, "__wrapped__", registered),
+                      mod.fetch_antigravity_quota)
 
     def test_secret_literal_stays_split(self):
         # The client secret must stay reassembled so scanners do not flag it.

@@ -87,7 +87,11 @@ def _called_urls(opener_mock):
 
 class MiniMaxParseTests(unittest.TestCase):
     def test_registered(self):
-        self.assertEqual(PROVIDER_FETCHERS["minimax"], minimax.fetch_minimax_quota)
+        # register() stores a fail-open wrapper (see registry.register), so
+        # compare against the function it wraps rather than by identity.
+        registered = PROVIDER_FETCHERS["minimax"]
+        self.assertIs(getattr(registered, "__wrapped__", registered),
+                      minimax.fetch_minimax_quota)
 
     def test_budget_stays_inside_the_sweep(self):
         # A provider slower than the sweep is recorded as `timeout` and loses
