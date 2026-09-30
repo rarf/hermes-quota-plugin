@@ -156,7 +156,11 @@ def _pct(value: Any) -> Optional[float]:
     number = _num(value)
     if number is None:
         return None
-    return round(max(0.0, min(100.0, number)), 2)
+    if not 0.0 <= number <= 100.0:
+        # Outside 0-100 is a schema surprise. Clamping reported 150% as a full
+        # 100% bar, which reads as "exhausted" rather than "unrecognised".
+        return None
+    return round(number, 2)
 
 
 def _iso_from_ms(value: Any) -> Optional[str]:

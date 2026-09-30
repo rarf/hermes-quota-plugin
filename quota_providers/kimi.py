@@ -143,10 +143,13 @@ def _parse_block(block: dict) -> QuotaWindow:
     else:
         label = "window"
     detail = block.get("detail") or {}
-    limit = _as_float(block.get("limit", detail.get("limit")))
-    used = _as_float(block.get("used", detail.get("used")))
-    remaining = _as_float(block.get("remaining", detail.get("remaining")))
-    reset = block.get("resetTime", detail.get("resetTime"))
+    # `or` rather than a dict.get default: a key present with a null value
+    # returns None from .get, not the fallback, so the nested `detail` copy
+    # was never consulted.
+    limit = _as_float(block.get("limit") or detail.get("limit"))
+    used = _as_float(block.get("used") or detail.get("used"))
+    remaining = _as_float(block.get("remaining") or detail.get("remaining"))
+    reset = block.get("resetTime") or detail.get("resetTime")
     used_pct: Optional[float] = None
     if used is not None and limit not in (None, 0):
         used_pct = round(100.0 * used / limit, 2)

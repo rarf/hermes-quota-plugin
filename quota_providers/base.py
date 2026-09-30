@@ -77,3 +77,24 @@ class QuotaResult:
 
 def build_unavailable(label: str, reason: str) -> QuotaResult:
     return QuotaResult(label=label, windows=[], plan=None, unavailable_reason=reason)
+
+
+def opt_in_flag(value: object) -> bool:
+    """Strictly parse a boolean-ish opt-in setting.
+
+    ``bool("false")`` is True, so a YAML/JSON value written as the *string*
+    ``"false"`` — or ``"no"``, ``"0"``, ``"off"`` — read as an opt-IN. For
+    ``grokEnabled`` that means reading and shipping browser session cookies
+    after the user explicitly opted out. Only a real bool, or one of the
+    recognised affirmative strings, enables a sensitive source.
+
+    Mirrors the allow/deny sets the env-var path in ``grok._grok_enabled``
+    and ``minimax._video_enabled`` already use.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False

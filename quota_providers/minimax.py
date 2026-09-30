@@ -73,7 +73,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import QuotaResult, QuotaWindow, build_unavailable, opt_in_flag, urlopen_no_redirect
 from .registry import register
 
 PROVIDER_ID = "minimax"
@@ -139,7 +139,7 @@ def _video_enabled() -> bool:
         if isinstance(entry, dict):
             settings = entry.get("settings")
             if isinstance(settings, dict) and _OPT_IN_VIDEO_CONFIG in settings:
-                return bool(settings.get(_OPT_IN_VIDEO_CONFIG))
+                return opt_in_flag(settings.get(_OPT_IN_VIDEO_CONFIG))
     except Exception:  # noqa: BLE001 - standalone install / locked store
         pass
     return False
@@ -251,6 +251,11 @@ def parse_quota_payload(payload: Any) -> QuotaResult:
     base_resp = payload.get("base_resp")
     if isinstance(base_resp, dict):
         status_code = base_resp.get("status_code")
+        # A JSON string is as likely as an int here, so normalise before
+        # comparing: `isinstance("1004", int)` is False and the whole envelope
+        # check was skipped, turning a "plan not found" into a bare no-data.
+        if isinstance(status_code, str) and status_code.strip().lstrip("-").isdigit():
+            status_code = int(status_code.strip())
         if isinstance(status_code, int) and status_code != 0:
             status_msg = str(base_resp.get("status_msg") or "").lower()
             if any(token in status_msg for token in ("plan", "subscript", "cookie", "auth")):

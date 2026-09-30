@@ -105,8 +105,13 @@ _PERCENT_KEYS = (
     "utilization",
     "utilizationPercent",
     "utilization_percent",
-    "usage",
 )
+# NOTE: "usage" is deliberately NOT a _PERCENT_KEYS entry. It is also in
+# _USED_KEYS, and the percent branch is tried first, so listing it here would
+# shadow the used/limit fallback this module documents ("percent can be
+# computed from used/limit pairs when no direct field exists") and report a
+# dollar amount as a percentage. The live shape nests window dicts under a
+# top-level "usage" wrapper, which is handled by the wrapper walk, not here.
 _RESET_IN_SEC_KEYS = (
     "resetInSec",
     "resetInSeconds",

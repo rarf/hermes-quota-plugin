@@ -166,7 +166,7 @@ def _used_percent(entry: dict) -> Optional[float]:
         if used is None or limit is None or limit <= 0:
             return None
         percent = used / limit * 100.0
-    if percent < 0:  # a negative server value is a schema surprise, not -3% used
+    if percent < 0 or percent > 100:  # a server value outside 0-100 is a schema surprise
         return None
     return max(0.0, min(100.0, percent))
 
@@ -286,7 +286,10 @@ def _subscription_plan(payload: Any) -> tuple[Optional[str], Optional[str]]:
             continue
         valid = item.get("valid")
         status = str(item.get("status") or "").strip().upper()
-        if valid is False or (status and status not in ("ACTIVE", "NORMAL", "OK")):
+        # A subscription item must positively assert it is live. Previously an
+        # item carrying neither `valid` nor `status` passed the filter, so a
+        # bare {"productName": "Canceled Plan"} was returned as the active plan.
+        if valid is not True and status not in ("ACTIVE", "NORMAL", "OK"):
             continue
         name = str(item.get("productName") or item.get("name") or "").strip()
         renew = _parse_reset(item.get("renewTime") or item.get("expireTime"))

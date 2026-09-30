@@ -210,7 +210,10 @@ def _parse_anthropic_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], 
             continue
         if not math.isfinite(used):
             continue
-        if used <= 1:
+        # A 0-1 value is a fraction, except a bare 1.0 which is a whole percent:
+        # the same rule issue #8 settled for opencode_go (`f9e6255`, "preserve
+        # integer percent values"). `used <= 1` rescaled a genuine 1% to 100%.
+        if 0.0 < used < 1.0:
             used *= 100
         if label in seen:
             continue
@@ -490,7 +493,9 @@ def _fetch_codex_with_models() -> QuotaResult:
             return None
         return QuotaWindow(
             label=label,
-            used_percent=float(used),
+            # Clamp like every other parser in this package (see :154 and :223):
+            # an out-of-range value is a schema surprise, not a percentage.
+            used_percent=max(0.0, min(100.0, float(used))),
             reset_at=_iso(raw.get("reset_at")),
         )
 

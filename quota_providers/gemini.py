@@ -102,10 +102,13 @@ def _parse_quota(data: dict) -> Optional[QuotaResult]:
         frac = b.get("remainingFraction")
         if frac is None:
             continue
-        try:
-            left = round(float(frac) * 100.0, 2)
-        except (TypeError, ValueError):
+        if isinstance(frac, bool) or not isinstance(frac, (int, float)):
             continue
+        # A fraction is 0..1 by contract (same guard as antigravity._bucket);
+        # anything else is a schema surprise, not a percentage.
+        if not 0.0 <= frac <= 1.0:
+            continue
+        left = round(float(frac) * 100.0, 2)
         used = round(100.0 - left, 2)
         reset = b.get("resetTime")
         model = b.get("modelId") or "gemini"

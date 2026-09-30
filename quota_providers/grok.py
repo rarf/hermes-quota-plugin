@@ -9,7 +9,7 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import QuotaResult, QuotaWindow, build_unavailable, opt_in_flag, urlopen_no_redirect
 from .browser_cookies import (
     ChromeCookieError,
     load_chrome_grok_cookies,
@@ -335,7 +335,7 @@ def _grok_enabled() -> bool:
         if isinstance(entry, dict):
             settings = entry.get("settings")
             if isinstance(settings, dict) and "grokEnabled" in settings:
-                return bool(settings.get("grokEnabled"))
+                return opt_in_flag(settings.get("grokEnabled"))
     except Exception:
         pass
     return False
