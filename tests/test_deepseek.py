@@ -80,10 +80,17 @@ class DeepSeekTests(unittest.TestCase):
 
     def test_errors_are_sanitized(self):
         mod = self.module()
+        # A credential-resolution failure now reports no-credentials rather
+        # than fetch-error: nothing resolved to auth with, and the two reasons
+        # mean different things on the muted card. The point of this test is
+        # the sanitisation assertion below, which is unchanged.
         with mock.patch.object(mod, 'resolve_api_key', side_effect=RuntimeError('SECRET')):
             result = mod.fetch_deepseek_quota()
-        self.assertEqual(result.unavailable_reason, 'fetch-error')
+        self.assertEqual(result.unavailable_reason, 'no-credentials')
         self.assertNotIn('SECRET', repr(result))
+        with mock.patch.object(mod, 'resolve_api_key', return_value='SYNTHETIC_KEY'), mock.patch.object(mod, 'get_json', side_effect=RuntimeError('SECRET')):
+            self.assertEqual(mod.fetch_deepseek_quota().unavailable_reason, 'fetch-error')
+            self.assertNotIn('SECRET', repr(mod.fetch_deepseek_quota()))
         for reason in ('auth-failed', 'http-429', 'timeout', 'bad-json'):
             with mock.patch.object(mod, 'resolve_api_key', return_value='SECRET'), mock.patch.object(mod, 'get_json', return_value=(None, reason)):
                 self.assertEqual(mod.fetch_deepseek_quota().unavailable_reason, reason)

@@ -12,10 +12,17 @@ from .registry import register
 
 @register("deepseek")
 def fetch_deepseek_quota() -> QuotaResult:
+    # Credential resolution is separated from the fetch so a missing Hermes
+    # core reports no-credentials rather than the generic fetch-error: the two
+    # mean different things to a user staring at the muted card, and a
+    # standalone install can never fix a missing core by retrying.
     try:
         secret = resolve_api_key("deepseek")
-        if not secret:
-            return build_unavailable("deepseek", "no-credentials")
+    except Exception:  # noqa: BLE001 - a standalone install has no hermes_cli
+        return build_unavailable("deepseek", "no-credentials")
+    if not secret:
+        return build_unavailable("deepseek", "no-credentials")
+    try:
         # The endpoint is account-level, not a per-key budget. Native primary
         # only: never add balances together across credentials or currencies.
         payload, error = get_json("https://api.deepseek.com/user/balance", secret)

@@ -226,8 +226,14 @@ def fetch_gemini_quota() -> QuotaResult:
             # read as a server answer that never arrived.
             return build_unavailable("gemini", "fetch-error")
         txt = err.get("body") or ""
-        if err.get("code") in (401, 403) or "UNSUPPORTED_CLIENT" in txt or "IneligibleTier" in txt:
+        # A 401/403 is an auth failure, not a tier verdict. Only the body's own
+        # tier wording justifies consumer-tier-deprecated; a bare invalid_token
+        # or revoked credential means re-auth, and telling the user to migrate
+        # to Antigravity sends them the wrong way.
+        if "UNSUPPORTED_CLIENT" in txt or "IneligibleTier" in txt:
             return build_unavailable("gemini", "consumer-tier-deprecated")
+        if err.get("code") in (401, 403):
+            return build_unavailable("gemini", "auth-failed")
         return build_unavailable("gemini", f"http-{err.get('code')}")
     if not isinstance(data, dict):
         return build_unavailable("gemini", "bad-json")
