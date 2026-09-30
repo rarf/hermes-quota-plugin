@@ -55,7 +55,7 @@ import urllib.error
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import Deadline, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
 
 _PROVIDER_ID = "opencode-go"
 _API_URL = "https://opencode.ai/zen/go/v1/usage"
@@ -68,6 +68,12 @@ _API_URL = "https://opencode.ai/zen/go/v1/usage"
 _RETRY_ATTEMPTS = 4
 _RETRY_BACKOFF_SECONDS = (0.25, 0.5, 1.0)
 _TRANSIENT_HTTP_STATUSES = (429, 500, 502, 504)
+# One request, and the total the retry loop may spend. The sweep budget is
+# quota_cache.REFRESH_BUDGET_S (20s); an overrun is recorded as `timeout` and
+# the provider loses its previous value. Four 15s attempts plus backoff is
+# ~61.75s, so the attempts share one deadline instead.
+_REQUEST_TIMEOUT_S = 15.0
+_FETCH_BUDGET_S = 15.0
 
 def _auth_file_candidates() -> tuple[str, ...]:
     """Known locations of OpenCode's local auth file across platforms.
@@ -359,7 +365,7 @@ def parse_usage_payload(data: Any, now: Optional[float] = None) -> list[QuotaWin
 # -- network ------------------------------------------------------------------
 
 
-def _attempt_usage(api_key: str) -> tuple[Optional[bytes], Optional[str], bool]:
+def _attempt_usage(api_key: str, timeout: float = _REQUEST_TIMEOUT_S) -> tuple[Optional[bytes], Optional[str], bool]:
     """One HTTP GET against the usage API.
 
     Returns ``(body, None, retryable)`` on success and
@@ -378,7 +384,11 @@ def _attempt_usage(api_key: str) -> tuple[Optional[bytes], Optional[str], bool]:
         method="GET",
     )
     try:
+<<<<<<< HEAD
         with urlopen_no_redirect(request, timeout=15) as resp:
+=======
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+>>>>>>> origin/fix/refresh-budget
             return resp.read(), None, False
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
@@ -401,9 +411,16 @@ def fetch_usage(
     total_attempts = max(1, attempts)
     reason: Optional[str] = None
     data: Any = None
+    # The retries share one deadline, so a persistently-503 endpoint cannot
+    # spend four full request timeouts inside a 20s sweep.
+    deadline = Deadline(_FETCH_BUDGET_S)
 
     for attempt in range(total_attempts):
-        body, reason, retryable = _attempt_usage(api_key)
+        if deadline.expired():
+            # Out of budget with nothing to show: say so rather than reporting
+            # a reason for a request we never made.
+            return build_unavailable(_PROVIDER_ID, "timeout")
+        body, reason, retryable = _attempt_usage(api_key, deadline.slice(_REQUEST_TIMEOUT_S))
         if body is not None:
             try:
                 data = json.loads(body)

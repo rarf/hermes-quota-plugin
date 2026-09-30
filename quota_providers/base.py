@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+<<<<<<< HEAD
 import urllib.request
+=======
+import time
+>>>>>>> origin/fix/refresh-budget
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -79,6 +83,7 @@ def build_unavailable(label: str, reason: str) -> QuotaResult:
     return QuotaResult(label=label, windows=[], plan=None, unavailable_reason=reason)
 
 
+<<<<<<< HEAD
 def opt_in_flag(value: object) -> bool:
     """Strictly parse a boolean-ish opt-in setting.
 
@@ -98,3 +103,38 @@ def opt_in_flag(value: object) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
+=======
+class Deadline:
+    """A wall-clock budget shared across a fetcher's serial requests.
+
+    ``quota_cache.REFRESH_BUDGET_S`` (20s) bounds the whole sweep, and a
+    provider that overruns it is recorded as ``timeout`` and loses its previous
+    value. A per-request ``timeout=15`` is therefore not a bound on the
+    provider: three serial requests at 15s each is 45s, and four 15s retries
+    with backoff is over 60s.
+
+    Clamp each request to whatever remains, so the provider as a whole stays
+    inside the sweep. ``minimax`` already does this with a private
+    ``_DEADLINE_S``; this makes it available to every provider and testable
+    with one formula.
+    """
+
+    def __init__(self, budget: float, clock=None) -> None:
+        # Resolved at call time, not bound as a default argument, so a test can
+        # patch time.monotonic after import and still drive the clock.
+        self._clock = clock if clock is not None else time.monotonic
+        self._expires = self._clock() + max(0.0, float(budget))
+
+    def remaining(self) -> float:
+        """Seconds left, never negative."""
+        return max(0.0, self._expires - self._clock())
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def slice(self, cap: float) -> float:
+        """The timeout to hand the next request: the smaller of ``cap`` and
+        what is left. Returns 0.0 once spent, which fails fast rather than
+        blocking for the full per-request timeout."""
+        return min(float(cap), self.remaining())
+>>>>>>> origin/fix/refresh-budget

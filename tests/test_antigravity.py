@@ -89,7 +89,7 @@ def _windows_for(payload):
 
 def _fetch(summary=None, load=None):
     """Run the fetcher with every HTTP boundary mocked to the live shapes."""
-    def _post(path, access_token):  # noqa: ANN001, ARG001
+    def _post(path, access_token, **kwargs):  # noqa: ANN001, ANN003, ARG001
         if path.endswith(mod._QUOTA_PATH):
             return (_LIVE if summary is None else summary), None
         return (_LOAD if load is None else load), None
@@ -163,7 +163,10 @@ class TokenTests(unittest.TestCase):
         with mock.patch.object(mod, "_refresh", return_value="ya29.fresh") as refresh:
             result = mod._access_token(
                 {"token": {"access_token": "stale", "refresh_token": "1//r"}})
-        refresh.assert_called_once_with("1//r")
+        # The refresh now carries the clamped timeout so the fetcher's shared
+        # deadline bounds it; assert the token, not the exact call shape.
+        self.assertEqual(refresh.call_args.args, ("1//r",))
+        self.assertIn("timeout", refresh.call_args.kwargs)
         self.assertEqual(result, ("ya29.fresh", None))
 
     def test_cached_token_used_when_no_refresh_token(self):
@@ -292,19 +295,19 @@ class FetchTests(unittest.TestCase):
         self.assertTrue(result.has_data())
 
     def test_401_is_auth_failed(self):
-        result = _fetch_with_post(lambda p, t: (None, 401))
+        result = _fetch_with_post(lambda p, t, **kw: (None, 401))
         self.assertEqual(result.unavailable_reason, "auth-failed")
 
     def test_403_is_no_subscription(self):
-        result = _fetch_with_post(lambda p, t: (None, 403))
+        result = _fetch_with_post(lambda p, t, **kw: (None, 403))
         self.assertEqual(result.unavailable_reason, "no-subscription")
 
     def test_other_http_is_reported(self):
-        result = _fetch_with_post(lambda p, t: (None, 500))
+        result = _fetch_with_post(lambda p, t, **kw: (None, 500))
         self.assertEqual(result.unavailable_reason, "http-500")
 
     def test_transport_failure_is_fetch_error(self):
-        result = _fetch_with_post(lambda p, t: (None, None))
+        result = _fetch_with_post(lambda p, t, **kw: (None, None))
         self.assertEqual(result.unavailable_reason, "fetch-error")
 
     def test_no_usable_bucket_is_no_data(self):
@@ -312,10 +315,10 @@ class FetchTests(unittest.TestCase):
 
     def test_json_array_payload_is_no_data(self):
         self.assertEqual(
-            _fetch_with_post(lambda p, t: ([], None)).unavailable_reason, "no-data")
+            _fetch_with_post(lambda p, t, **kw: ([], None)).unavailable_reason, "no-data")
 
     def test_plan_failure_does_not_lose_the_quota(self):
-        def _post(path, token):  # noqa: ANN001, ARG001
+        def _post(path, token, **kwargs):  # noqa: ANN001, ANN003, ARG001
             return (_LIVE, None) if path.endswith(mod._QUOTA_PATH) else (None, 500)
 
         result = _fetch_with_post(_post)

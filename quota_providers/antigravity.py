@@ -42,7 +42,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import Deadline, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
 from .registry import register as _register
 
 _PROVIDER_ID = "antigravity"
@@ -57,6 +57,13 @@ _QUOTA_PATH = "/v1internal:retrieveUserQuotaSummary"
 _LOAD_PATH = "/v1internal:loadCodeAssist"
 _USER_AGENT = "antigravity/2.8.0 windows/amd64"
 _TIMEOUT_S = 15.0
+# The refresh, quota and plan calls are serial, so three 15s timeouts is 45s --
+# more than twice quota_cache.REFRESH_BUDGET_S (20s), where an overrun is
+# recorded as `timeout` and the provider loses its previous value. They share
+# one deadline instead. `_plan` is cosmetic (the plan name only) so it is
+# given the smallest share and skipped when nothing is left.
+_FETCH_BUDGET_S = 18.0
+_PLAN_BUDGET_S = 2.0
 
 _CRED_TARGET = "gemini:antigravity"
 
@@ -168,7 +175,7 @@ def _load_credential() -> Optional[dict[str, Any]]:
     return None
 
 
-def _refresh(refresh_token: str) -> Optional[str]:
+def _refresh(refresh_token: str, *, timeout: float = _TIMEOUT_S) -> Optional[str]:
     """Exchange a refresh token for a fresh access token, or None."""
     body = urllib.parse.urlencode({
         "client_id": _CLIENT_ID,
@@ -181,7 +188,7 @@ def _refresh(refresh_token: str) -> Optional[str]:
             _TOKEN_URL, data=body, method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded",
                      "User-Agent": _USER_AGENT},
-        ), timeout=_TIMEOUT_S) as resp:
+        ), timeout=timeout) as resp:
             data = json.loads(resp.read())
     except Exception:  # noqa: BLE001 - fail-open by contract
         return None
@@ -189,7 +196,7 @@ def _refresh(refresh_token: str) -> Optional[str]:
     return token if isinstance(token, str) and token.strip() else None
 
 
-def _access_token(cred: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+def _access_token(cred: dict[str, Any], deadline: "Deadline | None" = None) -> tuple[Optional[str], Optional[str]]:
     """(access_token, failure_reason). Refresh first; cached token is the fallback.
 
     A failed refresh is not by itself proof the credentials are dead: the token
@@ -206,7 +213,10 @@ def _access_token(cred: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
     cached = cached.strip() if isinstance(cached, str) and cached.strip() else None
     refresh = token.get("refresh_token")
     if isinstance(refresh, str) and refresh.strip():
-        fresh = _refresh(refresh.strip())
+        fresh = _refresh(
+            refresh.strip(),
+            timeout=deadline.slice(_TIMEOUT_S) if deadline else _TIMEOUT_S,
+        )
         if fresh:
             return fresh, None
         if cached:
@@ -220,10 +230,12 @@ def _access_token(cred: dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
 # -- HTTP ----------------------------------------------------------------------
 
 
-def _post(path: str, access_token: str) -> tuple[Optional[dict], Optional[int]]:
+def _post(path: str, access_token: str, *, timeout: float = _TIMEOUT_S) -> tuple[Optional[dict], Optional[int]]:
     """POST JSON with the bearer. Returns ``(data, http_status)``.
 
     ``http_status`` is None on success and on a transport failure alike.
+    ``timeout`` is supplied by the caller so the fetcher's shared deadline can
+    clamp it; the default keeps a direct call bounded.
     """
     try:
         with urlopen_no_redirect(urllib.request.Request(
@@ -232,7 +244,7 @@ def _post(path: str, access_token: str) -> tuple[Optional[dict], Optional[int]]:
                      "Content-Type": "application/json",
                      "Accept": "application/json",
                      "User-Agent": _USER_AGENT},
-        ), timeout=_TIMEOUT_S) as resp:
+        ), timeout=timeout) as resp:
             return json.loads(resp.read()), None
     except urllib.error.HTTPError as exc:
         return None, exc.code
@@ -284,11 +296,11 @@ def _window(bucket: dict[str, Any], label: str) -> Optional[QuotaWindow]:
                        reset_at=reset)
 
 
-def _plan(access_token: str) -> Optional[str]:
+def _plan(access_token: str, *, timeout: float = _TIMEOUT_S) -> Optional[str]:
     """Plan name from loadCodeAssist, or None. paidTier first: Google reports
     currentTier as ``free-tier`` even on a paid subscription (verified live).
     """
-    data, _status = _post(_LOAD_PATH, access_token)
+    data, _status = _post(_LOAD_PATH, access_token, timeout=timeout)
     if not isinstance(data, dict):
         return None
     for key in ("paidTier", "currentTier"):
@@ -303,18 +315,25 @@ def _plan(access_token: str) -> Optional[str]:
 
 
 def fetch_antigravity_quota() -> QuotaResult:
+    # The refresh, quota and plan calls are serial; they share one deadline so
+    # the provider as a whole stays inside quota_cache.REFRESH_BUDGET_S.
+    deadline = Deadline(_FETCH_BUDGET_S)
     cred = _load_credential()
     if not cred:
         return build_unavailable(_PROVIDER_ID, "no-credentials")
-    access_token, reason = _access_token(cred)
+    access_token, reason = _access_token(cred, deadline)
     if not access_token:
         return build_unavailable(_PROVIDER_ID, reason or "auth-failed")
 
-    payload, status = _post(_QUOTA_PATH, access_token)
+    payload, status = _post(_QUOTA_PATH, access_token, timeout=deadline.slice(_TIMEOUT_S))
     if status in (401, 403):
         return build_unavailable(
             _PROVIDER_ID, "auth-failed" if status == 401 else "no-subscription")
     if payload is None:
+        if deadline.expired():
+            # Out of budget: a zero-length slice fails immediately, so this is
+            # the sweep running out of time, not the endpoint misbehaving.
+            return build_unavailable(_PROVIDER_ID, "timeout")
         return build_unavailable(_PROVIDER_ID, f"http-{status}" if status else "fetch-error")
 
     found = _buckets(payload)
@@ -324,7 +343,11 @@ def fetch_antigravity_quota() -> QuotaResult:
     ) if w is not None]
     if not windows:
         return build_unavailable(_PROVIDER_ID, "no-data")
-    return QuotaResult(label=_PROVIDER_ID, windows=windows, plan=_plan(access_token))
+    # The plan name is cosmetic, so it gets a small slice and is skipped rather
+    # than spending what is left of the budget on a label.
+    plan = None if deadline.expired() else _plan(
+        access_token, timeout=min(_PLAN_BUDGET_S, deadline.remaining()))
+    return QuotaResult(label=_PROVIDER_ID, windows=windows, plan=plan)
 
 
 _register(_PROVIDER_ID)(fetch_antigravity_quota)
