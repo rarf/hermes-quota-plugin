@@ -425,9 +425,21 @@ function remainingPct(w) {
 	return Math.max(0, Math.min(100, Math.round(100 - n)));
 }
 
+// A provider record comes from a JSON cache file that a truncated write, a
+// hand edit, or an older/newer backend can leave in any shape. `x || []` is
+// null-safe but not type-safe: `{}` and `"text"` are both truthy and reach
+// .map/.filter/spread. These normalise, matching accountFacts' Array.isArray.
+function asList(value) {
+	return Array.isArray(value) ? value : [];
+}
+
+function asProvider(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
 function worstWindow(provider) {
 	let worst = null;
-	for (const w of provider.windows || []) {
+	for (const w of asList(provider && provider.windows)) {
 		const r = remainingPct(w);
 		if (r == null) continue;
 		if (worst == null || r < worst) worst = r;
@@ -458,6 +470,18 @@ function balanceFractionDigits(raw) {
 
 function balanceText(balance) {
 	const raw = String(balance.total_balance).trim();
+	// Prefer the endpoint's own decimal string: Number() silently rounds past
+	// 2^53 (9007199254740993.00 came back as ...992) and to 17 significant
+	// digits, which Intl's maximumFractionDigits cannot recover.
+	if (/^-?\d+(?:\.\d+)?$/.test(raw)) {
+		const [whole, frac = ""] = raw.replace("-", "").split(".");
+		const grouped = whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+		const sign = raw.startsWith("-") ? "-" : "";
+		// At least two fraction digits, as the Intl path always produced.
+		const digits = Math.max(2, balanceFractionDigits(raw));
+		const shown = (frac + "0".repeat(digits)).slice(0, digits);
+		return `$${sign}${grouped}.${shown} ${balance.currency}`;
+	}
 	const n = Number(raw);
 	const format = (value) => new Intl.NumberFormat(undefined, {
 		style: "currency", currency: balance.currency,
@@ -471,6 +495,7 @@ function balanceText(balance) {
 }
 
 function providerTone(provider) {
+	if (!provider) return "muted";
 	if (provider.unavailable_reason) return "muted";
 	const r = worstWindow(provider);
 	if (r != null) return toneForRemaining(r);
@@ -734,8 +759,27 @@ function parseJsonOutput(output, requiredKey) {
 		firstError = error;
 	}
 
+	// Cap on opener retries; see the loop below for why. Declared inside the
+	// function because tests/test_widget_json.py evaluates it in isolation.
+	const maxAttempts = 256;
 	let cursor = 0;
+	// Bound the retry. The scan below restarts from `start + 1` after a
+	// rejected span, which is what lets a payload be recovered from inside a
+	// gateway diagnostic -- but it is also quadratic, because every retry
+	// re-walks the rest of the output. 16k unmatched openers measured 2.4s and
+	// 60k measured 19.3s, all of it inside queryFn on the render path. A real
+	// payload sits after a handful of openers at most (the diagnostic cases in
+	// test_widget_json use three), so capping the attempts keeps the recovery
+	// behaviour and makes the work linear in the output length.
+	let attempts = 0;
 	while (cursor < text.length) {
+		if (attempts >= maxAttempts) {
+			// Out of attempts. Fall back to a plain JSON.parse of the whole
+			// output rather than giving up: the common case is a clean payload
+			// and this keeps it working.
+			throw firstError || new Error("invalid JSON output");
+		}
+		attempts += 1;
 		let start = cursor;
 		while (
 			start < text.length &&
@@ -910,19 +954,24 @@ function useQuota() {
 			// cli.exec exposes stdout and stderr as one string; parse the quota
 			// value while ignoring gateway diagnostics. Keep the full envelope so
 			// its installed_sha still feeds the update check.
-			let data;
+			let data = null;
 			try {
 				data = parseJsonOutput(result.output || "{}", "providers");
 			} catch {
-				data = {};
+				// Unreadable this poll. The last good snapshot is left in place --
+				// writing {} here meant one bad read erased the payload, so a
+				// reload afterwards painted nothing. The refresh below still
+				// fires, so a transient gateway diagnostic self-heals.
 			}
-			writeSnapshot(scope, data);
+			if (data) writeSnapshot(scope, data);
 			// Missing age (no cache yet on this gateway) counts as stale.
 			const rawAge = data ? data.age_s : null;
+			// `>=`, not `>`: a payload exactly one interval old is already due.
+			// With `>` the poll drifted a full interval behind, permanently.
 			const stale =
 				rawAge == null ||
 				!Number.isFinite(Number(rawAge)) ||
-				Number(rawAge) > intervalSec;
+				Number(rawAge) >= intervalSec;
 			// Fire the refresh off the poll path and update when it lands.
 			if (stale) {
 				void refreshQuotaCache(scope).then((refreshed) => {
@@ -995,7 +1044,7 @@ function QuotaChipWithBar() {
 }
 
 function ProviderChip({ pid, provider }) {
-	const r = provider.unavailable_reason ? null : worstWindow(provider);
+	const r = provider && provider.unavailable_reason ? null : worstWindow(provider);
 	const facts = accountFacts(provider);
 	const value = provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
 	const tone = providerTone(provider);
@@ -1041,6 +1090,7 @@ function makeWorstTip(worstLabel, worst, providersObj) {
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
 	const meta = providerMeta(pid);
+	if (!provider) return `${meta.name}: unavailable`;
 	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
@@ -1048,7 +1098,7 @@ function makeProviderTip(pid, provider) {
 	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
 	lines.unshift(meta.name);
-	const details = provider.details || [];
+	const details = asList(provider.details);
 	if (details.length) lines.push(...details);
 	lines.push("Click to open Quota pane");
 	return lines.join("\n");
@@ -1057,7 +1107,7 @@ function makeProviderTip(pid, provider) {
 // Shared: turn a provider's windows into tooltip lines like
 // "  Session · 21% left · resets 5d 19h" / "  5.3 Codex Spark · 5h · 8% left · resets 3h 52m"
 function providerWindowLines(pid, provider) {
-	const windows = provider.windows || [];
+	const windows = asList(provider.windows);
 	const out = [];
 	for (const w of windows) {
 		const r = remainingPct(w);
@@ -1115,8 +1165,8 @@ function ProviderRow({ id, provider }) {
 	// percentage bars, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
 	const dense = paneDetail !== "clean";
-	const reason = provider.unavailable_reason;
-	const details = provider.details || [];
+	const reason = provider ? provider.unavailable_reason : "no-data";
+	const details = asList(provider.details);
 	const facts = accountFacts(provider);
 	const displayName = providerMeta(id).name;
 	// Inline sizing is intentional: plugin-only utility classes might not be
@@ -1166,7 +1216,7 @@ function ProviderRow({ id, provider }) {
 		});
 	}
 
-	const windows = provider.windows || [];
+	const windows = asList(provider.windows);
 	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null) {
 		return jsxs("div", {
 			className:
