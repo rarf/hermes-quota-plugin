@@ -170,7 +170,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
-| `antigravity` | Antigravity OAuth: Windows Credential Manager, macOS Keychain, or the `agy` token file on Linux | Google AI Pro pools — Gemini and Claude/GPT each with a 5-hour and a weekly window; plan from `loadCodeAssist` (`paidTier` wins over `currentTier`) |
+| `antigravity` | Reads `gemini:antigravity` from Windows Credential Manager; the `gemini` / `antigravity` item from macOS Keychain; or `~/.gemini/antigravity-cli/antigravity-oauth-token` on Linux | **Opt-in, disabled by default.** Google AI Pro pools — Gemini and Claude/GPT each with a 5-hour and a weekly window; plan from `loadCodeAssist` (`paidTier` wins over `currentTier`). When enabled, refreshes with Antigravity's installed-app OAuth client identity and impersonates its `User-Agent: antigravity/2.8.0 windows/amd64`. Credential stores are read-only. |
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
@@ -183,6 +183,22 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Antigravity
+
+Antigravity quota collection is disabled unless you opt in:
+
+```sh
+hermes config set plugins.entries.quota.settings.antigravityEnabled true
+```
+
+Alternatively, set `HERMES_QUOTA_ANTIGRAVITY_ENABLED=1`. If enabled, the plugin
+reads Antigravity's token from Windows Credential Manager (`gemini:antigravity`),
+macOS Keychain (service `gemini`, account `antigravity`), or Linux's
+`~/.gemini/antigravity-cli/antigravity-oauth-token` file. It refreshes the token
+with Antigravity's installed-app OAuth client identity, then calls Google's
+quota service using the spoofed `User-Agent: antigravity/2.8.0 windows/amd64`.
+Credential stores are read-only; refreshed tokens stay in memory.
 
 ### DeepSeek
 
