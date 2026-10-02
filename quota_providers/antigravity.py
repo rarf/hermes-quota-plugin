@@ -18,7 +18,8 @@ its Google OAuth out of ``state.vscdb`` into the OS secret store, so that is the
 live source; the vscdb decoders keyed on the old ``oauthTokenInfoSentinelKey``
 return null on current builds and are deliberately not implemented. This is an
 OAuth API credential like the ``~/.gemini/oauth_creds.json`` that gemini.py
-reads, so unlike grok.py's browser session cookies it needs no opt-in gate.
+reads. This provider is disabled by default; enable it explicitly with
+``plugins.entries.quota.settings.antigravityEnabled``.
 
 The stored access token 401s once stale, so the refresh_token grant is the
 normal path, not a fallback. The client is Antigravity's own installed-app
@@ -42,7 +43,14 @@ import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
-from .base import Deadline, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import (
+    Deadline,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    opt_in_flag,
+    urlopen_no_redirect,
+)
 from .registry import register as _register
 
 _PROVIDER_ID = "antigravity"
@@ -356,4 +364,38 @@ def fetch_antigravity_quota() -> QuotaResult:
     return QuotaResult(label=_PROVIDER_ID, windows=windows, plan=plan)
 
 
-_register(_PROVIDER_ID)(fetch_antigravity_quota)
+# Antigravity is opt-in: it reads an OAuth token from another application's
+# credential store and sends requests using Antigravity's client identity.
+# Enable with:
+#   hermes config set plugins.entries.quota.settings.antigravityEnabled true
+import os as _os
+
+
+def _antigravity_enabled() -> bool:
+    value = _os.environ.get("HERMES_QUOTA_ANTIGRAVITY_ENABLED", "").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly() or {}
+        plugins = config.get("plugins") if isinstance(config, dict) else None
+        entries = plugins.get("entries") if isinstance(plugins, dict) else None
+        entry = entries.get("quota") if isinstance(entries, dict) else None
+        if isinstance(entry, dict):
+            settings = entry.get("settings")
+            if isinstance(settings, dict) and "antigravityEnabled" in settings:
+                return opt_in_flag(settings.get("antigravityEnabled"))
+    except Exception:
+        pass
+    return False
+
+
+def _fetch_antigravity_optin() -> QuotaResult:
+    if not _antigravity_enabled():
+        return build_unavailable(_PROVIDER_ID, "opt-in-disabled")
+    return fetch_antigravity_quota()
+
+
+_register(_PROVIDER_ID)(_fetch_antigravity_optin)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import types
 import unittest
 import urllib.error
 from io import BytesIO
@@ -16,7 +17,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from quota_providers import antigravity as mod  # noqa: E402
+from quota_providers import PROVIDER_FETCHERS, antigravity as mod  # noqa: E402
 
 
 class _FakeResponse(BytesIO):
@@ -327,17 +328,63 @@ class FetchTests(unittest.TestCase):
         self.assertIsNone(result.plan)
 
 
+class AntigravityOptInTests(unittest.TestCase):
+    def _enabled_via_config(self, value):
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"quota": {"settings": {"antigravityEnabled": value}}}}}
+        cli = types.ModuleType("hermes_cli")
+        cli.config = config
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                return mod._antigravity_enabled()
+
+    def test_antigravity_config_uses_a_strict_opt_in(self):
+        for value in ("false", "False", "no", "0", "off", 0, None):
+            with self.subTest(value=value):
+                self.assertFalse(self._enabled_via_config(value))
+        self.assertTrue(self._enabled_via_config(True))
+        self.assertTrue(self._enabled_via_config("true"))
+
+    def test_registered_fetcher_does_not_read_credentials_or_call_network_by_default(self):
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {"plugins": {"entries": {"quota": {"settings": {}}}}}
+        cli = types.ModuleType("hermes_cli")
+        cli.config = config
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}):
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(mod, "_load_credential") as load_credential, \
+                    mock.patch.object(mod, "_post") as post:
+                result = PROVIDER_FETCHERS["antigravity"]()
+        self.assertEqual(result.unavailable_reason, "opt-in-disabled")
+        load_credential.assert_not_called()
+        post.assert_not_called()
+
+    def test_explicit_config_opt_in_reaches_the_provider(self):
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"quota": {"settings": {"antigravityEnabled": True}}}}}
+        cli = types.ModuleType("hermes_cli")
+        cli.config = config
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}):
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(mod, "_load_credential", return_value=None) as load_credential:
+                result = PROVIDER_FETCHERS["antigravity"]()
+        self.assertEqual(result.unavailable_reason, "no-credentials")
+        load_credential.assert_called_once_with()
+
+
 class RegistrationTests(unittest.TestCase):
     def test_provider_is_registered(self):
         from quota_providers import PROVIDER_FETCHERS
 
         self.assertIn("antigravity", PROVIDER_FETCHERS)
-        # Registered ungated, like every other provider except grok. The
+        # Registered through the opt-in gate, like grok. The
         # registry stores register()'s fail-open wrapper, so compare against
         # the function it wraps rather than the wrapper's identity.
         registered = PROVIDER_FETCHERS["antigravity"]
         self.assertIs(getattr(registered, "__wrapped__", registered),
-                      mod.fetch_antigravity_quota)
+                      mod._fetch_antigravity_optin)
 
     def test_secret_literal_stays_split(self):
         # The client secret must stay reassembled so scanners do not flag it.
