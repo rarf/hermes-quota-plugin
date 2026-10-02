@@ -104,12 +104,9 @@ class ProviderBudgetTests(unittest.TestCase):
     def test_cursor_fits(self):
         mod = importlib.import_module("quota_providers.cursor")
         self.assertLessEqual(mod._FETCH_BUDGET_S, REFRESH_BUDGET_S)
-        # The refresh path is keychain + rpc + keychain + exchange + rpc; the
-        # old comment counted only the happy path.
-        refresh_path = (2 * mod._KEYCHAIN_TIMEOUT_S + mod._REFRESH_TIMEOUT_S
-                        + 2 * mod._HTTP_TIMEOUT_S)
-        self.assertLess(mod._FETCH_BUDGET_S, refresh_path,
-                        "budget should be tighter than the un-clamped refresh path")
+        worst = mod._KEYCHAIN_TIMEOUT_S + 2 * mod._HTTP_TIMEOUT_S
+        self.assertLessEqual(worst, mod._FETCH_BUDGET_S,
+                             "read-only keychain plus two RPCs must fit the provider budget")
 
     def test_cursor_still_satisfies_the_original_happy_path_assertion(self):
         """test_cursor.test_requests_fit_sweep_budget must keep passing."""
@@ -246,16 +243,11 @@ class DeadlineIsActuallyUsedTests(unittest.TestCase):
         clock = FakeClock()
 
         def _slow_post(method, token, **kwargs):
-            clock.advance(kwargs.get("timeout", 0.0))
+            clock.advance(mod._FETCH_BUDGET_S)
             return None, "auth-failed"
 
         with mock.patch.object(mod, "resolve_access_token", return_value="t"), \
              mock.patch.object(mod, "_post", side_effect=_slow_post), \
-             mock.patch.object(mod, "resolve_refresh_token",
-                               return_value=("SYNTHETIC_REFRESH", "auth-file")), \
-             mock.patch.object(mod, "_refresh_access_token",
-                               side_effect=lambda *a, **k: (clock.advance(mod._HTTP_TIMEOUT_S),
-                                                             ("fresh", None, None))[1]), \
              mock.patch.object(base_mod.time, "monotonic", clock):
             result = mod.fetch_cursor_quota()
         self.assertEqual(result.unavailable_reason, "timeout")
@@ -400,32 +392,6 @@ class HappyPathsUnchangedTests(unittest.TestCase):
                       "_plan_name called without a deadline slice")
         self.assertLessEqual(seen["timeout"], mod._FETCH_BUDGET_S)
 
-    def test_cursor_keychain_pair_cannot_exceed_its_slice(self):
-        """Neither write may get the whole slice; the pair must fit in it.
-
-        Handing write #1 the full pair slice and write #2 the remainder let
-        the two sum to slice + _KEYCHAIN_TIMEOUT_S -- measured 21.0s against
-        a 20s sweep, the exact outcome this branch exists to prevent.
-        """
-        mod = importlib.import_module("quota_providers.cursor")
-        got = []
-
-        def capture(service, token, timeout=None):
-            got.append(timeout)
-
-        for budget in (mod._KEYCHAIN_TIMEOUT_S * 2, mod._KEYCHAIN_TIMEOUT_S, 0.5):
-            with self.subTest(budget=budget):
-                got.clear()
-                with mock.patch.object(mod.sys, "platform", "darwin"), \
-                     mock.patch.object(mod, "_store_keychain_token", capture):
-                    mod._persist_refreshed_credentials("keychain", "a1", "r1",
-                                                       timeout=budget)
-                self.assertEqual(len(got), 2, "both writes must be attempted")
-                self.assertLessEqual(sum(got), budget + 1e-9,
-                                     "the pair exceeded its slice")
-                for t in got:
-                    self.assertLessEqual(t, mod._KEYCHAIN_TIMEOUT_S + 1e-9,
-                                         "a single write may not exceed one timeout")
 
     def test_a_definitive_http_status_is_not_reported_as_timeout(self):
         """A status the server returned is a fact; a budget is our own.
@@ -462,41 +428,6 @@ class HappyPathsUnchangedTests(unittest.TestCase):
             result = mod.fetch_antigravity_quota()
         self.assertEqual(result.unavailable_reason, "timeout")
 
-    def test_cursor_keychain_writes_share_one_slice(self):
-        """Two serial `security` calls must not each take the full timeout."""
-        mod = importlib.import_module("quota_providers.cursor")
-        calls = []
-
-        def capture(service, token, timeout=None):
-            calls.append((service, timeout))
-
-        with mock.patch.object(mod.sys, "platform", "darwin"), \
-             mock.patch.object(mod, "_store_keychain_token", capture):
-            mod._persist_refreshed_credentials("keychain", "a1", "r1",
-                                               timeout=mod._KEYCHAIN_TIMEOUT_S)
-        self.assertEqual([c[0] for c in calls],
-                         [mod._KEYCHAIN_SERVICE, mod._KEYCHAIN_REFRESH_SERVICE])
-        # The second write must not start after the budget the first consumed.
-        self.assertIsNotNone(calls[1][1])
-        self.assertLessEqual(calls[1][1], mod._KEYCHAIN_TIMEOUT_S)
-
-    def test_cursor_keychain_refresh_token_is_never_dropped(self):
-        """Losing the refresh token leaves the account unable to refresh.
-
-        So even when the budget is spent the second write is attempted with
-        whatever remains -- and `_store_keychain_token` treats 0 as fail-fast.
-        """
-        mod = importlib.import_module("quota_providers.cursor")
-        for budget in (mod._KEYCHAIN_TIMEOUT_S * 2, mod._KEYCHAIN_TIMEOUT_S, 0.0):
-            with self.subTest(budget=budget):
-                calls = []
-                with mock.patch.object(mod.sys, "platform", "darwin"), \
-                     mock.patch.object(mod, "_store_keychain_token",
-                                       lambda s, t, timeout=None: calls.append(s)):
-                    mod._persist_refreshed_credentials("keychain", "a1", "r1",
-                                                       timeout=budget)
-                self.assertEqual(calls, [mod._KEYCHAIN_SERVICE,
-                                         mod._KEYCHAIN_REFRESH_SERVICE])
 
     def test_opencode_go_live_shape_still_parses(self):
         mod = importlib.import_module("quota_providers.opencode_go")

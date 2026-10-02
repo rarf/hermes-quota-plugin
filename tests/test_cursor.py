@@ -133,64 +133,29 @@ class CursorFetcherTests(unittest.TestCase):
         self.assertIsNone(res.unavailable_reason)
         self.assertIsNone(res.plan)
 
-    def test_auth_failure(self):
-        err = urllib.error.HTTPError("u", 401, "no", {}, None)
-        with mock.patch.object(cursor, "resolve_refresh_token", return_value=(None, None)):
-            res = _fetch({"GetCurrentPeriodUsage": err})
-        self.assertEqual(res.unavailable_reason, "auth-failed")
+    def test_auth_failure_returns_login_instruction_without_refreshing(self):
+        for code in (401, 403):
+            with self.subTest(code=code):
+                calls = []
 
-    def test_refreshes_after_auth_failure(self):
-        calls = []
-        usage_attempts = 0
+                def opener(req, timeout=None):  # noqa: ANN001, ARG001
+                    endpoint = req.full_url.rsplit("/", 1)[-1]
+                    calls.append(endpoint)
+                    raise urllib.error.HTTPError(req.full_url, code, "expired", {}, None)
 
-        def opener(req, timeout=None):  # noqa: ANN001
-            nonlocal usage_attempts
-            endpoint = req.full_url.rsplit("/", 1)[-1]
-            calls.append((endpoint, req.get_header("Authorization")))
-            if endpoint == "GetCurrentPeriodUsage":
-                usage_attempts += 1
-                if usage_attempts == 1:
-                    raise urllib.error.HTTPError(req.full_url, 401, "expired", {}, None)
-                return _Resp(json.dumps(_USAGE).encode())
-            if endpoint == "exchange_user_api_key":
-                self.assertEqual(req.get_header("Authorization"), "Bearer refresh-token")
-                return _Resp(json.dumps({
-                    "accessToken": "fresh-token",
-                    "refreshToken": "rotated-refresh",
-                }).encode())
-            if endpoint == "GetPlanInfo":
-                return _Resp(json.dumps(_PLAN).encode())
-            raise AssertionError(endpoint)
+                with mock.patch.object(cursor, "resolve_access_token", return_value="expired-token"), \
+                     mock.patch.object(cursor, "_auth_file_data") as auth_file_data, \
+                     mock.patch.object(cursor, "_keychain_token") as keychain_token, \
+                     mock.patch.object(cursor.subprocess, "run") as keychain_command, \
+                     mock.patch.object(cursor, "urlopen_no_redirect", opener):
+                    res = cursor.fetch_cursor_quota()
 
-        with mock.patch.object(cursor, "resolve_access_token", return_value="expired-token"), \
-             mock.patch.object(cursor, "resolve_refresh_token",
-                               return_value=("refresh-token", "auth-file")), \
-             mock.patch.object(cursor, "_persist_refreshed_credentials") as persist, \
-             mock.patch.object(cursor, "urlopen_no_redirect", opener):
-            res = cursor.fetch_cursor_quota()
-
-        self.assertIsNone(res.unavailable_reason)
-        self.assertEqual(res.plan, "Team")
-        self.assertEqual(
-            calls,
-            [
-                ("GetCurrentPeriodUsage", "Bearer expired-token"),
-                ("exchange_user_api_key", "Bearer refresh-token"),
-                ("GetCurrentPeriodUsage", "Bearer fresh-token"),
-                ("GetPlanInfo", "Bearer fresh-token"),
-            ],
-        )
-        # The signature gained a keyword-only `timeout` so the keychain path
-        # can share one slice of the sweep budget (see #38). The three values
-        # this assertion pins are unchanged; assert the slice separately so a
-        # dropped bound is caught rather than folded into one loose check.
-        persist.assert_called_once_with(
-            "auth-file", "fresh-token", "rotated-refresh",
-            timeout=mock.ANY)
-        self.assertLessEqual(
-            persist.call_args.kwargs["timeout"],
-            cursor._FETCH_BUDGET_S,
-            "the persist slice must fit inside the provider budget")
+                self.assertEqual(res.unavailable_reason, "auth-failed")
+                self.assertTrue(any("cursor-agent login" in line for line in res.details))
+                self.assertEqual(calls, ["GetCurrentPeriodUsage"])
+                auth_file_data.assert_not_called()
+                keychain_token.assert_not_called()
+                keychain_command.assert_not_called()
 
     def test_garbage_and_empty_payloads(self):
         self.assertEqual(_fetch({"GetCurrentPeriodUsage": b"<html>"}).unavailable_reason, "bad-json")
@@ -206,27 +171,6 @@ class CursorFetcherTests(unittest.TestCase):
             with mock.patch.object(cursor, "_keychain_token", return_value=None), \
                  mock.patch.object(cursor, "_auth_file_path", return_value=path):
                 self.assertEqual(cursor.resolve_access_token(), "file-token")
-
-    def test_auth_file_refresh_token_is_resolved_and_persisted_atomically(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "auth.json")
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump({"accessToken": "old", "refreshToken": "refresh", "other": 1}, fh)
-            with mock.patch.object(cursor, "_keychain_token", return_value=None), \
-                 mock.patch.object(cursor, "_auth_file_path", return_value=path):
-                self.assertEqual(
-                    cursor.resolve_refresh_token("old"),
-                    ("refresh", "auth-file"),
-                )
-                cursor._persist_refreshed_credentials("auth-file", "new", "rotated")
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            self.assertEqual(data["accessToken"], "new")
-            self.assertEqual(data["refreshToken"], "rotated")
-            self.assertEqual(data["other"], 1)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
