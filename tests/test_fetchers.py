@@ -6,6 +6,7 @@ No network access happens here — every HTTP boundary is mocked.
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ import types
 import unittest
 import urllib.error
 from io import BytesIO
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -305,24 +307,49 @@ class NousPortalFetcherTests(unittest.TestCase):
 
 
 class GeminiFetcherTests(unittest.TestCase):
-    def test_secret_matches_upstream_gemini_cli(self):
+    def test_module_reload_does_not_read_local_oauth_store(self):
+        from quota_providers import gemini
+
+        with mock.patch("builtins.open", side_effect=AssertionError("unexpected OAuth store read")):
+            importlib.reload(gemini)
+
+    def test_public_installed_app_client_matches_gemini_cli_constants(self):
+        from quota_providers import gemini
         from quota_providers.gemini import (
             _GEMINI_CLIENT_ID,
             _GEMINI_CLIENT_SECRET,
         )
 
-        # These are Google's public installed-app OAuth constants, published
-        # in google-gemini/gemini-cli (packages/core/src/code_assist/oauth2.ts).
-        # A stale/typo'd value makes refresh fail with invalid_client (a real
-        # bug we hit). Reassembled here like production does so secret
-        # scanners don't fire on public-but-pattern-matching literals.
-        expected_id = (
-            "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135"
-            + "j.apps.googleusercontent.com"
-        )
-        expected_secret = "GOCSPX-4uHgMPm-1o7Sk-geV6Cu5clXFsx" + "l"
+        # Public installed-app OAuth credentials shipped with Gemini CLI, not secrets.
+        expected_id = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+        expected_secret = "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"
         self.assertEqual(_GEMINI_CLIENT_ID, expected_id)
         self.assertEqual(_GEMINI_CLIENT_SECRET, expected_secret)
+        source = Path(gemini.__file__).read_text(encoding="utf-8")
+        self.assertIn(f'_GEMINI_CLIENT_ID = "{expected_id}"', source)
+        self.assertIn(f'_GEMINI_CLIENT_SECRET = "{expected_secret}"', source)
+        self.assertIn("public installed-app oauth client credentials", source.lower())
+
+    def test_refresh_preserves_cli_public_client_from_credential_file(self):
+        from quota_providers import gemini
+
+        seen = {}
+
+        def opener(req, timeout=None):  # noqa: ANN001, ARG001
+            seen["body"] = req.data.decode("utf-8")
+            return _FakeResponse(b'{"access_token":"fresh"}')
+
+        creds = {
+            "client_id": "synthetic-client-id",
+            "client_secret": "synthetic-client-secret",
+            "refresh_token": "synthetic-refresh-token",
+        }
+        with mock.patch.dict(gemini.os.environ, {}, clear=True), \
+                mock.patch.object(gemini, "urlopen_no_redirect", opener):
+            self.assertEqual(gemini._refresh(creds), "fresh")
+        self.assertIn("client_id=synthetic-client-id", seen["body"])
+        self.assertIn("client_secret=synthetic-client-secret", seen["body"])
+        self.assertIn("refresh_token=synthetic-refresh-token", seen["body"])
 
     def test_free_tier_retired_returns_honest_card(self):
         from quota_providers import gemini

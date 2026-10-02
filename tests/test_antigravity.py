@@ -13,6 +13,7 @@ import types
 import unittest
 import urllib.error
 from io import BytesIO
+from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -386,14 +387,16 @@ class RegistrationTests(unittest.TestCase):
         self.assertIs(getattr(registered, "__wrapped__", registered),
                       mod._fetch_antigravity_optin)
 
-    def test_secret_literal_stays_split(self):
-        # The client secret must stay reassembled so scanners do not flag it.
-        # Build the expected literal from parts -- hardcoding it here would put
-        # the very string this test exists to keep out of the repo.
-        expected = "GOCSPX-" + "K58FWR486LdLJ1mLB8sXC4z6qDAf"
-        src = open(mod.__file__, encoding="utf-8").read()
-        self.assertNotIn(expected, src)
-        self.assertNotIn(expected, open(__file__, encoding="utf-8").read())
+    def test_public_installed_app_client_uses_plain_documented_constants(self):
+        source = Path(mod.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            mod._CLIENT_ID,
+            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+        )
+        self.assertEqual(mod._CLIENT_SECRET, "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")
+        self.assertIn(f'_CLIENT_ID = "{mod._CLIENT_ID}"', source)
+        self.assertIn(f'_CLIENT_SECRET = "{mod._CLIENT_SECRET}"', source)
+        self.assertIn("public installed-app oauth client credentials", source.lower())
 
     def test_no_credential_write_back(self):
         # Reading someone else's login must never mutate their store, and this
@@ -402,7 +405,7 @@ class RegistrationTests(unittest.TestCase):
         # absence of open().
         import re
 
-        src = open(mod.__file__, encoding="utf-8").read()
+        src = Path(mod.__file__).read_text(encoding="utf-8")
         for forbidden in ("CredWrite", "CredDelete", "pathlib", "tempfile", "shutil"):
             self.assertNotIn(forbidden, src)
         for line in src.splitlines():

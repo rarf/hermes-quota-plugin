@@ -18,30 +18,10 @@ _LOAD_URL = "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _CREDS_PATH = os.path.join(os.path.expanduser("~"), ".gemini", "oauth_creds.json")
 
-# Google's public client id/secret for the Gemini CLI (same values the CLI uses
-# for the local OAuth flow). Not a secret — shipped in the Gemini CLI bundle and
-# only unlocks the user's own refresh token. We read them from the CLI's own
-# oauth_creds.json (created by `gemini` on first login) so the public-but-
-# scanner-flagged client id never sits hardcoded in this repo.
-def _gemini_cli_credentials():
-    try:
-        with open(_CREDS_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        cid = data.get("client_id")
-        csec = data.get("client_secret")
-        if cid and csec:
-            return cid, csec
-    except (OSError, ValueError):
-        pass
-    # Public Gemini CLI client (shipped in google-gemini/gemini-cli oauth2.ts).
-    # Reassembled at runtime so the literal never trips secret scanners; it is
-    # not a secret — only unlocks the user's own refresh token.
-    cid = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135" + "j.apps.googleusercontent.com"
-    csec = "GOCSPX-4uHgMPm-1o7Sk-geV6Cu5clXFsx" + "l"
-    return cid, csec
-
-
-_GEMINI_CLIENT_ID, _GEMINI_CLIENT_SECRET = _gemini_cli_credentials()
+# Public installed-app OAuth client credentials shipped with Gemini CLI; they
+# are not secrets. They identify the public client, not the user's refresh token.
+_GEMINI_CLIENT_ID = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
+_GEMINI_CLIENT_SECRET = "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"
 
 
 def _b64urldecode(s: str) -> dict:
@@ -58,8 +38,11 @@ def _load_creds() -> Optional[dict]:
 
 
 def _refresh(creds: dict) -> Optional[str]:
-    cid = os.environ.get("GEMINI_OAUTH_CLIENT_ID", _GEMINI_CLIENT_ID)
-    csec = os.environ.get("GEMINI_OAUTH_CLIENT_SECRET", _GEMINI_CLIENT_SECRET)
+    has_cli_client = creds.get("client_id") and creds.get("client_secret")
+    default_client_id = creds["client_id"] if has_cli_client else _GEMINI_CLIENT_ID
+    default_client_secret = creds["client_secret"] if has_cli_client else _GEMINI_CLIENT_SECRET
+    cid = os.environ.get("GEMINI_OAUTH_CLIENT_ID", default_client_id)
+    csec = os.environ.get("GEMINI_OAUTH_CLIENT_SECRET", default_client_secret)
     rt = creds.get("refresh_token")
     if not (cid and csec and rt):
         return None

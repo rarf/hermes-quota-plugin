@@ -55,9 +55,10 @@ from .registry import register as _register
 
 _PROVIDER_ID = "antigravity"
 
-# Installed-app (RFC 8252) public client, split so the literal is not greppable.
-_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep" + ".apps.googleusercontent.com"
-_CLIENT_SECRET = "GOCSPX-" + "K58FWR486LdLJ1mLB8sXC4z6qDAf"
+# Public installed-app OAuth client credentials for Antigravity; these are not
+# secrets. Public-client credentials identify the app and are shipped with it.
+_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+_CLIENT_SECRET = "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"
 
 _TOKEN_URL = "https://oauth2.googleapis.com/token"
 _BASE = "https://daily-cloudcode-pa.googleapis.com"
