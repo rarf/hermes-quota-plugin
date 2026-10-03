@@ -179,10 +179,38 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Read-only credential use; Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details. If the session expires, run `cursor-agent login`; the plugin never exchanges refresh tokens or writes to Cursor's credential store. |
 | `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
+| `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/usage` (spend, per-model request counts) and `POST /api/me` (plan label, signup date). The **Monthly** bar is the server-reported usage fraction. The reset is the next monthly anniversary of `CreatedAt`, matching Ollama's documented "resets monthly on the same day of the month your plan started"; the day is derived because no endpoint returns a reset timestamp. **No balance value** — Ollama exposes none; see below. |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Ollama
+
+Ollama Cloud quota is read from two endpoints: `GET /api/usage` for the spend
+and per-model request counts, and `POST /api/me` for the plan label and the
+signup date. Set `OLLAMA_API_KEY` to the `sk-…` key from
+[ollama.com/settings](https://ollama.com/settings).
+
+**There is no balance or credit value, because Ollama does not expose one.**
+The settings page shows a dollar balance, but it is not reachable from the
+API: of 36 candidate paths tried with both `GET` and `POST`, only `/api/usage`
+and `/api/me` respond, and `/api/usage` ignores `?include=balance` and
+`?include=credits`. This has been reported upstream and is not being worked
+on yet:
+
+- [ollama/ollama#12532 — Expose cloud usage stats via `/api/me`](https://github.com/ollama/ollama/issues/12532)
+- [ollama/ollama#18653 — Add an API endpoint for credit balance](https://github.com/ollama/ollama/issues/18653)
+
+Until one of those lands, the card shows spend and request counts rather than
+a fabricated `$0`. The remaining path — scraping `ollama.com/settings` with a
+`__Secure-session` browser cookie — is a sensitive-source reader that would
+need to be opt-in and disabled by default, like `grok`. It is not implemented
+here.
+
+Until `/api/me` exists the plugin already handles the account, but it cannot
+know the plan or derive the reset, so the card falls back to spend and request
+counts alone. Until the balance endpoint exists there is nothing to add.
 
 ### Antigravity
 
