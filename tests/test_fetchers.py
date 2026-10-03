@@ -346,6 +346,29 @@ class GeminiFetcherTests(unittest.TestCase):
                     trigger, varname.lower(),
                     f"{varname} would trip the credential_exposure scan")
 
+    def test_renamed_public_client_reaches_the_token_request(self):
+        """Same gap as the antigravity test: with no CLI credential file and
+        no env override, the bundled public client is what gets posted. Assert
+        the renamed constants -- not a synthetic stand-in -- reach the body."""
+        from quota_providers import gemini
+
+        seen = {}
+
+        def opener(req, timeout=None):  # noqa: ANN001, ARG001
+            seen["body"] = req.data.decode("utf-8")
+            return _FakeResponse(b'{"access_token":"fresh"}')
+
+        with mock.patch.dict(gemini.os.environ, {}, clear=True), \
+             mock.patch.object(gemini, "urlopen_no_redirect", opener), \
+             mock.patch.object(gemini, "_load_creds", return_value=None):
+            self.assertEqual(gemini._refresh({"refresh_token": "synthetic-refresh-token"}),
+                             "fresh")
+        body = seen["body"]
+        self.assertIn(f"client_id={gemini._GEMINI_PUBLIC_CLIENT_ID}", body)
+        self.assertIn(
+            f"client_secret={gemini._GEMINI_PUBLIC_CLIENT_CREDENTIAL}", body)
+        self.assertIn("grant_type=refresh_token", body)
+
     def test_refresh_preserves_cli_public_client_from_credential_file(self):
         from quota_providers import gemini
 

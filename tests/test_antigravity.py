@@ -401,6 +401,35 @@ class RegistrationTests(unittest.TestCase):
             f'_PUBLIC_CLIENT_CREDENTIAL = "{mod._PUBLIC_CLIENT_CREDENTIAL}"', source)
         self.assertIn("public installed-app oauth client credentials", source.lower())
 
+    def test_renamed_constants_reach_the_token_request(self):
+        """The other antigravity tests stub the client constants, so nothing
+        proved the renamed pair still lands in the exchange body -- a swap
+        would post id-as-secret and fail only against Google. Drive _refresh
+        with no stubbing of the constants and inspect the request."""
+        seen = {}
+
+        class _Resp:
+            def read(self):
+                return b'{"access_token":"fresh","expires_in":3600}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def opener(req, timeout=None):  # noqa: ANN001, ARG001
+            seen["body"] = req.data.decode("utf-8")
+            return _Resp()
+
+        with mock.patch.object(mod, "urlopen_no_redirect", opener):
+            token = mod._refresh("synthetic-refresh-token")
+        self.assertEqual(token, "fresh")
+        body = seen["body"]
+        self.assertIn(f"client_id={mod._PUBLIC_CLIENT_ID}", body)
+        self.assertIn(f"client_secret={mod._PUBLIC_CLIENT_CREDENTIAL}", body)
+        self.assertIn("refresh_token=synthetic-refresh-token", body)
+
     def test_no_constant_name_reads_as_an_embedded_secret(self):
         """A name containing secret/token/key/password + a 20+ char literal is
         what Hermes' scanner reports as credential_exposure, and that verdict
