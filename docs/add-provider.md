@@ -159,17 +159,21 @@ the round trip:
 python3 scripts/scan_plugin.py
 ```
 
-It fetches the scanner into `~/.cache/hermes-plugin-scanner` (a sparse checkout
-of `tools/` only) and runs it against this tree. Exit code **1** means at least
-one critical finding. It needs Python 3.11+ — that is hermes-agent's floor; this
-plugin still supports 3.9.
+The scanner is fetched from a **pinned Hermes release** (`SCANNER_REF` in
+`scripts/scan_plugin.py`), not from `main`. Pinning is the difference between a
+gate and a decoration: on 2026-10-04 `main` demoted the Google installed-app
+client literals to `high` (`is_google_installed_app_secret`) while every stable
+build still called them `critical`, so a `main`-tracking job went green on a tree
+that stable Hermes refuses to install — which is exactly how the two literals
+shipped through several releases unnoticed (issue #51). Bump `SCANNER_REF` in its
+own commit when a release is targeted.
 
-Other useful flags:
-
-```bash
-python3 scripts/scan_plugin.py --json report.json      # full findings as JSON
-python3 scripts/scan_plugin.py --scanner /path/to/hermes-agent   # reuse a checkout
-```
+The gate fails on a `critical` finding in any category, or on a `high` finding in
+`credential_exposure`, because a scanner-side demotion only moves the severity —
+the class still blocks community installs. `--self-test` plants a secret-shaped
+literal in a temp tree and requires the scanner to report it as blocking; CI runs
+it before every scan, so a scanner bump that stops seeing the class fails loudly
+instead of passing quietly.
 
 Matched values are redacted in the output. A finding's file and line are enough
 to locate it; copying credential-shaped strings into logs is worth avoiding.
@@ -180,10 +184,9 @@ down inside test trees, and a blanket ignore teaches the next author the same
 thing. Restructure the code, or argue it upstream in
 [hermes-agent](https://github.com/NousResearch/hermes-agent).
 
-Note that the scanner is pulled at its **latest** version, so the same tree can
-score differently over time as the patterns change. That is deliberate: a stale
-copy of the scanner is worse than none. It does mean a PR can go red with no
-change of its own.
+Because the scanner is pinned, a PR cannot go red because upstream changed its
+mind; it goes red because this tree changed, or because a deliberate
+`SCANNER_REF` bump brought a stricter scanner.
 
 ## Checklist
 
@@ -195,4 +198,4 @@ change of its own.
 - [ ] Registered in `__init__.py`; `PROVIDER_META` entry added
 - [ ] Unit tests added and passing offline
 - [ ] `plugin.yaml` version bumped; live refresh verified
-- [ ] **No critical plugin-scanner findings** — see [Run the plugin scanner](#run-the-plugin-scanner)
+- [ ] **Plugin scanner clean** — no `critical`, no `high` in `credential_exposure`; see [Run the plugin scanner](#run-the-plugin-scanner)

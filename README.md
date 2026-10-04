@@ -379,9 +379,12 @@ hermes quota refresh
 `scan_plugin.py` runs Hermes' own plugin scanner against this tree — the same
 code that runs when someone installs or updates the plugin. **A critical finding
 there stops people installing the plugin**, and the `plugin-scanner` CI job
-checks for it on every PR. Exit code 1 means at least one critical. It fetches
-the scanner on first run and needs Python 3.11+, while the plugin itself
-supports 3.9. See [adding a provider](docs/add-provider.md#run-the-plugin-scanner).
+checks for it on every PR. The scanner is pinned to a Hermes release instead of
+`main`, because a scanner-side demotion must not turn the gate green while stable
+installs still refuse the tree; the gate fails on any `critical`, or on `high` in
+`credential_exposure`, and `--self-test` proves it can still see that class. It
+needs Python 3.11+, while the plugin itself supports 3.9. See
+[adding a provider](docs/add-provider.md#run-the-plugin-scanner).
 
 Widget changes can be checked without launching the app — the harness renders the
 real `desktop/plugin.js` against a real payload and asserts the pane's contract

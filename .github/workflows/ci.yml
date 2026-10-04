@@ -112,6 +112,11 @@ jobs:
           # still supports 3.9 -- that is what the matrix above covers.
           python-version: "3.12"
 
+      - name: Prove the gate can still see the blocking class
+        # A scanner demotion upstream (or a broken sparse fetch) must fail here
+        # rather than turn the scan below green on an installable-looking tree.
+        run: python scripts/scan_plugin.py --self-test
+
       - name: Run the Hermes plugin scanner against this tree
         run: python scripts/scan_plugin.py --json scanner-report.json
 
