@@ -243,6 +243,9 @@ class MiniMaxFetchTests(unittest.TestCase):
         self.assertIsNone(handler.redirect_request(request, None, 302, "Found", {}, "https://evil.example"))
 
 
+OAUTH = "t" * 125  # inert stand-in; the shape of a MiniMax OAuth token
+
+
 class MiniMaxCredentialTests(unittest.TestCase):
     def _hermes(self, resolved):
         """Fake hermes_cli.auth whose registry holds the three MiniMax providers."""
@@ -282,6 +285,92 @@ class MiniMaxCredentialTests(unittest.TestCase):
             for name in minimax._ENV_KEYS:
                 os.environ.pop(name, None)
             self.assertIsNone(minimax.resolve_bearer())
+
+
+    def _hermes_real_types(self, pool_rows, resolver_results):
+        """Stub hermes_cli.auth with the auth_type values live core actually uses.
+
+        The other tests here stub every provider as ``auth_type="api_key"``,
+        which is how this shipped broken: ``minimax-oauth`` is really registered
+        as ``oauth_minimax``, so an allowlist of ``("api_key", "oauth")`` skipped
+        the only provider holding a token -- and a test asserting against the
+        wrong stub could never catch it.
+        """
+        calls = []
+
+        def resolver(provider_id, config):  # noqa: ANN001, ARG001
+            calls.append(provider_id)
+            return resolver_results.get(provider_id), "src"
+
+        registry = {
+            "minimax": type("C", (), {"auth_type": "api_key"})(),
+            "minimax-cn": type("C", (), {"auth_type": "api_key"})(),
+            "minimax-oauth": type("C", (), {"auth_type": "oauth_minimax"})(),
+        }
+        auth = type("M", (), {
+            "PROVIDER_REGISTRY": registry,
+            "_resolve_api_key_provider_secret": staticmethod(resolver),
+            "read_credential_pool": staticmethod(
+                lambda pid=None: list((pool_rows or {}).get(pid, []))),
+        })
+        package = type("M", (), {"auth": auth})
+        return calls, mock.patch.dict(
+            sys.modules, {"hermes_cli": package, "hermes_cli.auth": auth})
+
+    def test_oauth_token_resolves_despite_the_oauth_minimax_auth_type(self):
+        """The regression: minimax-oauth holds the only credential, and the
+        allowlist used to skip it before the resolver was ever asked."""
+        calls, modules = self._hermes_real_types(
+            {"minimax-oauth": [{"access_token": OAUTH}]},
+            {"minimax-oauth": OAUTH})
+        with modules:
+            self.assertEqual(minimax.resolve_bearer(), OAUTH)
+        self.assertNotIn("minimax-oauth", calls, "must not need the resolver at all")
+
+    def test_pool_token_beats_a_shadowing_model_key_env(self):
+        """model.key_env can point minimax-oauth at an unrelated API key that
+        MiniMax accepts over HTTP but rejects in base_resp.status_code. The
+        pool read has to come first or this returns the wrong key."""
+        shadow = "u" * 43
+        calls, modules = self._hermes_real_types(
+            {"minimax-oauth": [{"access_token": OAUTH}]},
+            {"minimax-oauth": shadow})
+        with modules:
+            self.assertEqual(minimax.resolve_bearer(), OAUTH)
+        self.assertNotEqual(minimax.resolve_bearer(), shadow)
+
+    def test_allowlist_still_widens_for_the_shared_resolver_path(self):
+        """With no pool row, the widened allowlist must still let the shared
+        resolver reach minimax-oauth, so a host that stores the token there
+        rather than in the pool keeps working."""
+        calls, modules = self._hermes_real_types({}, {"minimax-oauth": "RESOLVED"})
+        with modules, mock.patch.dict(os.environ, {}, clear=False):
+            for name in minimax._ENV_KEYS:
+                os.environ.pop(name, None)
+            self.assertEqual(minimax.resolve_bearer(), "RESOLVED")
+        self.assertIn("minimax-oauth", calls)
+
+    def test_api_key_path_is_untouched_when_the_pool_is_empty(self):
+        """The subscription-key path must not regress when no OAuth token
+        exists -- the pool read is a fallback, not a replacement."""
+        calls, modules = self._hermes_real_types({}, {"minimax": "SUB_KEY"})
+        with modules, mock.patch.dict(os.environ, {}, clear=False):
+            for name in minimax._ENV_KEYS:
+                os.environ.pop(name, None)
+            self.assertEqual(minimax.resolve_bearer(), "SUB_KEY")
+        self.assertEqual(calls, ["minimax"])
+
+    def test_blank_pool_rows_fall_through(self):
+        """A pool entry with no usable token must not shadow the other paths."""
+        for rows in ([{}], [{"access_token": "   "}], [{"access_token": None}], ["nope"]):
+            with self.subTest(rows=rows):
+                calls, modules = self._hermes_real_types(
+                    {"minimax-oauth": rows}, {"minimax": "SUB_KEY"})
+                with modules, mock.patch.dict(os.environ, {}, clear=False):
+                    for name in minimax._ENV_KEYS:
+                        os.environ.pop(name, None)
+                    self.assertEqual(minimax.resolve_bearer(), "SUB_KEY")
+
 
 
 if __name__ == "__main__":

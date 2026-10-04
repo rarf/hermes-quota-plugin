@@ -157,12 +157,37 @@ def resolve_bearer() -> Optional[str]:
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY, _resolve_api_key_provider_secret
 
+        # ``minimax-oauth`` is registered with the provider-specific auth_type
+        # ``oauth_minimax``, which never matched the ``("api_key", "oauth")``
+        # allowlist below -- so the one provider that actually holds a token was
+        # silently skipped and the module reported ``no-credentials``. Read its
+        # access token from the credential pool directly:
+        # ``_resolve_api_key_provider_secret`` is built for API-key providers
+        # and consults the model-level ``model.key_env`` pointer FIRST, so on a
+        # host whose active model is ``minimax-oauth`` it can return an
+        # unrelated key that MiniMax accepts at the HTTP layer but rejects in
+        # ``base_resp.status_code``. Widening the allowlist alone would convert
+        # a clean ``no-credentials`` into a misleading ``no-subscription``.
+        # The pool read has to precede the shared resolver for that reason;
+        # ``read_credential_pool`` is profile-aware and ignores ``key_env``.
+        try:
+            from hermes_cli.auth import read_credential_pool
+
+            for row in read_credential_pool("minimax-oauth") or []:
+                if not isinstance(row, dict):
+                    continue
+                token = row.get("access_token")
+                if token and str(token).strip():
+                    return str(token).strip()
+        except Exception:  # noqa: BLE001 - standalone install / locked store
+            pass
+
         for provider_id in ("minimax", "minimax-cn", "minimax-oauth"):
             pconfig = PROVIDER_REGISTRY.get(provider_id)
             if pconfig is None:
                 continue
             auth_type = getattr(pconfig, "auth_type", "") or ""
-            if auth_type not in ("api_key", "oauth"):
+            if auth_type not in ("api_key", "oauth", "oauth_minimax"):
                 continue
             try:
                 key, _source = _resolve_api_key_provider_secret(provider_id, pconfig)
