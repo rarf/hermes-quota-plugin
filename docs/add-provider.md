@@ -146,6 +146,45 @@ The provider should appear in `/quota` and in the Desktop pane after
 **Reload desktop plugins** (⌘K). Remember: widget-only changes reload; any new
 Python backend file needs a full Desktop restart.
 
+## Run the plugin scanner
+
+Hermes scans every plugin it installs, with
+[`tools/plugin_guard.py`](https://github.com/NousResearch/hermes-agent) from
+hermes-agent. **A critical finding there does not fail an ordinary unit test —
+it stops people installing or updating this plugin**, and the `plugin-scanner`
+CI job checks for it on every PR. Running it locally is the same check without
+the round trip:
+
+```bash
+python3 scripts/scan_plugin.py
+```
+
+It fetches the scanner into `~/.cache/hermes-plugin-scanner` (a sparse checkout
+of `tools/` only) and runs it against this tree. Exit code **1** means at least
+one critical finding. It needs Python 3.11+ — that is hermes-agent's floor; this
+plugin still supports 3.9.
+
+Other useful flags:
+
+```bash
+python3 scripts/scan_plugin.py --json report.json      # full findings as JSON
+python3 scripts/scan_plugin.py --scanner /path/to/hermes-agent   # reuse a checkout
+```
+
+Matched values are redacted in the output. A finding's file and line are enough
+to locate it; copying credential-shaped strings into logs is worth avoiding.
+
+If a finding is legitimate — a public OAuth client id, a fixture holding a
+hostile string — do not add a suppression. The scanner already steps findings
+down inside test trees, and a blanket ignore teaches the next author the same
+thing. Restructure the code, or argue it upstream in
+[hermes-agent](https://github.com/NousResearch/hermes-agent).
+
+Note that the scanner is pulled at its **latest** version, so the same tree can
+score differently over time as the patterns change. That is deliberate: a stale
+copy of the scanner is worse than none. It does mean a PR can go red with no
+change of its own.
+
 ## Checklist
 
 - [ ] Fetcher never raises; every failure returns `build_unavailable(...)`
@@ -156,3 +195,4 @@ Python backend file needs a full Desktop restart.
 - [ ] Registered in `__init__.py`; `PROVIDER_META` entry added
 - [ ] Unit tests added and passing offline
 - [ ] `plugin.yaml` version bumped; live refresh verified
+- [ ] **No critical plugin-scanner findings** — see [Run the plugin scanner](#run-the-plugin-scanner)
