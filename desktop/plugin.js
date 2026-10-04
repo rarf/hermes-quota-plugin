@@ -34,6 +34,7 @@ import {
 	STATUSBAR_AREAS,
 	StatusDot,
 	Switch,
+	Tip,
 	useMutation,
 	usePluginI18n,
 	useQuery,
@@ -1063,36 +1064,61 @@ function useQuota() {
 	});
 }
 
+// Statusbar tips must use the SDK portal, not native title (unreliable in
+// Electron). Preserve account/window lines; escape the short statusbar pane.
+function QuotaTip({ label, children }) {
+	return jsx(Tip, {
+		side: "top",
+		align: "start",
+		boundary: "viewport",
+		style: { maxWidth: "min(38rem, calc(100vw - 1.5rem))" },
+		label: jsx("div", {
+			style: {
+				whiteSpace: "pre-wrap",
+				maxHeight: "min(70vh, var(--radix-tooltip-content-available-height, 70vh))",
+				overflowY: "auto",
+			},
+			children: label,
+		}),
+		children,
+	});
+}
+
 // ---- single worst chip (worst mode) ---------------------------------------
 
 function QuotaChipWithBar() {
-	const { data } = useQuota();
+	const { data, isError, isPlaceholderData } = useQuota();
+	const stale = useCodexStale(data, isError || isPlaceholderData);
 	const providers =
-		data && data.providers ? Object.entries(data.providers) : [];
+		data && data.providers ? statusEntries(data.providers, stale) : [];
 	let worst = null;
 	let worstLabel = "";
+	let worstProvider = null;
 	for (const [pid, p] of providers) {
 		if (!isProviderEnabled(pid)) continue;
-		const r = worstWindow(p);
+		const r = p?.unavailable_reason ? null : p?.display_accounts ? p.display_remaining : worstWindow(p);
 		if (r == null) continue;
 		if (worst == null || r < worst) {
 			worst = r;
-			worstLabel = providerMeta(pid).name;
+			worstLabel = providerDisplayName(pid, p);
+			worstProvider = p;
 		}
 	}
 	if (worst == null) {
-		// Money in different currencies has no meaningful "worst" percentage.
-		const balances = providers.filter(([pid, p]) => isProviderEnabled(pid) && accountFacts(p).balances.length);
-		return balances.length
-			? jsx("span", { className: "inline-flex h-full items-center", children: balances.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
+		// Unknown Codex cannot be ranked. Keep it alongside the existing
+		// balance-only fallback; money has no meaningful worst percentage.
+		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
+		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1] });
+		return fallback.length
+			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
 			: jsx("span", { children: "Q:none" });
 	}
 	const tone = toneForRemaining(worst);
 	const fill = toneColor(tone);
-	const tip = makeWorstTip(worstLabel, worst, data && data.providers);
-	return jsxs("button", {
+	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
+	const button = jsxs("button", {
 		type: "button",
-		title: tip,
+		"aria-label": worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%") + " · Open Quota pane",
 		className:
 			"inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		onClick: () => {
@@ -1101,7 +1127,7 @@ function QuotaChipWithBar() {
 		children: [
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
-				children: worstLabel + " " + worst + "%",
+				children: worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%"),
 			}),
 			jsx("span", {
 				className:
@@ -1113,21 +1139,99 @@ function QuotaChipWithBar() {
 			}),
 		],
 	});
+	return jsx(QuotaTip, { label: tip, children: button });
+}
+
+// Only explicit saved labels are display text; never infer an identity.
+// Re-sanitize cached input, matching the backend's 64-code-point bound.
+function codexDisplayLabel(value) {
+	return typeof value === "string" ? Array.from(value.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, "").trim()).slice(0, 64).join("").trimEnd() : "";
+}
+
+// Keep the real provider ID for icons, settings, and routing.
+function providerEntries(providers) {
+	return Object.entries(providers || {}).flatMap(([pid, p]) => {
+		const accounts = pid === "openai-codex" && p && Array.isArray(p.accounts)
+			? p.accounts.filter(asProvider) : [];
+		return accounts.length ? accounts.map((a, i) => [pid, { ...a, account_label: codexDisplayLabel(a.label) || `Account ${i + 1}` }]) : [[pid, pid === "openai-codex" && p ? { ...p, account_label: codexDisplayLabel(p.account_label) } : p]];
+	});
+}
+
+// Backend account order is validated saved priority, already deduplicated.
+// Keep expanded entries for the pane, but only one representative per provider
+// in the status bar. This is display selection, never runtime routing.
+function codexRemaining(account) {
+	const windows = asWindowList(account?.windows).filter((w) => ["Session", "Weekly"].includes(w.label));
+	if (account?.unavailable_reason || !windows.length || windows.some((w) => typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent))) return null;
+	return Math.max(0, Math.min(...windows.map((w) => 100 - w.used_percent)));
+}
+
+function codexValue(remaining) {
+	return remaining == null ? "unknown" : remaining === 0 ? "limit reached" : remaining < 1 ? "<1%" : `${Math.round(remaining)}%`;
+}
+
+function useCodexStale(data, untrusted = false) {
+	const interval = useValue(refreshIntervalAtom);
+	const now = useNow(5_000);
+	const received = useRef({ data, at: now });
+	if (received.current.data !== data) received.current = { data, at: now };
+	const age = data?.age_s;
+	return untrusted || typeof age !== "number" || !Number.isFinite(age) || age < 0 || age + (now - received.current.at) / 1000 >= interval;
+}
+
+function statusEntries(providers, stale = false) {
+	return Object.entries(providers || {}).map(([pid, provider]) => {
+		const accounts = pid === "openai-codex" && provider && provider.unavailable_reason !== "no-credentials"
+			? providerEntries({ [pid]: provider }).map(([, p]) => p).filter(asProvider) : [];
+		if (!accounts.length) return [pid, provider];
+		// A lone account needs no distinguishing name in the compact status bar.
+		// Preserve the original OpenAI Codex headline even with a saved label.
+		if (accounts.length === 1) accounts[0] = { ...accounts[0], account_label: "" };
+		const selected = (stale ? null : accounts.find((a) => codexRemaining(a) !== 0)) || accounts[0];
+		return [pid, { ...selected, display_selected_index: accounts.indexOf(selected), display_accounts: accounts, display_stale: stale, display_remaining: stale ? null : codexRemaining(selected) }];
+	});
+}
+
+function codexAccountsTip(provider) {
+	const lines = [];
+	for (const [index, account] of provider.display_accounts.entries()) {
+		const remaining = provider.display_stale ? null : codexRemaining(account);
+		const marker = index === provider.display_selected_index ? "●" : "○";
+		const error = account.unavailable_reason ? ` · ${account.unavailable_reason}` : "";
+		const value = codexValue(remaining) + (remaining > 0 ? " left" : "");
+		lines.push(`${marker} ${account.account_label || `Account ${index + 1}`} · ${value}${provider.display_stale ? " · stale" : ""}${error}`);
+		// Keep historical/model-specific details in the pane, not in this summary.
+		if (provider.display_stale || account.unavailable_reason) continue;
+		const windows = asWindowList(account.windows).filter((w) => ["Session", "Weekly"].includes(w.label));
+		for (const w of windows) {
+			const r = codexRemaining({ windows: [w] });
+			const value = codexValue(r) + (r > 0 ? " left" : "");
+			const countdown = relativeCountdown(w.reset_at);
+			const reset = countdown === "resetting…" ? countdown : countdown ? `resets in ${countdown}` : "";
+			// A single window already has its remaining value in the account line.
+			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
+		}
+	}
+	return lines.join("\n");
+}
+
+function providerDisplayName(pid, provider) {
+	return providerMeta(pid).name + (provider?.account_label ? ` · ${provider.account_label}` : "");
 }
 
 function ProviderChip({ pid, provider }) {
-	const r = provider && provider.unavailable_reason ? null : worstWindow(provider);
+	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? provider.display_remaining : worstWindow(provider);
 	const facts = accountFacts(provider);
-	const value = provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
-	const tone = providerTone(provider);
+	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
+	const tone = provider?.display_accounts ? toneForRemaining(r) : providerTone(provider);
 	const dot = toneColor(tone);
-	const label = providerMeta(pid).name;
+	const label = providerDisplayName(pid, provider);
 	const tip = makeProviderTip(pid, provider);
-	return jsxs(
+	const button = jsxs(
 		"button",
 		{
 			type: "button",
-			title: tip,
+			"aria-label": `${label} ${value} · Open Quota pane`,
 			className: cn(
 				"inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
@@ -1142,26 +1246,31 @@ function ProviderChip({ pid, provider }) {
 			],
 		},
 	);
+	return jsx(QuotaTip, { label: tip, children: button });
 }
 
-// Build a rich multiline tip: every provider with data, listing ALL its
-// windows (Session, Spark 5h, Spark Weekly, ...) each with % left + reset.
-function makeWorstTip(worstLabel, worst, providersObj) {
+// Keep other providers' window details; Codex uses its compact account summary.
+function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 	if (!providersObj) return `Quota · lowest ${worst}% (${worstLabel})`;
 	const blocks = [];
-	for (const [pid, p] of Object.entries(providersObj)) {
-		if (!isProviderEnabled(pid) || !isConfigured(p)) continue;
-		const lines = providerWindowLines(pid, p);
+	let hasCodex = false;
+	for (const [pid, p] of statusEntries(providersObj, stale)) {
+		if (!isProviderEnabled(pid) || (!p?.display_accounts && !isConfigured(p))) continue;
+		if (p?.display_accounts) hasCodex = true;
+		const lines = p?.display_accounts ? [makeProviderTip(pid, p)] : providerWindowLines(pid, p);
 		if (lines.length) blocks.push(lines.join("\n"));
 	}
 	if (blocks.length === 0) return `Quota · lowest ${worst}% (${worstLabel})`;
-	return `Quota breakdown:\n${blocks.join("\n")}\nClick to open Quota pane`;
+	if (hasCodex && blocks.length === 1) return blocks[0];
+
+	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : "\nClick to open Quota pane"}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
-	const meta = providerMeta(pid);
+	if (provider?.display_accounts) return codexAccountsTip(provider);
+	const meta = { name: providerDisplayName(pid, provider) };
 	if (!provider) return `${meta.name}: unavailable`;
 	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
 	const lines = providerWindowLines(pid, provider);
@@ -1194,16 +1303,17 @@ function providerWindowLines(pid, provider) {
 function StatusBar() {
 	const showStatusBar = useValue(showStatusBarAtom);
 	const mode = useValue(statusbarModeAtom);
-	const { data, isError } = useQuota();
+	const { data, isError, isPlaceholderData } = useQuota();
+	const stale = useCodexStale(data, isError || isPlaceholderData);
 	if (!showStatusBar) return null;
 	if (mode === "worst") return jsx(QuotaChipWithBar, {});
-	if (isError || !data || !data.providers)
+	if (!data || !data.providers)
 		return jsx(StatusDot, { tone: "muted" });
-	// Default: only providers with real data. The cherry-picker can only hide
-	// more, never show unavailable ones here (the pane shows those muted).
-	const entries = Object.entries(data.providers)
-		.filter(([pid]) => isProviderEnabled(pid))
-		.filter(([, p]) => isConfigured(p));
+	// Keep unavailable saved accounts visible alongside healthy siblings.
+	// Unconfigured providers remain hidden; visibility settings apply to all accounts.
+	const entries = statusEntries(data.providers, stale)
+		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
+		.filter(([, p]) => p?.display_accounts || isConfigured(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
@@ -1240,7 +1350,7 @@ function ProviderRow({ id, provider }) {
 	const reason = provider ? provider.unavailable_reason : "no-data";
 	const details = asList(provider && provider.details);
 	const facts = accountFacts(provider);
-	const displayName = providerMeta(id).name;
+	const displayName = providerDisplayName(id, provider);
 	// Inline sizing is intentional: plugin-only utility classes might not be
 	// in the host's compiled Tailwind stylesheet.
 	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
@@ -1710,7 +1820,7 @@ function QuotaPane() {
 		const disabled = disabledProvidersAtom.get();
 		// Default view: only providers with real data. Providers without data
 		// (unconfigured / opt-in off) collapse into a muted "no data" section.
-		const all = Object.entries(data.providers).filter(
+		const all = providerEntries(data.providers).filter(
 			([pid]) => !disabled.includes(pid),
 		);
 		const withData = all.filter(([, p]) => isConfigured(p));
@@ -1718,8 +1828,8 @@ function QuotaPane() {
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				...withData.map(([id, p]) =>
-					jsx(ProviderRow, { id, provider: p, key: id }),
+				...withData.map(([id, p], index) =>
+					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
 				),
 				withoutData.length > 0
 					? jsxs("details", {
@@ -1732,8 +1842,8 @@ function QuotaPane() {
 								}),
 								jsx("div", {
 									className: "mt-1.5 flex flex-col gap-2",
-									children: withoutData.map(([id, p]) =>
-										jsx(ProviderRow, { id, provider: p, key: id }),
+									children: withoutData.map(([id, p], index) =>
+										jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
 									),
 								}),
 							],

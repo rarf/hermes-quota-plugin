@@ -221,6 +221,51 @@ mode uses balance chips only when no percentage windows are available.
 Missing credentials and failed requests remain explicit unavailable states.
 Requests have a timeout, bounded response size, and no redirects; error details
 and credentials are never written into the display cache.
+
+### OpenAI Codex: saved accounts
+
+Codex shows one status-bar chip: the highest-priority distinct saved account
+that is **not definitely exhausted**. Fresh quota recovery restores a
+higher-priority account. This display choice does not change inference routing.
+Only generic **Session/Weekly** windows govern selection; model-specific limits
+(including Spark), plans and banked resets remain in the Quota pane.
+
+Hover uses the desktop SDK tooltip to list accounts in priority order with
+remaining quota and relative reset times. `●` marks the displayed account.
+Unknown, expired, failed or stale data is **unknown**, not exhaustion. Reset
+countdowns never imply recovery; a fresh poll is required. When every account
+is definitely exhausted, the chip says **limit reached**. All/Worst modes use
+this same Codex representative, without combining account percentages.
+
+Saved credential labels distinguish multiple accounts; blank labels use
+`Account N` in priority order. Labels are intentional local display text: they
+appear in the cache, pane, CLI/footer and widget. Choose names suitable for
+screenshots. Controls are stripped and labels are limited to 64 characters;
+no name is inferred from an email, account ID or token. A single distinct
+account keeps the original **OpenAI Codex XX%** headline without a name.
+
+Discovery reads saved `auth.json` snapshots using Hermes' home/root helpers:
+a nonempty profile pool takes precedence, otherwise the root pool is used;
+an empty effective pool falls back to legacy provider state. Credentials with
+the same account and subject are queried once. The best-priority label is
+retained when an unexpired saved duplicate supplies the token. Without both
+identity hints, only exact duplicate tokens can be collapsed. Fallback account
+numbers are positional, not permanent identifiers.
+
+Polling never refreshes tokens, selects/rotates the runtime pool, writes auth
+files or redeems reset credits. Expired tokens and HTTP 401/403 require normal
+Hermes sign-in. Endpoints follow Hermes' configured backend URL helpers
+(including the older usage-URL helper); HTTP behavior remains based on `httpx`.
+Requests are collected independently within a shared 15-second budget, so one
+slow account cannot discard another's result. The outer cache sweep bounds
+stalled discovery; blocked workers are not forcibly cancelled. Raw credentials
+and exception bodies are not included in quota records.
+
+The backend and widget should be updated together: multiple accounts use the
+optional `providers["openai-codex"].accounts` field, while one account retains
+the original top-level windows. The pane and `/quota openai-codex` show separate
+account details, not a summed quota.
+
 ### OpenRouter
 
 Reads `GET https://openrouter.ai/api/v1/key` separately for each distinct locally

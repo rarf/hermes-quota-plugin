@@ -15,7 +15,7 @@ import time
 import unittest
 from pathlib import Path
 
-from widget_harness import render, text
+from widget_harness import render, text, tooltip_text
 
 ROOT = Path(__file__).resolve().parent.parent
 EXTRACT = ROOT / "tests" / "widget_extract.cjs"
@@ -228,8 +228,10 @@ class NullProviderRenderTests(unittest.TestCase):
         src = self._source()
         self.assertIn("asList(provider && provider.details)", src)
         self.assertNotIn("asList(provider.details)", src)
-        self.assertIn("const value = provider && provider.unavailable_reason",
-                      src)
+        chip = render(component="chip", provider=None)
+        self.assertIn("DeepSeek", text(chip))
+        self.assertIn("—", text(chip))
+        self.assertIn("unavailable", tooltip_text(chip))
 
     def test_null_window_entries_are_ignored_by_window_helpers(self):
         got = run_js({
@@ -246,7 +248,7 @@ class NullProviderRenderTests(unittest.TestCase):
     def test_null_window_does_not_crash_provider_tooltip(self):
         tree = render(component="chip", provider={"windows": [None], "details": []})
         self.assertIn("DeepSeek", text(tree))
-        self.assertIn("Quota pane", tree["props"]["title"])
+        self.assertIn("Quota pane", tooltip_text(tree))
 
 
 if __name__ == "__main__":

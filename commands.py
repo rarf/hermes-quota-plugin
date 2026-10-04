@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .quota_cache import read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
+from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
 from .quota_providers import PROVIDER_FETCHERS
 
 _PROVIDER_IDS = tuple(PROVIDER_FETCHERS)
@@ -83,7 +83,7 @@ def _render_quota(provider_filter: Optional[str]) -> str:
     pf = (provider_filter or "").strip().lower()
     lines = [f"📊 **quota** ({_age_label()})", ""]
     shown = 0
-    for name, rec in providers.items():
+    for name, rec in iter_account_records(providers):
         if pf and pf not in (name.lower(), (rec.get("label") or "").lower()):
             continue
         shown += 1

@@ -10,8 +10,11 @@ function renderWidget(options = {}) {
     useValue: a => a.get(), useEffect: () => {}, useMemo: f => f(),
     useRef: v => ({current: v}), useState: v => [typeof v === 'function' ? v() : v, () => {}],
     usePluginI18n: () => (key, ...args) => typeof translations[key] === 'function' ? translations[key](...args) : translations[key] || key,
-    useQuery: () => ({data: options.data, isError: !!options.isError}),
+    useQuery: () => ({data: options.data, isError: !!options.isError, isPlaceholderData: !!options.isPlaceholderData}),
     useQueryClient: () => ({invalidateQueries: () => {}}), useMutation: () => ({}),
+    // Keep tooltip labels separate from trigger text/native title. This is a
+    // structural test seam, not a simulation of hover (see hover test).
+    Tip: props => ({type: 'Tip', props}),
     StatusDot: ({tone}) => jsx('span', {'data-tone': tone}),
     Input: 'input', Switch: 'input', SegmentedControl: 'span', icons: {},
     // Quota commands route to the focused profile's owner (#26); the pane reads
@@ -29,9 +32,10 @@ function renderWidget(options = {}) {
     TEST_MODE: options.mode || 'dense',
     TEST_CTX: {storage: {get: () => undefined}, i18n: {register: v => {translations = v.en;}}, register: () => () => {}},
   }));
+  vm.runInContext('statusbarModeAtom.set(TEST_STATUS_MODE); disabledProvidersAtom.set(TEST_DISABLED);', Object.assign(context, { TEST_STATUS_MODE: options.statusMode || 'all', TEST_DISABLED: options.disabled || [] }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
-  const expression = options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
   return vm.runInContext(expression, context);
 }
 module.exports = {renderWidget};

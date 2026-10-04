@@ -139,41 +139,12 @@ class CodexPostRequestParseTests(unittest.TestCase):
     """builtin._fetch_codex_with_models parses after its try/except closes."""
 
     def _fetch(self, payload):
+        from test_codex_accounts import auth_modules, token, mock_http
+        from io import BytesIO
+        import json
         mod = importlib.import_module("quota_providers.builtin")
-        agent = types.ModuleType("agent")
-        usage = types.ModuleType("agent.account_usage")
-        usage._resolve_codex_usage_credentials = lambda a, b: ("SYNTHETIC_KEY", "https://x", None)
-        usage._codex_backend_urls = lambda b: ("https://x/api/usage",)
-        usage._resolve_codex_usage_url = lambda *a, **k: "https://x/api/usage"
-        agent.account_usage = usage
-
-        class Response:
-            status_code = 200
-
-            def raise_for_status(self):
-                pass
-
-            def json(self):
-                return payload
-
-        class Ctx:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def get(self, *a, **k):
-                return Response()
-
-            def post(self, *a, **k):
-                return Response()
-
-        fake = types.ModuleType("httpx")
-        fake.Client = lambda *a, **k: Ctx()
-        with mock.patch.dict(sys.modules, {"agent": agent, "agent.account_usage": usage,
-                                           "httpx": fake}):
-            return PROVIDER_FETCHERS["openai-codex"]()
+        with mock.patch.dict(sys.modules, auth_modules([{"access_token": token("synthetic-a")}])), mock_http(return_value=BytesIO(json.dumps(payload).encode())):
+            return mod._fetch_codex_with_models()
 
     def test_non_dict_sections_do_not_raise(self):
         for payload in ({"rate_limit": ["not", "a", "dict"]},

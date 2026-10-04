@@ -57,156 +57,96 @@ def _urlopen_returning(payload: dict):
 
 
 class OpenAICodexFetcherTests(unittest.TestCase):
-    def test_legacy_usage_url_helper_is_supported(self):
-        from quota_providers.builtin import _fetch_codex_with_models
+    def test_usage_url_helpers_preserve_configured_backend(self):
+        from quota_providers import builtin
+        from test_codex_accounts import auth_modules, token, mock_http
+        for helper in ('_codex_backend_urls', '_resolve_codex_usage_url'):
+            modules = auth_modules([{'access_token': token('synthetic-a'),
+                                     'base_url': 'https://saved.invalid/codex'}])
+            usage = modules['agent.account_usage']
+            del usage._codex_backend_urls
+            resolve = mock.Mock(return_value=('https://configured.invalid/api/codex/usage',)
+                                if helper == '_codex_backend_urls' else 'https://configured.invalid/api/codex/usage')
+            setattr(usage, helper, resolve)
+            route = mock.Mock(return_value='https://configured.invalid')
+            modules['hermes_cli.auth_codex']._codex_pool_route_base_url = route
+            with self.subTest(helper=helper), mock.patch.dict(sys.modules, modules), mock_http(side_effect=_urlopen_returning({'rate_limit': {'primary_window': {'used_percent': 21}}})) as http:
+                result = builtin._fetch_codex_with_models()
+            self.assertIsNone(result.unavailable_reason)
+            self.assertEqual(str(http.call_args.args[0].url), 'https://configured.invalid/api/codex/usage')
+            route.assert_called_once_with('https://saved.invalid/codex')
+            resolve.assert_called_once_with('https://configured.invalid')
 
-        captured = {}
+    def test_legacy_saved_account_header_and_old_auth_base_helper(self):
+        from quota_providers import builtin
+        from test_codex_accounts import auth_modules, token, mock_http
+        modules = auth_modules([], {'tokens': {'access_token': token('jwt-account'),
+                                               'account_id': 'synthetic-saved-account'}})
+        modules['hermes_cli.auth_codex'] = None
+        auth = types.ModuleType('hermes_cli.auth')
+        auth._codex_base_url = lambda: 'https://legacy-configured.invalid/codex'
+        modules['hermes_cli.auth'] = auth
+        with mock.patch.dict(sys.modules, modules), mock_http(side_effect=_urlopen_returning({'rate_limit': {'primary_window': {'used_percent': 21}}})) as http:
+            result = builtin._fetch_codex_with_models()
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(str(http.call_args.args[0].url), 'https://legacy-configured.invalid/wham/usage')
+        self.assertEqual(http.call_args.args[0].headers['ChatGPT-Account-Id'], 'synthetic-saved-account')
+
+    def test_native_httpx_keeps_redirects_disabled_and_accounts_independent(self):
+        try:
+            import httpx
+        except ImportError:
+            self.skipTest('optional httpx integration')
+        from quota_providers import builtin
+        from test_codex_accounts import auth_modules, token, payload
+        client = httpx.Client
+        requests = []
+        def respond(request):
+            requests.append(request)
+            if request.headers['ChatGPT-Account-Id'] == 'synthetic-a':
+                return httpx.Response(302, headers={'Location': 'https://redirect.invalid'},
+                                      text='SYNTHETIC_PRIVATE_ERROR')
+            return httpx.Response(200, json=payload(21))
+        with mock.patch.dict(sys.modules, auth_modules([
+                {'access_token': token('synthetic-a')}, {'access_token': token('synthetic-b')}])), mock.patch.object(httpx, 'Client', side_effect=lambda **kw: client(transport=httpx.MockTransport(respond), **kw)):
+            result = builtin._fetch_codex_with_models()
+        self.assertEqual(len(requests), 2)
+        self.assertTrue(all(request.url.host == 'chatgpt.com' for request in requests))
+        self.assertEqual(result.accounts[0].unavailable_reason, 'http-302')
+        self.assertEqual(result.accounts[1].windows[0].used_percent, 21)
+        self.assertNotIn('SYNTHETIC_PRIVATE_ERROR', repr(result))
+
+    def test_worker_preserves_profile_context_for_endpoint_helpers(self):
+        from contextvars import ContextVar
+        from quota_providers import builtin
+        from test_codex_accounts import auth_modules, token, mock_http
+        context = ContextVar('synthetic_endpoint', default='https://wrong.invalid')
+        modules = auth_modules([{'access_token': token('synthetic-a')}])
+        modules['hermes_cli.auth_codex']._codex_pool_route_base_url = lambda base: context.get()
+        handle = context.set('https://profile.invalid/codex')
+        try:
+            with mock.patch.dict(sys.modules, modules), mock_http(side_effect=_urlopen_returning({'rate_limit': {'primary_window': {'used_percent': 21}}})) as http:
+                result = builtin._fetch_codex_with_models()
+            self.assertIsNone(result.unavailable_reason)
+            self.assertEqual(str(http.call_args.args[0].url), 'https://profile.invalid/wham/usage')
+        finally:
+            context.reset(handle)
+
+    def test_saved_single_account_request_and_spark_windows(self):
+        from quota_providers import builtin
+        from test_codex_accounts import auth_modules, token, mock_http
         payload = {
             "plan_type": "plus",
-            "rate_limit": {
-                "primary_window": {"used_percent": 21, "reset_at": 1_700_000_000},
-            },
+            "rate_limit": {"primary_window": {"used_percent": 21}, "secondary_window": {"used_percent": 42}},
+            "additional_rate_limits": [{"limit_name": "GPT-5-Codex-Spark", "rate_limit": {"primary_window": {"used_percent": 7}}}],
         }
-
-        fake_usage = types.ModuleType("agent.account_usage")
-        setattr(
-            fake_usage,
-            "_resolve_codex_usage_credentials",
-            lambda *_args: (
-                "test-token",
-                "https://chatgpt.com/backend-api/codex",
-                "account-1",
-            ),
-        )
-        setattr(
-            fake_usage,
-            "_resolve_codex_usage_url",
-            lambda base: f"{base.removesuffix('/codex')}/wham/usage",
-        )
-        fake_agent = types.ModuleType("agent")
-        setattr(fake_agent, "account_usage", fake_usage)
-
-        class FakeResponse:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return payload
-
-        class FakeClient:
-            def __init__(self, **_kwargs):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def get(self, url, headers):
-                captured["url"] = url
-                captured["headers"] = headers
-                return FakeResponse()
-
-        fake_httpx = types.ModuleType("httpx")
-        setattr(fake_httpx, "Client", FakeClient)
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "agent": fake_agent,
-                "agent.account_usage": fake_usage,
-                "httpx": fake_httpx,
-            },
-        ):
-            result = _fetch_codex_with_models()
-
+        with mock.patch.dict(sys.modules, auth_modules([{"access_token": token("synthetic-a")} ])), mock_http(side_effect=_urlopen_returning(payload)) as http:
+            result = builtin._fetch_codex_with_models()
         self.assertIsNone(result.unavailable_reason)
-        self.assertEqual(captured["url"], "https://chatgpt.com/backend-api/wham/usage")
-        self.assertEqual(captured["headers"]["ChatGPT-Account-Id"], "account-1")
-
-    def test_current_account_usage_helpers_are_supported(self):
-        from quota_providers.builtin import _fetch_codex_with_models
-
-        captured = {}
-        payload = {
-            "plan_type": "plus",
-            "rate_limit": {
-                "primary_window": {"used_percent": 21, "reset_at": 1_700_000_000},
-                "secondary_window": {"used_percent": 42, "reset_at": 1_700_100_000},
-            },
-            "additional_rate_limits": [
-                {
-                    "limit_name": "GPT-5-Codex-Spark",
-                    "rate_limit": {
-                        "primary_window": {"used_percent": 7, "reset_at": 1_700_000_000}
-                    },
-                }
-            ],
-        }
-
-        fake_usage = types.ModuleType("agent.account_usage")
-        setattr(
-            fake_usage,
-            "_resolve_codex_usage_credentials",
-            lambda *_args: (
-                "test-token",
-                "https://chatgpt.com/backend-api/codex",
-                "account-1",
-            ),
-        )
-        setattr(
-            fake_usage,
-            "_codex_backend_urls",
-            lambda base: (
-                f"{base.removesuffix('/codex')}/wham/usage",
-                "",
-                "",
-            ),
-        )
-        fake_agent = types.ModuleType("agent")
-        setattr(fake_agent, "account_usage", fake_usage)
-
-        class FakeResponse:
-            def raise_for_status(self):
-                return None
-
-            def json(self):
-                return payload
-
-        class FakeClient:
-            def __init__(self, **_kwargs):
-                pass
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                return False
-
-            def get(self, url, headers):
-                captured["url"] = url
-                captured["headers"] = headers
-                return FakeResponse()
-
-        fake_httpx = types.ModuleType("httpx")
-        setattr(fake_httpx, "Client", FakeClient)
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "agent": fake_agent,
-                "agent.account_usage": fake_usage,
-                "httpx": fake_httpx,
-            },
-        ):
-            result = _fetch_codex_with_models()
-
-        self.assertIsNone(result.unavailable_reason)
-        self.assertEqual(captured["url"], "https://chatgpt.com/backend-api/wham/usage")
-        self.assertEqual(captured["headers"]["ChatGPT-Account-Id"], "account-1")
-        self.assertEqual(
-            [w.label for w in result.windows],
-            ["Session", "Weekly", "5 Codex Spark · 5h"],
-        )
+        request = http.call_args.args[0]
+        self.assertEqual(str(request.url), "https://chatgpt.com/backend-api/wham/usage")
+        self.assertEqual(request.headers.get("Chatgpt-account-id"), "synthetic-a")
+        self.assertEqual([w.label for w in result.windows], ["Session", "Weekly", "5 Codex Spark · 5h"])
 
 
 # -- Nous Portal --------------------------------------------------------------
