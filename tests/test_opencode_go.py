@@ -50,7 +50,13 @@ class CredentialResolutionTests(unittest.TestCase):
     def test_no_credentials_anywhere(self):
         mod = load_module()
         with mock.patch.dict(mod.os.environ, {}, clear=False):
-            mod.os.environ.pop("OPENCODE_API_KEY", None)
+            # Every accepted name, not just the first: Hermes' own opencode-go
+            # provider exports OPENCODE_GO_API_KEY, so clearing only
+            # OPENCODE_API_KEY left a real key visible and this test failed on
+            # any machine that runs the plugin (passing in CI, where the env is
+            # empty).
+            for name in mod._ENV_KEYS:
+                mod.os.environ.pop(name, None)
             self.assertIsNone(mod._read_env_api_key())
 
     def test_opencode_go_env_key_is_accepted(self):
