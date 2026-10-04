@@ -15,10 +15,10 @@ ways to obtain a Bearer for the same backend:
   ``MINIMAX_CN_API_KEY``) or the credential pool.
 * **OAuth access token** — the ``minimax-oauth`` provider persists the access
   + refresh tokens in ``~/.hermes/auth.json`` after the user logs in via the
-  browser. Hermes core's auth resolver surfaces either transparently through
-  ``hermes_cli.auth._resolve_api_key_provider_secret``. No separate OAuth flow
-  is implemented here — the key path covers both, since the endpoint accepts
-  any valid Bearer.
+  browser. Hermes registers it with its own auth type (``oauth_minimax``), so it
+  is resolved through the same credential-pool path but has to be asked for
+  explicitly — see ``resolve_bearer``. The endpoint accepts any valid Bearer, so
+  no separate OAuth flow is implemented here.
 
 Pay-as-you-go API keys are **not** supported: they target MiniMax's standard
 Open Platform balance product, which has no documented quota-window endpoint.
