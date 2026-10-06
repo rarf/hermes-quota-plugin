@@ -204,7 +204,7 @@ def _profile(secret: str, timeout: float = _TIMEOUT_S):
     return (data, None) if isinstance(data, dict) else (None, "parse-pending")
 
 
-def _next_monthly_reset(created_at) -> Optional[str]:
+def _next_monthly_reset(created_at, now=None) -> Optional[str]:
     """The next monthly reset, derived from the account creation date.
 
     ollama.com/blog/transparent-pricing: "On Pro, Max, and Team plans, usage
@@ -243,7 +243,9 @@ def _next_monthly_reset(created_at) -> Optional[str]:
         return None
     if started.tzinfo is None:
         started = started.replace(tzinfo=datetime.timezone.utc)
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=datetime.timezone.utc)
     day = started.day
 
     def candidate(year: int, month: int) -> Optional[datetime.datetime]:

@@ -294,9 +294,10 @@ class ResetDerivationTests(unittest.TestCase):
         self.assertTrue(got.endswith("T00:00:00Z"), got)
 
     def test_day_is_preserved(self):
-        self.assertTrue(ollama._next_monthly_reset("2026-02-22T09:45:23Z")
+        fixed_now = datetime.datetime(2026, 9, 30, 12, tzinfo=datetime.timezone.utc)
+        self.assertTrue(ollama._next_monthly_reset("2026-02-22T09:45:23Z", fixed_now)
                         .startswith("2026-10-22"))
-        self.assertTrue(ollama._next_monthly_reset("2026-08-05T00:00:00Z")
+        self.assertTrue(ollama._next_monthly_reset("2026-08-05T00:00:00Z", fixed_now)
                         .startswith("2026-10-05"))
 
     def test_short_month_start_clamps_rather_than_skipping(self):

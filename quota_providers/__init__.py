@@ -29,6 +29,7 @@ from . import zai  # noqa: F401
 from . import commandcode  # noqa: F401
 from . import cursor  # noqa: F401
 from . import deepseek  # noqa: F401
+from . import experientiallabs  # noqa: F401
 from . import minimax  # noqa: F401
 from . import ollama  # noqa: F401
 

@@ -26,11 +26,16 @@ def resolve_api_key(provider: str):
 urlopen = urlopen_no_redirect
 
 
-def get_json(url: str, secret: str):
-    """Return (payload, safe reason); never expose response/error text."""
+def get_json(url: str, secret: str, timeout: float | None = None):
+    """Return (payload, safe reason); never expose response/error text.
+
+    *timeout* defaults to 7 s when omitted, which preserves backward
+    compatibility for all existing callers.  Pass ``deadline.slice(cap)``
+    when budget enforcement is needed.
+    """
     try:
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {secret}", "Accept": "application/json"})
-        with urlopen(req, timeout=7) as response:
+        with urlopen(req, timeout=timeout if timeout is not None else 7) as response:
             body = response.read(1024 * 1024 + 1)
         if len(body) > 1024 * 1024:
             return None, "response-too-large"
