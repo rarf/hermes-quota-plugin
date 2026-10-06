@@ -93,6 +93,8 @@ def _render_quota(provider_filter: Optional[str]) -> str:
         reason = rec.get("unavailable_reason")
         if reason:
             lines.append(f"• **{label}**: unavailable ({reason})")
+            for detail in rec.get("details") or []:
+                lines.append(f"• **{label}** · {detail}")
             continue
         windows = rec.get("windows") or []
         details = rec.get("details") or []

@@ -80,8 +80,19 @@ class QuotaResult:
         return (bool(self.windows) or bool(self.details) or bool(self.account_balances) or any(a.has_data() for a in self.accounts)) and self.unavailable_reason is None
 
 
-def build_unavailable(label: str, reason: str) -> QuotaResult:
-    return QuotaResult(label=label, windows=[], plan=None, unavailable_reason=reason)
+def build_unavailable(
+    label: str,
+    reason: str,
+    details: Optional[list[str]] = None,
+) -> QuotaResult:
+    """Unavailable record; optional details carry per-credential diagnostics."""
+    return QuotaResult(
+        label=label,
+        windows=[],
+        plan=None,
+        unavailable_reason=reason,
+        details=details or [],
+    )
 
 
 def opt_in_flag(value: object) -> bool:

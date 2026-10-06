@@ -138,6 +138,19 @@ class DeepSeekTests(unittest.TestCase):
         self.assertEqual(str(api_keys.amount('12.5000')), '12.5000')
         self.assertEqual(str(api_keys.amount('-1.25')), '-1.25')
 
+    def test_cli_renders_diagnostics_for_unavailable_record(self):
+        pkg = types.ModuleType('quota_balance_tests')
+        pkg.__path__ = [str(ROOT)]
+        constants = types.ModuleType('hermes_constants')
+        constants.get_hermes_home = lambda: ROOT
+        with mock.patch.dict(sys.modules, {'quota_balance_tests': pkg, 'hermes_constants': constants}):
+            cmd = importlib.import_module('quota_balance_tests.commands')
+        record = {'label': 'opencode-go', 'windows': [], 'details': ['key2: auth-failed'], 'unavailable_reason': 'no-data'}
+        with mock.patch.object(cmd, 'read_quota_cache', return_value={'providers': {'opencode-go': record}}), mock.patch.object(cmd, '_age_label', return_value='now'):
+            text = cmd._render_quota('opencode-go')
+        self.assertIn('unavailable (no-data)', text)
+        self.assertIn('key2: auth-failed', text)
+
     def test_cli_renders_details_without_windows(self):
         pkg = types.ModuleType('quota_balance_tests')
         pkg.__path__ = [str(ROOT)]
