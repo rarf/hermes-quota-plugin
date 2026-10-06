@@ -34,6 +34,7 @@ import {
 	STATUSBAR_AREAS,
 	StatusDot,
 	Switch,
+	Tip,
 	useMutation,
 	usePluginI18n,
 	useQuery,
@@ -50,7 +51,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.8.1";
+const WIDGET_VERSION = "2.9.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -269,9 +270,13 @@ const PROVIDER_SVGS = {
 		viewBox: "0 0 24 24",
 		body: '<path d="M18.654 3.87a5.087 5.087 0 110 10.174L23.7 19.09c.64.641.187 1.737-.72 1.737H8.48a8.479 8.479 0 010-16.958h10.175zM8.479 7.26a5.087 5.087 0 100 10.176 5.087 5.087 0 000-10.175z"></path>',
 	},
+	experientiallabs: {
+		viewBox: "0 0 24 24",
+		body: '<path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zm0 3a7 7 0 1 1 0 14 7 7 0 0 1 0-14zm-1 2v6l5 3 .9-1.5-4.1-2.4V7z"></path>',
+	},
 	gemini: {
 		viewBox: "0 0 24 24",
-		body: '<path d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"></path>',
+		body: '<path d="M20.616 10.835a14.147 14.147 0 01-4.45-3.001 14.111 14.111 0 01-3.678-6.452a.503.503 0 00-.975 0 14.134 14.134 0 01-3.679 6.452 14.155 14.155 0 01-4.45 3.001c-.65.28-1.318.505-2.002.678a.502.502 0 000 .975c.684.172 1.35.397 2.002.677a14.147 14.147 0 014.45 3.001 14.112 14.112 0 013.679 6.453a.502.502 0 00.975 0c.172-.685.397-1.351.677-2.003a14.145 14.145 0 013.001-4.45 14.113 14.113 0 016.453-3.678a.503.503 0 000-.975 13.245 13.245 0 01-2.003-.678z"></path>',
 	},
 	kimi: {
 		viewBox: "0 0 24 24",
@@ -337,6 +342,18 @@ const PROVIDER_SVGS = {
 		viewBox: "0 0 24 24",
 		body: '<path fill-rule="evenodd" d="M16.278 2c1.156 0 2.093.927 2.093 2.07v12.501a.74.74 0 00.744.709.74.74 0 00.743-.709V9.099a2.06 2.06 0 012.071-2.049A2.06 2.06 0 0124 9.1v6.561a.649.649 0 01-.652.645.649.649 0 01-.653-.645V9.1a.762.762 0 00-.766-.758.762.762 0 00-.766.758v7.472a2.037 2.037 0 01-2.048 2.026 2.037 2.037 0 01-2.048-2.026v-12.5a.785.785 0 00-.788-.753.785.785 0 00-.789.752l-.001 15.904A2.037 2.037 0 0113.441 22a2.037 2.037 0 01-2.048-2.026V18.04c0-.356.292-.645.652-.645.36 0 .652.289.652.645v1.934c0 .263.142.506.372.638.23.131.514.131.744 0a.734.734 0 00.372-.638V4.07c0-1.143.937-2.07 2.093-2.07zm-5.674 0c1.156 0 2.093.927 2.093 2.07v11.523a.648.648 0 01-.652.645.648.648 0 01-.652-.645V4.07a.785.785 0 00-.789-.78.785.785 0 00-.789.78v14.013a2.06 2.06 0 01-2.07 2.048 2.06 2.06 0 01-2.071-2.048V9.1a.762.762 0 00-.766-.758.762.762 0 00-.766.758v3.8a2.06 2.06 0 01-2.071 2.049A2.06 2.06 0 010 12.9v-1.378c0-.357.292-.646.652-.646.36 0 .653.29.653.646V12.9c0 .418.343.757.766.757s.766-.339.766-.757V9.099a2.06 2.06 0 012.07-2.048 2.06 2.06 0 012.071 2.048v8.984c0 .419.343.758.767.758.423 0 .766-.339.766-.758V4.07c0-1.143.937-2.07 2.093-2.07z"></path>',
 	},
+	ollama: {
+		// The llama mark from simple-icons (CC0), matching the glyph
+		// ollama/ollama ships. Inlined so the widget renders offline.
+		viewBox: "0 0 24 24",
+		body: '<path d="M16.361 10.26a.894.894 0 0 0-.558.47l-.072.148.001.207c0 .193.004.217.059.353.076.193.152.312.291.448.24.238.51.3.872.205a.86.86 0 0 0 .517-.436.752.752 0 0 0 .08-.498c-.064-.453-.33-.782-.724-.897a1.06 1.06 0 0 0-.466 0zm-9.203.005c-.305.096-.533.32-.65.639a1.187 1.187 0 0 0-.06.52c.057.309.31.59.598.667.362.095.632.033.872-.205.14-.136.215-.255.291-.448.055-.136.059-.16.059-.353l.001-.207-.072-.148a.894.894 0 0 0-.565-.472 1.02 1.02 0 0 0-.474.007Zm4.184 2c-.131.071-.223.25-.195.383.031.143.157.288.353.407.105.063.112.072.117.136.004.038-.01.146-.029.243-.02.094-.036.194-.036.222.002.074.07.195.143.253.064.052.076.054.255.059.164.005.198.001.264-.03.169-.082.212-.234.15-.525-.052-.243-.042-.28.087-.355.137-.08.281-.219.324-.314a.365.365 0 0 0-.175-.48.394.394 0 0 0-.181-.033c-.126 0-.207.03-.355.124l-.085.053-.053-.032c-.219-.13-.259-.145-.391-.143a.396.396 0 0 0-.193.032zm.39-2.195c-.373.036-.475.05-.654.086-.291.06-.68.195-.951.328-.94.46-1.589 1.226-1.787 2.114-.04.176-.045.234-.045.53 0 .294.005.357.043.524.264 1.16 1.332 2.017 2.714 2.173.3.033 1.596.033 1.896 0 1.11-.125 2.064-.727 2.493-1.571.114-.226.169-.372.22-.602.039-.167.044-.23.044-.523 0-.297-.005-.355-.045-.531-.288-1.29-1.539-2.304-3.072-2.497a6.873 6.873 0 0 0-.855-.031zm.645.937a3.283 3.283 0 0 1 1.44.514c.223.148.537.458.671.662.166.251.26.508.303.82.02.143.01.251-.043.482-.08.345-.332.705-.672.957a3.115 3.115 0 0 1-.689.348c-.382.122-.632.144-1.525.138-.582-.006-.686-.01-.853-.042-.57-.107-1.022-.334-1.35-.68-.264-.28-.385-.535-.45-.946-.03-.192.025-.509.137-.776.136-.326.488-.73.836-.963.403-.269.934-.46 1.422-.512.187-.02.586-.02.773-.002zm-5.503-11a1.653 1.653 0 0 0-.683.298C5.617.74 5.173 1.666 4.985 2.819c-.07.436-.119 1.04-.119 1.503 0 .544.064 1.24.155 1.721.02.107.031.202.023.208a8.12 8.12 0 0 1-.187.152 5.324 5.324 0 0 0-.949 1.02 5.49 5.49 0 0 0-.94 2.339 6.625 6.625 0 0 0-.023 1.357c.091.78.325 1.438.727 2.04l.13.195-.037.064c-.269.452-.498 1.105-.605 1.732-.084.496-.095.629-.095 1.294 0 .67.009.803.088 1.266.095.555.288 1.143.503 1.534.071.128.243.393.264.407.007.003-.014.067-.046.141a7.405 7.405 0 0 0-.548 1.873c-.062.417-.071.552-.071.991 0 .56.031.832.148 1.279L3.42 24h1.478l-.05-.091c-.297-.552-.325-1.575-.068-2.597.117-.472.25-.819.498-1.296l.148-.29v-.177c0-.165-.003-.184-.057-.293a.915.915 0 0 0-.194-.25 1.74 1.74 0 0 1-.385-.543c-.424-.92-.506-2.286-.208-3.451.124-.486.329-.918.544-1.154a.787.787 0 0 0 .223-.531c0-.195-.07-.355-.224-.522a3.136 3.136 0 0 1-.817-1.729c-.14-.96.114-2.005.69-2.834.563-.814 1.353-1.336 2.237-1.475.199-.033.57-.028.776.01.226.04.367.028.512-.041.179-.085.268-.19.374-.431.093-.215.165-.333.36-.576.234-.29.46-.489.822-.729.413-.27.884-.467 1.352-.561.17-.035.25-.04.569-.04.319 0 .398.005.569.04a4.07 4.07 0 0 1 1.914.997c.117.109.398.457.488.602.034.057.095.177.132.267.105.241.195.346.374.43.14.068.286.082.503.045.343-.058.607-.053.943.016 1.144.23 2.14 1.173 2.581 2.437.385 1.108.276 2.267-.296 3.153-.097.15-.193.27-.333.419-.301.322-.301.722-.001 1.053.493.539.801 1.866.708 3.036-.062.772-.26 1.463-.533 1.854a2.096 2.096 0 0 1-.224.258.916.916 0 0 0-.194.25c-.054.109-.057.128-.057.293v.178l.148.29c.248.476.38.823.498 1.295.253 1.008.231 2.01-.059 2.581a.845.845 0 0 0-.044.098c0 .006.329.009.732.009h.73l.02-.074.036-.134c.019-.076.057-.3.088-.516.029-.217.029-1.016 0-1.258-.11-.875-.295-1.57-.597-2.226-.032-.074-.053-.138-.046-.141.008-.005.057-.074.108-.152.376-.569.607-1.284.724-2.228.031-.26.031-1.378 0-1.628-.083-.645-.182-1.082-.348-1.525a6.083 6.083 0 0 0-.329-.7l-.038-.064.131-.194c.402-.604.636-1.262.727-2.04a6.625 6.625 0 0 0-.024-1.358 5.512 5.512 0 0 0-.939-2.339 5.325 5.325 0 0 0-.95-1.02 8.097 8.097 0 0 1-.186-.152.692.692 0 0 1 .023-.208c.208-1.087.201-2.443-.017-3.503-.19-.924-.535-1.658-.98-2.082-.354-.338-.716-.482-1.15-.455-.996.059-1.8 1.205-2.116 3.01a6.805 6.805 0 0 0-.097.726c0 .036-.007.066-.015.066a.96.96 0 0 1-.149-.078A4.857 4.857 0 0 0 12 3.03c-.832 0-1.687.243-2.456.698a.958.958 0 0 1-.148.078c-.008 0-.015-.03-.015-.066a6.71 6.71 0 0 0-.097-.725C8.997 1.392 8.337.319 7.46.048a2.096 2.096 0 0 0-.585-.041Zm.293 1.402c.248.197.523.759.682 1.388.03.113.06.244.069.292.007.047.026.152.041.233.067.365.098.76.102 1.24l.002.475-.12.175-.118.178h-.278c-.324 0-.646.041-.954.124l-.238.06c-.033.007-.038-.003-.057-.144a8.438 8.438 0 0 1 .016-2.323c.124-.788.413-1.501.696-1.711.067-.05.079-.049.157.013zm9.825-.012c.17.126.358.46.498.888.28.854.36 2.028.212 3.145-.019.14-.024.151-.057.144l-.238-.06a3.693 3.693 0 0 0-.954-.124h-.278l-.119-.178-.119-.175.002-.474c.004-.669.066-1.19.214-1.772.157-.623.434-1.185.68-1.382.078-.062.09-.063.159-.012z"/>',
+	},
+	deepseek: {
+		// The whale mark from simple-icons (CC0), matching DeepSeek's own
+		// logo. Inlined so the widget renders offline.
+		viewBox: "0 0 24 24",
+		body: '<path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45"/>',
+	},
 };
 
 // Display names mirror hermes_cli/models.py CANONICAL_PROVIDERS/_PROVIDER_LABELS
@@ -359,6 +376,7 @@ const PROVIDER_META = {
 	cursor: { name: "Cursor", mono: "CU" },
 	antigravity: { name: "Antigravity", mono: "AG" },
 	minimax: { name: "MiniMax", mono: "MM" },
+	ollama: { name: "Ollama", mono: "OL" },
 };
 
 function providerMeta(pid) {
@@ -1064,36 +1082,61 @@ function useQuota() {
 	});
 }
 
+// Statusbar tips must use the SDK portal, not native title (unreliable in
+// Electron). Preserve account/window lines; escape the short statusbar pane.
+function QuotaTip({ label, children }) {
+	return jsx(Tip, {
+		side: "top",
+		align: "start",
+		boundary: "viewport",
+		style: { maxWidth: "min(38rem, calc(100vw - 1.5rem))" },
+		label: jsx("div", {
+			style: {
+				whiteSpace: "pre-wrap",
+				maxHeight: "min(70vh, var(--radix-tooltip-content-available-height, 70vh))",
+				overflowY: "auto",
+			},
+			children: label,
+		}),
+		children,
+	});
+}
+
 // ---- single worst chip (worst mode) ---------------------------------------
 
 function QuotaChipWithBar() {
-	const { data } = useQuota();
+	const { data, isError, isPlaceholderData } = useQuota();
+	const stale = useCodexStale(data, isError || isPlaceholderData);
 	const providers =
-		data && data.providers ? Object.entries(data.providers) : [];
+		data && data.providers ? statusEntries(data.providers, stale) : [];
 	let worst = null;
 	let worstLabel = "";
+	let worstProvider = null;
 	for (const [pid, p] of providers) {
 		if (!isProviderEnabled(pid)) continue;
-		const r = worstWindow(p);
+		const r = p?.unavailable_reason ? null : p?.display_accounts ? p.display_remaining : worstWindow(p);
 		if (r == null) continue;
 		if (worst == null || r < worst) {
 			worst = r;
-			worstLabel = providerMeta(pid).name;
+			worstLabel = providerDisplayName(pid, p);
+			worstProvider = p;
 		}
 	}
 	if (worst == null) {
-		// Money in different currencies has no meaningful "worst" percentage.
-		const balances = providers.filter(([pid, p]) => isProviderEnabled(pid) && accountFacts(p).balances.length);
-		return balances.length
-			? jsx("span", { className: "inline-flex h-full items-center", children: balances.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
+		// Unknown Codex cannot be ranked. Keep it alongside the existing
+		// balance-only fallback; money has no meaningful worst percentage.
+		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
+		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1] });
+		return fallback.length
+			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, key: pid })) })
 			: jsx("span", { children: "Q:none" });
 	}
 	const tone = toneForRemaining(worst);
 	const fill = toneColor(tone);
-	const tip = makeWorstTip(worstLabel, worst, data && data.providers);
-	return jsxs("button", {
+	const tip = makeWorstTip(worstLabel, worst, data && data.providers, stale);
+	const button = jsxs("button", {
 		type: "button",
-		title: tip,
+		"aria-label": worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%") + " · Open Quota pane",
 		className:
 			"inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		onClick: () => {
@@ -1102,7 +1145,7 @@ function QuotaChipWithBar() {
 		children: [
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
-				children: worstLabel + " " + worst + "%",
+				children: worstLabel + " " + (worstProvider?.display_accounts ? codexValue(worst) : worst + "%"),
 			}),
 			jsx("span", {
 				className:
@@ -1114,21 +1157,99 @@ function QuotaChipWithBar() {
 			}),
 		],
 	});
+	return jsx(QuotaTip, { label: tip, children: button });
+}
+
+// Only explicit saved labels are display text; never infer an identity.
+// Re-sanitize cached input, matching the backend's 64-code-point bound.
+function codexDisplayLabel(value) {
+	return typeof value === "string" ? Array.from(value.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, "").trim()).slice(0, 64).join("").trimEnd() : "";
+}
+
+// Keep the real provider ID for icons, settings, and routing.
+function providerEntries(providers) {
+	return Object.entries(providers || {}).flatMap(([pid, p]) => {
+		const accounts = pid === "openai-codex" && p && Array.isArray(p.accounts)
+			? p.accounts.filter(asProvider) : [];
+		return accounts.length ? accounts.map((a, i) => [pid, { ...a, account_label: codexDisplayLabel(a.label) || `Account ${i + 1}` }]) : [[pid, pid === "openai-codex" && p ? { ...p, account_label: codexDisplayLabel(p.account_label) } : p]];
+	});
+}
+
+// Backend account order is validated saved priority, already deduplicated.
+// Keep expanded entries for the pane, but only one representative per provider
+// in the status bar. This is display selection, never runtime routing.
+function codexRemaining(account) {
+	const windows = asWindowList(account?.windows).filter((w) => ["Session", "Weekly"].includes(w.label));
+	if (account?.unavailable_reason || !windows.length || windows.some((w) => typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent))) return null;
+	return Math.max(0, Math.min(...windows.map((w) => 100 - w.used_percent)));
+}
+
+function codexValue(remaining) {
+	return remaining == null ? "unknown" : remaining === 0 ? "limit reached" : remaining < 1 ? "<1%" : `${Math.round(remaining)}%`;
+}
+
+function useCodexStale(data, untrusted = false) {
+	const interval = useValue(refreshIntervalAtom);
+	const now = useNow(5_000);
+	const received = useRef({ data, at: now });
+	if (received.current.data !== data) received.current = { data, at: now };
+	const age = data?.age_s;
+	return untrusted || typeof age !== "number" || !Number.isFinite(age) || age < 0 || age + (now - received.current.at) / 1000 >= interval;
+}
+
+function statusEntries(providers, stale = false) {
+	return Object.entries(providers || {}).map(([pid, provider]) => {
+		const accounts = pid === "openai-codex" && provider && provider.unavailable_reason !== "no-credentials"
+			? providerEntries({ [pid]: provider }).map(([, p]) => p).filter(asProvider) : [];
+		if (!accounts.length) return [pid, provider];
+		// A lone account needs no distinguishing name in the compact status bar.
+		// Preserve the original OpenAI Codex headline even with a saved label.
+		if (accounts.length === 1) accounts[0] = { ...accounts[0], account_label: "" };
+		const selected = (stale ? null : accounts.find((a) => codexRemaining(a) !== 0)) || accounts[0];
+		return [pid, { ...selected, display_selected_index: accounts.indexOf(selected), display_accounts: accounts, display_stale: stale, display_remaining: stale ? null : codexRemaining(selected) }];
+	});
+}
+
+function codexAccountsTip(provider) {
+	const lines = [];
+	for (const [index, account] of provider.display_accounts.entries()) {
+		const remaining = provider.display_stale ? null : codexRemaining(account);
+		const marker = index === provider.display_selected_index ? "●" : "○";
+		const error = account.unavailable_reason ? ` · ${account.unavailable_reason}` : "";
+		const value = codexValue(remaining) + (remaining > 0 ? " left" : "");
+		lines.push(`${marker} ${account.account_label || `Account ${index + 1}`} · ${value}${provider.display_stale ? " · stale" : ""}${error}`);
+		// Keep historical/model-specific details in the pane, not in this summary.
+		if (provider.display_stale || account.unavailable_reason) continue;
+		const windows = asWindowList(account.windows).filter((w) => ["Session", "Weekly"].includes(w.label));
+		for (const w of windows) {
+			const r = codexRemaining({ windows: [w] });
+			const value = codexValue(r) + (r > 0 ? " left" : "");
+			const countdown = relativeCountdown(w.reset_at);
+			const reset = countdown === "resetting…" ? countdown : countdown ? `resets in ${countdown}` : "";
+			// A single window already has its remaining value in the account line.
+			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
+		}
+	}
+	return lines.join("\n");
+}
+
+function providerDisplayName(pid, provider) {
+	return providerMeta(pid).name + (provider?.account_label ? ` · ${provider.account_label}` : "");
 }
 
 function ProviderChip({ pid, provider }) {
-	const r = provider && provider.unavailable_reason ? null : worstWindow(provider);
+	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? provider.display_remaining : worstWindow(provider);
 	const facts = accountFacts(provider);
-	const value = provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
-	const tone = providerTone(provider);
+	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
+	const tone = provider?.display_accounts ? toneForRemaining(r) : providerTone(provider);
 	const dot = toneColor(tone);
-	const label = providerMeta(pid).name;
+	const label = providerDisplayName(pid, provider);
 	const tip = makeProviderTip(pid, provider);
-	return jsxs(
+	const button = jsxs(
 		"button",
 		{
 			type: "button",
-			title: tip,
+			"aria-label": `${label} ${value} · Open Quota pane`,
 			className: cn(
 				"inline-flex h-full items-center gap-1 px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
@@ -1143,26 +1264,31 @@ function ProviderChip({ pid, provider }) {
 			],
 		},
 	);
+	return jsx(QuotaTip, { label: tip, children: button });
 }
 
-// Build a rich multiline tip: every provider with data, listing ALL its
-// windows (Session, Spark 5h, Spark Weekly, ...) each with % left + reset.
-function makeWorstTip(worstLabel, worst, providersObj) {
+// Keep other providers' window details; Codex uses its compact account summary.
+function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 	if (!providersObj) return `Quota · lowest ${worst}% (${worstLabel})`;
 	const blocks = [];
-	for (const [pid, p] of Object.entries(providersObj)) {
-		if (!isProviderEnabled(pid) || !isConfigured(p)) continue;
-		const lines = providerWindowLines(pid, p);
+	let hasCodex = false;
+	for (const [pid, p] of statusEntries(providersObj, stale)) {
+		if (!isProviderEnabled(pid) || (!p?.display_accounts && !isConfigured(p))) continue;
+		if (p?.display_accounts) hasCodex = true;
+		const lines = p?.display_accounts ? [makeProviderTip(pid, p)] : providerWindowLines(pid, p);
 		if (lines.length) blocks.push(lines.join("\n"));
 	}
 	if (blocks.length === 0) return `Quota · lowest ${worst}% (${worstLabel})`;
-	return `Quota breakdown:\n${blocks.join("\n")}\nClick to open Quota pane`;
+	if (hasCodex && blocks.length === 1) return blocks[0];
+
+	return `Quota breakdown:\n${blocks.join("\n")}${hasCodex ? "" : "\nClick to open Quota pane"}`;
 }
 
 // Build a rich multiline tip for a single provider: lists ALL its windows
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
-	const meta = providerMeta(pid);
+	if (provider?.display_accounts) return codexAccountsTip(provider);
+	const meta = { name: providerDisplayName(pid, provider) };
 	if (!provider) return `${meta.name}: unavailable`;
 	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
 	const lines = providerWindowLines(pid, provider);
@@ -1195,16 +1321,17 @@ function providerWindowLines(pid, provider) {
 function StatusBar() {
 	const showStatusBar = useValue(showStatusBarAtom);
 	const mode = useValue(statusbarModeAtom);
-	const { data, isError } = useQuota();
+	const { data, isError, isPlaceholderData } = useQuota();
+	const stale = useCodexStale(data, isError || isPlaceholderData);
 	if (!showStatusBar) return null;
 	if (mode === "worst") return jsx(QuotaChipWithBar, {});
-	if (isError || !data || !data.providers)
+	if (!data || !data.providers)
 		return jsx(StatusDot, { tone: "muted" });
-	// Default: only providers with real data. The cherry-picker can only hide
-	// more, never show unavailable ones here (the pane shows those muted).
-	const entries = Object.entries(data.providers)
-		.filter(([pid]) => isProviderEnabled(pid))
-		.filter(([, p]) => isConfigured(p));
+	// Keep unavailable saved accounts visible alongside healthy siblings.
+	// Unconfigured providers remain hidden; visibility settings apply to all accounts.
+	const entries = statusEntries(data.providers, stale)
+		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
+		.filter(([, p]) => p?.display_accounts || isConfigured(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
@@ -1241,7 +1368,7 @@ function ProviderRow({ id, provider }) {
 	const reason = provider ? provider.unavailable_reason : "no-data";
 	const details = asList(provider && provider.details);
 	const facts = accountFacts(provider);
-	const displayName = providerMeta(id).name;
+	const displayName = providerDisplayName(id, provider);
 	// Inline sizing is intentional: plugin-only utility classes might not be
 	// in the host's compiled Tailwind stylesheet.
 	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
@@ -1711,7 +1838,7 @@ function QuotaPane() {
 		const disabled = disabledProvidersAtom.get();
 		// Default view: only providers with real data. Providers without data
 		// (unconfigured / opt-in off) collapse into a muted "no data" section.
-		const all = Object.entries(data.providers).filter(
+		const all = providerEntries(data.providers).filter(
 			([pid]) => !disabled.includes(pid),
 		);
 		const withData = all.filter(([, p]) => isConfigured(p));
@@ -1719,8 +1846,8 @@ function QuotaPane() {
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				...withData.map(([id, p]) =>
-					jsx(ProviderRow, { id, provider: p, key: id }),
+				...withData.map(([id, p], index) =>
+					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
 				),
 				withoutData.length > 0
 					? jsxs("details", {
@@ -1733,8 +1860,8 @@ function QuotaPane() {
 								}),
 								jsx("div", {
 									className: "mt-1.5 flex flex-col gap-2",
-									children: withoutData.map(([id, p]) =>
-										jsx(ProviderRow, { id, provider: p, key: id }),
+									children: withoutData.map(([id, p], index) =>
+										jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
 									),
 								}),
 							],

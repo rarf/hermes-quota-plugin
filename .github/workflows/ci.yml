@@ -99,3 +99,31 @@ jobs:
               sys.exit(f"plugin.yaml: version '{version}' is not semver X.Y.Z")
           print(f"plugin.yaml version {version} OK")
           PY
+
+  plugin-scanner:
+    name: Plugin scanner (Hermes install-time gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # hermes-agent requires 3.11+ to run the scanner. The plugin itself
+          # still supports 3.9 -- that is what the matrix above covers.
+          python-version: "3.12"
+
+      - name: Prove the gate can still see the blocking class
+        # A scanner demotion upstream (or a broken sparse fetch) must fail here
+        # rather than turn the scan below green on an installable-looking tree.
+        run: python scripts/scan_plugin.py --self-test
+
+      - name: Run the Hermes plugin scanner against this tree
+        run: python scripts/scan_plugin.py --json scanner-report.json
+
+      - name: Keep the findings even when the scan fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-scanner-report
+          path: scanner-report.json
+          if-no-files-found: ignore

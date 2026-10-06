@@ -1,5 +1,5 @@
 name: quota
-version: 2.8.1
+version: 2.9.0
 description: "Per-provider quota / rate-limit status via /quota command and desktop widget. Reads precomputed quota_cache.json so the widget never does network I/O. Cherry-pick providers in Settings. Nous Portal works on free accounts; Gemini detects tier via loadCodeAssist; Grok uses the REST rate-limits endpoint. Antigravity requires antigravityEnabled=true (default off), reads Windows Credential Manager, macOS Keychain, or the Linux agy token file, refreshes with Antigravity's installed-app OAuth client identity, and sends User-Agent antigravity/2.8.0 windows/amd64. Pane detail: clean or dense."
 author: rarf
 kind: standalone

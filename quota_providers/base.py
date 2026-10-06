@@ -71,9 +71,13 @@ class QuotaResult:
     details: list[str] = field(default_factory=list)
     account_balances: list[AccountBalance] = field(default_factory=list)
     api_calls_available: Optional[bool] = None
+    # Optional per-account records; no identity or credential material.
+    accounts: list[QuotaResult] = field(default_factory=list)
+    # Optional explicit display label for the legacy single-account shape.
+    account_label: Optional[str] = None
 
     def has_data(self) -> bool:
-        return (bool(self.windows) or bool(self.details) or bool(self.account_balances)) and self.unavailable_reason is None
+        return (bool(self.windows) or bool(self.details) or bool(self.account_balances) or any(a.has_data() for a in self.accounts)) and self.unavailable_reason is None
 
 
 def build_unavailable(label: str, reason: str) -> QuotaResult:

@@ -146,6 +146,48 @@ The provider should appear in `/quota` and in the Desktop pane after
 **Reload desktop plugins** (⌘K). Remember: widget-only changes reload; any new
 Python backend file needs a full Desktop restart.
 
+## Run the plugin scanner
+
+Hermes scans every plugin it installs, with
+[`tools/plugin_guard.py`](https://github.com/NousResearch/hermes-agent) from
+hermes-agent. **A critical finding there does not fail an ordinary unit test —
+it stops people installing or updating this plugin**, and the `plugin-scanner`
+CI job checks for it on every PR. Running it locally is the same check without
+the round trip:
+
+```bash
+python3 scripts/scan_plugin.py
+```
+
+The scanner is fetched from a **pinned Hermes release** (`SCANNER_REF` in
+`scripts/scan_plugin.py`), not from `main`. Pinning is the difference between a
+gate and a decoration: on 2026-10-04 `main` demoted the Google installed-app
+client literals to `high` (`is_google_installed_app_secret`) while every stable
+build still called them `critical`, so a `main`-tracking job went green on a tree
+that stable Hermes refuses to install — which is exactly how the two literals
+shipped through several releases unnoticed (issue #51). Bump `SCANNER_REF` in its
+own commit when a release is targeted.
+
+The gate fails on a `critical` finding in any category, or on a `high` finding in
+`credential_exposure`, because a scanner-side demotion only moves the severity —
+the class still blocks community installs. `--self-test` plants a secret-shaped
+literal in a temp tree and requires the scanner to report it as blocking; CI runs
+it before every scan, so a scanner bump that stops seeing the class fails loudly
+instead of passing quietly.
+
+Matched values are redacted in the output. A finding's file and line are enough
+to locate it; copying credential-shaped strings into logs is worth avoiding.
+
+If a finding is legitimate — a public OAuth client id, a fixture holding a
+hostile string — do not add a suppression. The scanner already steps findings
+down inside test trees, and a blanket ignore teaches the next author the same
+thing. Restructure the code, or argue it upstream in
+[hermes-agent](https://github.com/NousResearch/hermes-agent).
+
+Because the scanner is pinned, a PR cannot go red because upstream changed its
+mind; it goes red because this tree changed, or because a deliberate
+`SCANNER_REF` bump brought a stricter scanner.
+
 ## Checklist
 
 - [ ] Fetcher never raises; every failure returns `build_unavailable(...)`
@@ -156,3 +198,4 @@ Python backend file needs a full Desktop restart.
 - [ ] Registered in `__init__.py`; `PROVIDER_META` entry added
 - [ ] Unit tests added and passing offline
 - [ ] `plugin.yaml` version bumped; live refresh verified
+- [ ] **Plugin scanner clean** — no `critical`, no `high` in `credential_exposure`; see [Run the plugin scanner](#run-the-plugin-scanner)

@@ -33,6 +33,11 @@ def nodes(tree):
             yield from nodes(item)
 
 
+def tooltip_text(tree):
+    """SDK Tip labels only: never confuse a native title with a working tip."""
+    return '\n'.join(text(n['props']['label']) for n in nodes(tree) if n.get('type') == 'Tip')
+
+
 def text(tree):
     if isinstance(tree, dict):
         return text(tree.get('props', {}).get('children'))

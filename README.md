@@ -180,10 +180,38 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Read-only credential use; Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details. If the session expires, run `cursor-agent login`; the plugin never exchanges refresh tokens or writes to Cursor's credential store. |
 | `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
+| `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/usage` (spend, per-model request counts) and `POST /api/me` (plan label, signup date). The **Monthly** bar is the server-reported usage fraction. The reset is the next monthly anniversary of `CreatedAt`, matching Ollama's documented "resets monthly on the same day of the month your plan started"; the day is derived because no endpoint returns a reset timestamp. **No balance value** — Ollama exposes none; see below. |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Ollama
+
+Ollama Cloud quota is read from two endpoints: `GET /api/usage` for the spend
+and per-model request counts, and `POST /api/me` for the plan label and the
+signup date. Set `OLLAMA_API_KEY` to the `sk-…` key from
+[ollama.com/settings](https://ollama.com/settings).
+
+**There is no balance or credit value, because Ollama does not expose one.**
+The settings page shows a dollar balance, but it is not reachable from the
+API: of 36 candidate paths tried with both `GET` and `POST`, only `/api/usage`
+and `/api/me` respond, and `/api/usage` ignores `?include=balance` and
+`?include=credits`. This has been reported upstream and is not being worked
+on yet:
+
+- [ollama/ollama#12532 — Expose cloud usage stats via `/api/me`](https://github.com/ollama/ollama/issues/12532)
+- [ollama/ollama#18653 — Add an API endpoint for credit balance](https://github.com/ollama/ollama/issues/18653)
+
+Until one of those lands, the card shows spend and request counts rather than
+a fabricated `$0`. The remaining path — scraping `ollama.com/settings` with a
+`__Secure-session` browser cookie — is a sensitive-source reader that would
+need to be opt-in and disabled by default, like `grok`. It is not implemented
+here.
+
+Until `/api/me` exists the plugin already handles the account, but it cannot
+know the plan or derive the reset, so the card falls back to spend and request
+counts alone. Until the balance endpoint exists there is nothing to add.
 
 ### Antigravity
 
@@ -242,6 +270,51 @@ has no quota denominator so no percentage is ever reported. Missing credentials
 and failed requests remain explicit unavailable states. Requests have a timeout,
 bounded response size, and no redirects; error details and credentials are never
 written into the display cache.
+
+### OpenAI Codex: saved accounts
+
+Codex shows one status-bar chip: the highest-priority distinct saved account
+that is **not definitely exhausted**. Fresh quota recovery restores a
+higher-priority account. This display choice does not change inference routing.
+Only generic **Session/Weekly** windows govern selection; model-specific limits
+(including Spark), plans and banked resets remain in the Quota pane.
+
+Hover uses the desktop SDK tooltip to list accounts in priority order with
+remaining quota and relative reset times. `●` marks the displayed account.
+Unknown, expired, failed or stale data is **unknown**, not exhaustion. Reset
+countdowns never imply recovery; a fresh poll is required. When every account
+is definitely exhausted, the chip says **limit reached**. All/Worst modes use
+this same Codex representative, without combining account percentages.
+
+Saved credential labels distinguish multiple accounts; blank labels use
+`Account N` in priority order. Labels are intentional local display text: they
+appear in the cache, pane, CLI/footer and widget. Choose names suitable for
+screenshots. Controls are stripped and labels are limited to 64 characters;
+email, preferred-username and UPN values copied into a label by the core are
+suppressed, and no name is inferred from a token or account ID. A single distinct
+account keeps the original **OpenAI Codex XX%** headline without a name.
+
+Discovery reads saved `auth.json` snapshots using Hermes' home/root helpers:
+a nonempty profile pool takes precedence, otherwise the root pool is used;
+an empty effective pool falls back to legacy provider state. Credentials with
+the same account and subject are queried once. The best-priority label is
+retained when an unexpired saved duplicate supplies the token. Without both
+identity hints, only exact duplicate tokens can be collapsed. Fallback account
+numbers are positional, not permanent identifiers.
+
+Polling never refreshes tokens, selects/rotates the runtime pool, writes auth
+files or redeems reset credits. Expired tokens and HTTP 401/403 require normal
+Hermes sign-in. Endpoints follow Hermes' configured backend URL helpers
+(including the older usage-URL helper); HTTP behavior remains based on `httpx`.
+Requests are collected independently within a shared 15-second budget, so one
+slow account cannot discard another's result. The outer cache sweep bounds
+stalled discovery; blocked workers are not forcibly cancelled. Raw credentials
+and exception bodies are not included in quota records.
+
+The backend and widget should be updated together: multiple accounts use the
+optional `providers["openai-codex"].accounts` field, while one account retains
+the original top-level windows. The pane and `/quota openai-codex` show separate
+account details, not a summed quota.
 
 ### OpenRouter
 
@@ -393,9 +466,20 @@ bash -n install.sh uninstall.sh
 python -m py_compile __init__.py commands.py quota_cache.py quota_providers/*.py
 python -m unittest discover -s tests -p "test_*.py"
 node --check desktop/plugin.js
+python scripts/scan_plugin.py
 hermes plugins doctor quota
 hermes quota refresh
 ```
+
+`scan_plugin.py` runs Hermes' own plugin scanner against this tree — the same
+code that runs when someone installs or updates the plugin. **A critical finding
+there stops people installing the plugin**, and the `plugin-scanner` CI job
+checks for it on every PR. The scanner is pinned to a Hermes release instead of
+`main`, because a scanner-side demotion must not turn the gate green while stable
+installs still refuse the tree; the gate fails on any `critical`, or on `high` in
+`credential_exposure`, and `--self-test` proves it can still see that class. It
+needs Python 3.11+, while the plugin itself supports 3.9. See
+[adding a provider](docs/add-provider.md#run-the-plugin-scanner).
 
 Widget changes can be checked without launching the app — the harness renders the
 real `desktop/plugin.js` against a real payload and asserts the pane's contract
@@ -414,7 +498,9 @@ For optional real Chromium geometry tests, see [widget layout tests](docs/widget
 
 To add a provider, write a fetcher in `quota_providers/` that returns a
 `QuotaResult` and register it. The cache and the widget need no
-provider-specific changes.
+provider-specific changes. [docs/add-provider.md](docs/add-provider.md) is the
+full walkthrough, including the merge checklist — run the scanner before you
+push, not after someone reports the install is blocked.
 
 ## Acknowledgements
 
