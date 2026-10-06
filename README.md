@@ -241,7 +241,8 @@ Saved credential labels distinguish multiple accounts; blank labels use
 `Account N` in priority order. Labels are intentional local display text: they
 appear in the cache, pane, CLI/footer and widget. Choose names suitable for
 screenshots. Controls are stripped and labels are limited to 64 characters;
-no name is inferred from an email, account ID or token. A single distinct
+email, preferred-username and UPN values copied into a label by the core are
+suppressed, and no name is inferred from a token or account ID. A single distinct
 account keeps the original **OpenAI Codex XX%** headline without a name.
 
 Discovery reads saved `auth.json` snapshots using Hermes' home/root helpers:

@@ -484,8 +484,17 @@ def _parse_codex_payload(payload: dict) -> QuotaResult:
     rate_limit = payload.get("rate_limit")
     if not isinstance(rate_limit, dict):
         rate_limit = {}
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        w = _window(rate_limit.get(key) or {}, label)
+    duration_labels = {18_000: "Session", 604_800: "Weekly"}
+    for key, fallback in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+        raw_window = rate_limit.get(key)
+        raw_window = raw_window if isinstance(raw_window, dict) else {}
+        seconds = raw_window.get("limit_window_seconds")
+        label = fallback
+        if isinstance(seconds, int) and not isinstance(seconds, bool):
+            label = duration_labels.get(seconds, fallback)
+        elif isinstance(seconds, float) and math.isfinite(seconds):
+            label = duration_labels.get(int(seconds), fallback)
+        w = _window(raw_window, label)
         if w is not None:
             windows.append(w)
 

@@ -13,9 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from quota_providers import builtin, codex
 
 
-def token(account, subject="synthetic-subject", exp=4102444800, nonce="one"):
+def token(account, subject="synthetic-subject", exp=4102444800, nonce="one", email=None, **auth_claims):
     claims = {"sub": subject, "exp": exp, "nonce": nonce,
-              "https://api.openai.com/auth": {"chatgpt_account_id": account}}
+              "https://api.openai.com/auth": {"chatgpt_account_id": account, **auth_claims}}
+    if email:
+        claims["email"] = email
     body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return "synthetic." + body + ".signature"
 
@@ -99,6 +101,32 @@ def payload(used):
 
 
 class CodexAccountsTests(unittest.TestCase):
+    def test_core_generated_email_label_is_not_exposed_but_custom_alias_is(self):
+        rows = [
+            {'access_token': token('a', email='private@example.invalid'), 'label': 'private@example.invalid'},
+            {'access_token': token('b', email='other@example.invalid'), 'label': 'Work account'},
+        ]
+        with mock.patch.dict(sys.modules, auth_modules(rows)), mock_http(side_effect=lambda *a, **k: BytesIO(json.dumps(payload(21)).encode())):
+            result = builtin._fetch_codex_with_models()
+        self.assertEqual([account.label for account in result.accounts], ['Account 1', 'Work account'])
+        self.assertNotIn('private@example.invalid', repr(result))
+
+    def test_codex_residency_claim_is_sent_as_required_header(self):
+        rows = [{'access_token': token('a', chatgpt_data_residency='eu')}]
+        with mock.patch.dict(sys.modules, auth_modules(rows)), mock_http(return_value=BytesIO(json.dumps(payload(21)).encode())) as http:
+            builtin._fetch_codex_with_models()
+        self.assertEqual(http.call_args.args[0].headers.get('x-openai-internal-codex-residency'), 'eu')
+
+    def test_primary_window_with_weekly_duration_is_labeled_weekly(self):
+        raw = payload(21)
+        raw['rate_limit'] = {
+            'primary_window': {'used_percent': 21, 'limit_window_seconds': 604800},
+            'secondary_window': {'used_percent': 42, 'limit_window_seconds': 18000},
+        }
+        raw['additional_rate_limits'] = []
+        result = builtin._parse_codex_payload(raw)
+        self.assertEqual([window.label for window in result.windows], ['Weekly', 'Session'])
+
     def test_saved_labels_follow_best_priority_even_with_replacement_token(self):
         rows = [
             {'access_token': token('a'), 'priority': 9, 'label': 'Later alias'},

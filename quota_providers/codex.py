@@ -28,6 +28,15 @@ def display_label(value):
                    {"Cc", "Cf", "Cs", "Zl", "Zp"}).strip()[:64].rstrip()
 
 
+def _explicit_display_label(row, claims):
+    """Hide core-generated identity labels while retaining user-chosen aliases."""
+    value = display_label(row.get("label"))
+    if not value:
+        return ""
+    generated = {display_label(claims.get(key)) for key in ("email", "preferred_username", "upn")}
+    return "" if value in generated else value
+
+
 def _claims(token):
     """Decode a local grouping/expiry hint, not authentication proof."""
     try:
@@ -135,7 +144,7 @@ def _credentials():
             account = saved_account.strip()  # legacy explicit header wins, not a grouping key
         expired = _is_expired(claims.get("exp")) or _is_expired(row.get("expires_at"))
         if identity not in unique:
-            unique[identity] = (token, account, expired, display_label(row.get("label")), row.get("base_url"), pooled)
+            unique[identity] = (token, account, expired, _explicit_display_label(row, claims), row.get("base_url"), pooled)
         elif unique[identity][2] and not expired:
             # Token freshness must not replace the best-priority display label.
             unique[identity] = (token, account, expired, unique[identity][3], row.get("base_url"), pooled)
@@ -183,6 +192,12 @@ def _fetch_account(credential, parse, deadline):
         }
         if account:
             headers["ChatGPT-Account-Id"] = account
+        claims = _claims(token)
+        auth_claims = claims.get("https://api.openai.com/auth")
+        if isinstance(auth_claims, dict):
+            residency = auth_claims.get("chatgpt_data_residency") or auth_claims.get("chatgpt_compute_residency")
+            if isinstance(residency, str) and residency.strip():
+                headers["x-openai-internal-codex-residency"] = residency.strip()
         usage_url = _usage_url(base_url, pooled)
         if deadline.expired():
             return build_unavailable("openai-codex", "timeout")
