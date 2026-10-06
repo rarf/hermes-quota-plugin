@@ -409,6 +409,7 @@ def fetch_usage(
     *,
     attempts: int = _RETRY_ATTEMPTS,
     _sleep: Any = time.sleep,
+    deadline: Optional[Deadline] = None,
 ) -> QuotaResult:
     total_attempts = max(1, attempts)
     reason: Optional[str] = None
@@ -416,7 +417,9 @@ def fetch_usage(
     # The retry budget prevents new attempts/backoffs once spent and caps each
     # urllib socket timeout. It is not an absolute response deadline: a server
     # that trickles bytes can keep one response active beyond this budget.
-    deadline = Deadline(_FETCH_BUDGET_S)
+    # Direct callers get a provider-local budget; a multi-key sweep supplies
+    # one shared deadline so serial calls cannot reset the budget per key.
+    deadline = deadline or Deadline(_FETCH_BUDGET_S)
 
     for attempt in range(total_attempts):
         if deadline.expired():
@@ -468,11 +471,108 @@ def fetch_usage(
     return QuotaResult(label=_PROVIDER_ID, windows=windows, plan=plan, unavailable_reason=None)
 
 
+def _pool_entries() -> list[tuple[str, str]]:
+    """Snapshot Hermes' effective pool read-only, with env-seeded keys included.
+
+    A nonempty profile pool wins; otherwise use the global-root pool. We read
+    the auth files directly to avoid core readers that can repair/write them.
+    Numbered OPENCODE_GO_API_KEY_N variables are then appended if not already
+    present, matching the runtime pool's env seeding behavior.
+    """
+    keys: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    try:
+        from hermes_constants import get_hermes_home, get_default_hermes_root
+
+        local_home = get_hermes_home()
+        global_home = get_default_hermes_root()
+        stores = []
+        for home in (local_home, global_home):
+            if home in [p for p, _ in stores]:
+                continue
+            try:
+                with open(os.path.join(str(home), "auth.json"), "r", encoding="utf-8-sig") as fh:
+                    store = json.load(fh)
+                stores.append((home, store if isinstance(store, dict) else {}))
+            except (OSError, ValueError, UnicodeError):
+                stores.append((home, {}))
+        local_store = next((data for home, data in stores if home == local_home), {})
+        global_store = next((data for home, data in stores if home == global_home), {})
+        local_rows = (local_store.get("credential_pool") or {}).get(_PROVIDER_ID) or []
+        global_rows = (global_store.get("credential_pool") or {}).get(_PROVIDER_ID) or []
+        entries = local_rows if isinstance(local_rows, list) and local_rows else global_rows
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            token = entry.get("access_token")
+            if not isinstance(token, str) or not token.strip():
+                continue
+            token = token.strip()
+            if token in seen:
+                continue
+            seen.add(token)
+            label = str(entry.get("label") or entry.get("id") or "")
+            label = label.split("@")[0][:14] or f"key{len(keys) + 1}"
+            keys.append((token, label))
+    except Exception:
+        # Do not make a broken profile store fatal; preserve legacy resolution.
+        keys = []
+        seen.clear()
+
+    # Hermes can seed a pool from numbered environment siblings. The base key
+    # remains the fallback resolver's responsibility when no pool was saved.
+    env_names = ["OPENCODE_GO_API_KEY"]
+    for index in range(2, 101):
+        name = f"OPENCODE_GO_API_KEY_{index}"
+        if os.environ.get(name):
+            env_names.append(name)
+    for name in env_names:
+        value = os.environ.get(name)
+        token = value.strip().strip("\\\"'") if value else ""
+        if token and token not in seen:
+            seen.add(token)
+            keys.append((token, f"env{len(keys) + 1}"))
+    if keys:
+        return keys
+    single = resolve_api_key()
+    return [(single, "key1")] if single else []
+
+
 def fetch_opencode_go_quota() -> QuotaResult:
-    api_key = resolve_api_key()
-    if not api_key:
+    entries = _pool_entries()
+    if not entries:
         return build_unavailable(_PROVIDER_ID, "no-credentials")
-    return fetch_usage(api_key)
+
+    deadline = Deadline(_FETCH_BUDGET_S)
+    windows: list[QuotaWindow] = []
+    plan: Optional[str] = None
+    failed: list[str] = []
+    for index, (token, label) in enumerate(entries):
+        if deadline.expired():
+            failed.extend(f"{pending_label}: timeout" for _, pending_label in entries[index:])
+            break
+        res = fetch_usage(token, deadline=deadline)
+        if res.unavailable_reason:
+            failed.append(f"{label}: {res.unavailable_reason}")
+            continue
+        plan = plan or res.plan
+        for w in res.windows:
+            windows.append(
+                QuotaWindow(
+                    label=f"{w.label} · {label}",
+                    used_percent=w.used_percent,
+                    reset_at=w.reset_at,
+                )
+            )
+    if not windows:
+        return build_unavailable(_PROVIDER_ID, "no-data", details=failed)
+    return QuotaResult(
+        label=_PROVIDER_ID,
+        windows=windows,
+        plan=plan,
+        unavailable_reason=None,
+        details=failed,
+    )
 
 
 from .registry import register as _register  # noqa: E402
