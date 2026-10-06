@@ -71,6 +71,9 @@ const sdk = {
   SegmentedControl: mk('div'),
   StatusDot: mk('span'),
   Switch: mk('button'),
+  // Static markup has no hover state. Do not fake a tooltip with title;
+  // tests/widget_hover.cjs exercises the actual SDK Tip in Chromium.
+  Tip: ({ children }) => children,
   useMutation: () => ({ mutate: () => {}, isPending: false }),
   usePluginI18n: id => (key, ...args) => {
     const v = (strings[id] || {})[key]

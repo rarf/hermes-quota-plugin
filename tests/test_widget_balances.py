@@ -2,7 +2,7 @@
 import shutil
 import unittest
 
-from widget_harness import nodes, render, text  # noqa: F401  (used by the tests below)
+from widget_harness import nodes, render, text, tooltip_text  # noqa: F401  (used by the tests below)
 
 BALANCE = {'windows': [], 'details': [], 'account_balances': [
     {'currency': 'USD', 'total_balance': '12.50', 'granted_balance': '0', 'topped_up_balance': '12.50'}], 'api_calls_available': True}
@@ -33,7 +33,7 @@ class WidgetBalanceTests(unittest.TestCase):
     def test_balance_chip_not_dash(self):
         tree = render(component='chip', provider=BALANCE)
         self.assertIn('$12.50 USD', text(tree))
-        self.assertIn('Account balance', tree['props']['title'])
+        self.assertIn('Account balance', tooltip_text(tree))
         self.assertNotIn('%', text(tree))
 
     def test_zero_and_unavailable_calls_not_missing_data(self):
@@ -58,7 +58,7 @@ class WidgetBalanceTests(unittest.TestCase):
         for component in ('row', 'chip'):
             tree = render(component=component, provider=p)
             self.assertNotIn('$12.50', text(tree))
-            self.assertIn('http-429', text(tree) + tree['props'].get('title', ''))
+            self.assertIn('http-429', text(tree) + tooltip_text(tree))
 
     def test_no_balance_is_not_zero(self):
         for value in (None, '', True, 'NaN', 'Infinity'):

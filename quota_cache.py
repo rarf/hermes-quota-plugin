@@ -47,6 +47,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from .quota_providers import PROVIDER_FETCHERS, QuotaResult
+from .quota_providers.codex import display_label
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +95,26 @@ def quota_cache_age_seconds() -> Optional[float]:
         return None
 
 
+def iter_account_records(providers):
+    """Expand optional Codex accounts without changing the provider identity."""
+
+    for name, record in providers.items():
+        accounts = record.get("accounts") if name == "openai-codex" and isinstance(record, dict) else None
+        if isinstance(accounts, list) and accounts:
+            for index, account in enumerate(accounts):
+                if isinstance(account, dict):
+                    label = display_label(account.get("label")) or f"Account {index + 1}"
+                    yield name, {**account, "label": f"{name} · {label}"}
+        elif name == "openai-codex" and isinstance(record, dict) and display_label(record.get("account_label")):
+            yield name, {**record, "label": f"{name} · {display_label(record['account_label'])}"}
+        else:
+            yield name, record
+
+
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     return {
+        **({"account_label": res.account_label} if res.account_label else {}),
+        **({"accounts": [_result_to_record(a) for a in res.accounts]} if res.accounts else {}),
         "label": res.label,
         "plan": res.plan,
         "unavailable_reason": res.unavailable_reason,

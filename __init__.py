@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from .quota_cache import read_quota_cache, quota_cache_age_seconds, MAX_AGE_S
+from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, MAX_AGE_S
 from . import commands
 
 
@@ -30,7 +30,7 @@ def _format_quota_block(quota_cache: dict[str, Any]) -> str:
     if not providers:
         return ""
     segs: list[str] = ["📊 quota:"]
-    for name, rec in providers.items():
+    for name, rec in iter_account_records(providers):
         if not isinstance(rec, dict):
             continue
         label = rec.get("label") or name
