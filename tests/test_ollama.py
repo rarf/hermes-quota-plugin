@@ -218,18 +218,16 @@ class LiveAccountCardTests(unittest.TestCase):
     def test_the_card_carries_no_explanatory_prose(self):
         """Detail lines are quota facts, not footnotes.
 
-        Two lines were tried and removed: a pointer to ollama.com/settings for
-        per-model usage (not in the API, "coming soon" with no tracker behind
-        it) and a note that Total spend spans both pools. Both are real
-        information and both belong in the README -- on the card they read as
-        commentary sitting among numbers, and the caveat lines fired even when
-        the payload carried no figures at all.
+        Two explanatory lines were written and then removed, one of them a
+        pointer to the web UI for a figure the API no longer returns. Both are
+        real information and both belong in the README -- on the card they read
+        as commentary sitting among numbers, and the caveat lines fired even
+        when the payload carried no figures at all.
         """
         for line in _fetch_real().details:
             with self.subTest(line=line):
                 self.assertNotIn("per-model", line.lower())
                 self.assertNotIn("ollama.com", line.lower())
-                self.assertNotIn("coming soon", line.lower())
                 self.assertTrue(
                     line.startswith(("Included credits:", "Purchased credits:",
                                      "Total spend (", "Requests (", "Tokens (")),

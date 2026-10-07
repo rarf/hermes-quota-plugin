@@ -65,13 +65,6 @@ was rewritten as a timeseries and no longer returns `activity` / `limits`:
 `range` is one of `24h` (hourly buckets), `7d` or `30d` (daily). Anything else
 returns 400, as does any unrecognised parameter.
 
-**No per-model breakdown.** The pre-#18829 response carried `activity.models`
-and `limits.monthly.models`; the timeseries carries neither, and per-request
-totals only. Ollama's docs list "usage breakdowns by model and API key" under
-*Coming soon* with no tracker behind it, so the card reports range totals and
-says nothing about the per-model figures it used to show — a missing feature is
-not a fact worth a line on every card.
-
 **No plan.** `POST /api/me` returns `"Plan": "free"`, but that is a write-shaped
 request to repeat on every refresh for a label, so it is not used. `plan` stays
 None.
@@ -338,11 +331,7 @@ def _windows(included) -> list[QuotaWindow]:
 
 
 def _usage_details(usage) -> list[str]:
-    """Spend, request and token lines from /api/usage's `totals`.
-
-    Per-model breakdown is gone with the old response shape and Ollama lists it
-    as "coming soon", so there is nothing per-model to report.
-    """
+    """Spend, request and token lines from /api/usage's `totals`."""
     if not isinstance(usage, dict):
         return []
     totals = usage.get("totals")

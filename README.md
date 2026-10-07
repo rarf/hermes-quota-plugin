@@ -224,15 +224,6 @@ two paid-model requests billed to purchased credit. The card labels the line
 (`balance_usd: 2.43893`) is per-token rounding, not resolution; a nonzero
 sub-cent balance keeps extra digits so it cannot read as `$0.00`.
 
-**Per-model usage is not in the API.** The pre-#18829 response carried
-`activity.models` and `limits.monthly.models`; the timeseries carries neither.
-`/api/usage/models`, `?granularity=model`, `/api/activity` and
-`/api/models/usage` all 404/400. Ollama's
-[`cloud-usage.mdx`](https://github.com/ollama/ollama/blob/main/docs/api/cloud-usage.mdx)
-lists "usage breakdowns by model and API key" under *Coming soon*, with no
-issue tracking it. The card drops the per-model lines rather than pointing at
-the web UI.
-
 **Legacy pre-credits plans** return `included.session` / `included.weekly` with
 Ollama's own `remaining_percent` and `resets_at` instead of dollar fields. Those
 are reported verbatim; the percent is Ollama's, not derived.
