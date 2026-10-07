@@ -203,27 +203,37 @@ class LiveAccountCardTests(unittest.TestCase):
         self.assertIn("Included credits: $2.44 of $2.50 remaining", details)
         self.assertIn("Purchased credits: $5.00 (does not refill at reset)", details)
 
-    def test_total_spend_is_labelled_as_spanning_both_pools(self):
+    def test_total_spend_is_labelled_as_total_not_plain_spend(self):
         """`totals.usage_usd` covers included *and* purchased credit, so it is
         not the same number as the percentage's base ($0.06348 vs $0.06107 --
-        the difference is the two paid deepseek requests). Calling it plain
-        "Spend" implied the two matched."""
-        details = _fetch_real().details
-        self.assertIn("Total spend (30d): $0.06", details)
-        self.assertIn("Total spend covers included and purchased credits; "
-                      "the percentage above is the included share only", details)
+        the difference is two paid deepseek requests). The word "Total" is what
+        keeps the card from implying the two matched."""
+        self.assertIn("Total spend (30d): $0.06", _fetch_real().details)
 
     def test_requests_and_tokens_come_from_totals(self):
         details = _fetch_real().details
         self.assertIn("Requests (30d): 18", details)
         self.assertIn("Tokens (30d): 673,390 in · 8,111 out", details)
 
-    def test_per_model_is_pointed_at_not_faked(self):
-        """There is no per-model breakdown in the API yet, but the dashboard
-        renders one -- so the card says where it lives instead of implying the
-        data is unobtainable."""
-        self.assertIn("Per-model usage is shown on ollama.com/settings, "
-                      "not exposed by the API", _fetch_real().details)
+    def test_the_card_carries_no_explanatory_prose(self):
+        """Detail lines are quota facts, not footnotes.
+
+        Two lines were tried and removed: a pointer to ollama.com/settings for
+        per-model usage (not in the API, "coming soon" with no tracker behind
+        it) and a note that Total spend spans both pools. Both are real
+        information and both belong in the README -- on the card they read as
+        commentary sitting among numbers, and the caveat lines fired even when
+        the payload carried no figures at all.
+        """
+        for line in _fetch_real().details:
+            with self.subTest(line=line):
+                self.assertNotIn("per-model", line.lower())
+                self.assertNotIn("ollama.com", line.lower())
+                self.assertNotIn("coming soon", line.lower())
+                self.assertTrue(
+                    line.startswith(("Included credits:", "Purchased credits:",
+                                     "Total spend (", "Requests (", "Tokens (")),
+                    "every detail line must be a quota figure, not prose")
 
     def test_the_plan_badge_is_read_from_the_profile(self):
         self.assertEqual(_fetch_real().plan, "Free")
@@ -828,8 +838,9 @@ class UsageDetailTests(unittest.TestCase):
         """The caveat lines must not be emitted on their own: a card with no
         figures would otherwise look populated and defeat has_data()."""
         r = _fetch(usage={"totals": {}}, balance=REAL_BALANCE)
-        self.assertEqual([d for d in r.details
-                          if "not exposed by the API" in d], [])
+        self.assertEqual([d for d in r.details if d.startswith("Total spend")], [])
+        self.assertEqual([d for d in r.details if d.startswith("Requests")], [])
+        self.assertEqual([d for d in r.details if d.startswith("Tokens")], [])
         self.assertTrue(r.has_data(), "the balance side still carries the card")
 
     def test_tokens_are_comma_grouped(self):

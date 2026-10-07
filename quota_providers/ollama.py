@@ -63,12 +63,14 @@ was rewritten as a timeseries and no longer returns `activity` / `limits`:
     }
 
 `range` is one of `24h` (hourly buckets), `7d` or `30d` (daily). Anything else
-returns 400, as does any unrecognised parameter. There is no per-model
-breakdown in the API — Ollama lists "usage breakdowns by model and API key"
-under "Coming soon", and /api/usage/models, ?granularity=model, /api/activity
-and /api/models/usage all 404 or 400 — while ollama.com/settings does render
-one. So the card shows range spend plus request and token counts, and says
-where the per-model figures live rather than inventing them.
+returns 400, as does any unrecognised parameter.
+
+**No per-model breakdown.** The pre-#18829 response carried `activity.models`
+and `limits.monthly.models`; the timeseries carries neither, and per-request
+totals only. Ollama's docs list "usage breakdowns by model and API key" under
+*Coming soon* with no tracker behind it, so the card reports range totals and
+says nothing about the per-model figures it used to show — a missing feature is
+not a fact worth a line on every card.
 
 **No plan.** `POST /api/me` returns `"Plan": "free"`, but that is a write-shaped
 request to repeat on every refresh for a label, so it is not used. `plan` stays
@@ -352,8 +354,9 @@ def _usage_details(usage) -> list[str]:
     cost = _dollars(totals.get("usage_usd"))
     if cost is not None:
         # "total", not just "spend": this figure spans every request, including
-        # the ones paid from the included allowance, so it does not equal
-        # "drawn from the pool" and calling it plain spend would imply it does.
+        # the ones paid from the included allowance, so it is not "drawn from
+        # the pool" and calling it plain spend would imply it is. The README
+        # spells out how the two differ.
         details.append(f"Total spend ({span}): ${cost}")
     count = totals.get("request_count")
     if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
@@ -365,10 +368,6 @@ def _usage_details(usage) -> list[str]:
         # An empty `totals` block carries nothing; saying so in prose would make
         # a data-less card look populated and defeat has_data().
         return []
-    details.append(
-        "Total spend covers included and purchased credits; the percentage above is the included share only")
-    details.append(
-        "Per-model usage is shown on ollama.com/settings, not exposed by the API")
     return details
 
 
