@@ -180,7 +180,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Read-only credential use; Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details. If the session expires, run `cursor-agent login`; the plugin never exchanges refresh tokens or writes to Cursor's credential store. |
 | `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
-| `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/usage` (spend, per-model request counts) and `POST /api/me` (plan label, signup date). The **Monthly** bar is the server-reported usage fraction. The reset is the next monthly anniversary of `CreatedAt`, matching Ollama's documented "resets monthly on the same day of the month your plan started"; the day is derived because no endpoint returns a reset timestamp. **No balance value** — Ollama exposes none; see below. |
+| `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/balance` (included allowance + balance, the reset period, purchased credit) and `GET /api/usage?range=30d` (spend, requests, tokens); `POST /api/me` supplies the plan label. The **Included credits** bar is the share drawn from the plan allowance, and the reset is the provider's own `period.until`. **Account balance** is the purchased wallet, which is separate money. See below. |
 | `grok` | browser cookies | **Opt-in**, disabled by default |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
@@ -188,30 +188,64 @@ and never blocks the rest.
 
 ### Ollama
 
-Ollama Cloud quota is read from two endpoints: `GET /api/usage` for the spend
-and per-model request counts, and `POST /api/me` for the plan label and the
-signup date. Set `OLLAMA_API_KEY` to the `sk-…` key from
+Ollama Cloud quota is read from three endpoints, all documented since
+[ollama/ollama#18829](https://github.com/ollama/ollama/pull/18829) merged:
+
+- `GET /api/balance` — the plan allowance (`included.allowance_usd`), what is
+  left of it (`included.balance_usd`), the reset (`included.period.until`) and
+  purchased credit (`purchased.balance_usd`).
+- `GET /api/usage?range=30d` — spend, request count and token counts across a
+  `24h` / `7d` / `30d` window (`totals` plus daily or hourly `buckets`).
+- `POST /api/me` — the plan label. `GET` is a 405, so this stays a POST.
+
+Set `OLLAMA_API_KEY` to the `sk-…` key from
 [ollama.com/settings](https://ollama.com/settings).
 
-**There is no balance or credit value, because Ollama does not expose one.**
-The settings page shows a dollar balance, but it is not reachable from the
-API: of 36 candidate paths tried with both `GET` and `POST`, only `/api/usage`
-and `/api/me` respond, and `/api/usage` ignores `?include=balance` and
-`?include=credits`. This has been reported upstream and is not being worked
-on yet:
+**Two pools, and they are separate money.** `ollama.com/settings` shows
+"Free usage credits" as a percentage of a small monthly allowance, and "Usage
+credits / Current balance" for purchased credit underneath it. `/api/balance`
+reports both, so the card does too:
 
-- [ollama/ollama#12532 — Expose cloud usage stats via `/api/me`](https://github.com/ollama/ollama/issues/12532)
-- [ollama/ollama#18653 — Add an API endpoint for credit balance](https://github.com/ollama/ollama/issues/18653)
+- **Included credits** — the window, the percentage
+  (`(allowance − balance) / allowance`) and the reset, all from one response.
+  Both sides of the division are real dollars, so the percent is arithmetic
+  rather than inference.
+- **Account balance** — the purchased wallet, which is the figure the dashboard
+  calls "Current balance". It does not refill at the reset.
 
-Until one of those lands, the card shows spend and request counts rather than
-a fabricated `$0`. The remaining path — scraping `ollama.com/settings` with a
-`__Secure-session` browser cookie — is a sensitive-source reader that would
-need to be opt-in and disabled by default, like `grok`. It is not implemented
-here.
+**Total spend is neither of those.** `totals.usage_usd` covers both pools, so
+it is not the percentage's base — on the account this was captured from it read
+`$0.06348` against `$0.06107` drawn from the allowance, the difference being the
+two paid-model requests billed to purchased credit. The card labels it
+"Total spend" and says so on the card, rather than implying the two figures
+matched.
 
-Until `/api/me` exists the plugin already handles the account, but it cannot
-know the plan or derive the reset, so the card falls back to spend and request
-counts alone. Until the balance endpoint exists there is nothing to add.
+**Money is rounded to cents for display.** The endpoint's own precision
+(`balance_usd: 2.43893`) is per-token rounding, not resolution; a nonzero
+sub-cent balance keeps extra digits so it cannot read as `$0.00`.
+
+**Per-model usage is not in the API.** Ollama lists "usage breakdowns by model
+and API key" under *Coming soon* in
+[`docs/api/cloud-usage.mdx`](https://github.com/ollama/ollama/blob/main/docs/api/cloud-usage.mdx),
+and `/api/usage/models`, `?granularity=model`, `/api/activity` and
+`/api/models/usage` all 404 or 400 — while `ollama.com/settings` does render a
+breakdown. The card names that page instead of guessing.
+
+**Legacy pre-credits plans** return `included.session` / `included.weekly` with
+Ollama's own `remaining_percent` and `resets_at` instead of dollar fields. Those
+are reported verbatim; the percent is Ollama's, not derived.
+
+Both endpoints allow 10 requests per minute per user, shared across API keys and
+devices, and answer a breach with `429` and a `Retry-After` header — reported as
+`http-429`. The card makes three calls per refresh, well inside that.
+
+Upstream, still open:
+
+- [ollama/ollama#12532 — Cloud usage stats](https://github.com/ollama/ollama/issues/12532)
+- [ollama/ollama#18653 — Cloud API: expose credit balance & true spend](https://github.com/ollama/ollama/issues/18653)
+
+#18653 is the request this landed against; it remains open because the endpoint
+is undocumented in the issue thread, not unimplemented.
 
 ### Antigravity
 

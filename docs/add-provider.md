@@ -83,6 +83,24 @@ Contract rules (all enforced in review):
   `granted_balance` / `topped_up_balance` as decimal strings. A provider may set
   `api_calls_available` to a reported boolean; `None` means unknown. These fields
   survive cache serialization and render without percentage bars.
+- **Prefer a published reset over a derived one.** If any endpoint returns the
+  window's own reset timestamp, use it verbatim and delete the derivation
+  (`ollama.py` dropped a `_next_monthly_reset()` built from the account's
+  `CreatedAt` once `/api/balance` started publishing `period.until` — the
+  derived day was the *signup* anniversary, which is wrong by up to a month for
+  anyone who subscribed later than they signed up). Deriving is a last resort,
+  and if you must, say so on the card.
+- **Label figures the way the provider's own page labels them.** Ollama shows
+  purchased credit as "Current balance" and the plan allowance separately, so
+  the widget's generic "Account balance" row has to carry the purchased wallet —
+  putting the allowance there made the card contradict the page it came from.
+  When two figures from one response are *different pools*, name both in
+  `details` instead of merging them or showing one unlabelled.
+- **Round money for display; keep the raw for arithmetic.** Endpoints often
+  return per-token precision (`balance_usd: 2.43893`) that reads as noise in a
+  headline. Compute percentages from the full-precision value and render
+  rounded, with one exception: a nonzero figure that would round to `$0.00`
+  keeps extra digits rather than reading as "no money left".
 - **Free tiers get honest cards.** If the API exposes nothing numeric for the
   tier, return a card with `plan="Free"` and `details` describing what IS true
   (published limits, tool pool). See `_fetch_nous_portal()` in `builtin.py`

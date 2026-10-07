@@ -1,53 +1,83 @@
-"""Ollama Cloud usage — spend and per-model usage; no credit balance.
+"""Ollama Cloud usage — remaining included credits, reset date, and spend.
 
-GET https://ollama.com/api/usage, Bearer API key. Live response shape, captured
-against a real Free-tier account (2026-10-03):
+Two endpoints, both Bearer-key authenticated, both documented in
+docs/api/cloud-usage.mdx and docs/api/balance.mdx since ollama/ollama#18829
+(server: proxy cloud usage and balance APIs, merged 2026-10-07).
+
+**`GET /api/balance` — the window, the percent and the reset.** Live response
+against a real Free-tier account (2026-10-07):
 
     {
-      "activity": {
-        "cost": "0.00241",
-        "period": {"type": "last_4_weeks",
-                   "starting_at": "2026-09-07T00:00:00Z",
-                   "ending_at":   "2026-10-03T11:05:03.33902593Z"},
-        "models": [{"name": "deepseek-v4.1-flash", "request_count": 2,
-                    "cost": "0.00241"}]
+      "included": {
+        "balance_usd":  2.43893,
+        "allowance_usd": 2.5,
+        "period": {"from": "2026-09-22T09:45:23.470675Z",
+                   "until": "2026-10-22T09:45:23.470675Z"}
       },
-      "limits": {
-        "monthly": {"usage": 0.004,
-                    "models": [{"name": "gpt-oss:120b", "request_count": 8}]}
-      }
+      "purchased": {"balance_usd": 4.99759}
     }
 
-This is the only usage endpoint: /api/usage. Everything else probed 404s, so the
-balance and reset the settings page displays have no API surface.
+`allowance_usd` is the real denominator the old response never carried, and
+`period.until` is the actual subscription reset — Ollama's own docs: "The
+included period follows your plan's monthly reset schedule, including for annual
+subscriptions." That replaces the previous derivation from /api/me `CreatedAt`,
+which was wrong by up to a month for anyone who subscribed after signing up.
 
-**`limits.monthly.usage` is a server-reported fraction, not dollars.** The account
-behind this capture shows "0.4% used" on ollama.com/settings for a value of
-0.004, and nothing in this payload could produce that percentage any other way:
-there is no allowance, limit or denominator field anywhere in the response. So
-it is used as used/1 — the "server-reported percent" case add-provider.md allows.
-A percentage is also what Ollama's own page shows, so any other reading would
-show up as the card contradicting the page it came from.
+The percent is derived, not reported: `(allowance_usd - balance_usd) /
+allowance_usd`. Both sides are real dollars from the same response, so the
+division is arithmetic, not inference. `balance_usd` above the allowance
+(pay-as-you-go overspend) yields >100% used rather than being clamped, matching
+the old behaviour for the same situation.
 
-**No reset date.** The settings page shows "Resets in 2 weeks", but no reset
-timestamp is present in the response and none of the probed paths expose one,
-so the window carries no reset rather than a guessed one.
+**The two pools are separate money.** ollama.com/settings shows "Free usage
+credits" with a percentage against a small monthly allowance, and "Usage
+credits / Current balance" for purchased credit below it — on the account this
+was captured from, $2.44 of a $2.50 allowance (2.44% used, matching the
+dashboard's "2.4% used") alongside a separate $4.99759 of spendable purchased
+credit. `included` is the pool that refills at the reset and that the
+percentage measures; `purchased` is the wallet the card shows as "Account
+balance", because that is the figure the dashboard labels "Current balance".
 
-**No credit balance.** The account behind the capture has a $5 balance that the
-settings page displays, but there is no API for it: /api/credits/balance,
-/api/credits, /api/balance, /api/billing/balance, /api/account,
-/api/subscription, /api/settings, /api/user, /api/me/credits, /api/me/billing
-and /api/account/usage all 404, and /api/usage ignores ?include=balance,
-?include=credits and ?verbose alike. ollama/ollama#18653 requests the endpoint
-and is open. Reporting a balance that cannot be read would be inventing one.
+`/api/usage`'s `totals.usage_usd` spans **both** pools — it is total spend, not
+"drawn from the allowance". On the same account it reads $0.06348 against
+$0.06107 drawn from the included pool: the $0.00241 difference is the two
+deepseek-v4.1-flash requests, which are not free-model requests and so were
+paid from purchased credit. The card therefore labels it "Total spend" and says
+so, instead of implying it is the same number as the percentage's base.
 
-**No plan.** `POST /api/me` does return `"Plan": "free"`, but that is a
-write-shaped request to repeat on every refresh for a label, so it is not used.
-`plan` stays None.
+Legacy pre-credits plans return `included.session` / `included.weekly` with
+`remaining_percent` and `resets_at` instead of `balance_usd`/`allowance_usd`.
+Those are reported verbatim — the percent is Ollama's own, not derived.
 
-Legacy pre-credits accounts return `limits.session` / `limits.weekly` instead of
-`limits.monthly`, where the values are window counters rather than dollar
-spend. Those are not rendered as currency; the card falls back to activity only.
+**`GET /api/usage` — spend and request counts over a time range.** The endpoint
+was rewritten as a timeseries and no longer returns `activity` / `limits`:
+
+    {
+      "range": "7d", "scope": "self", "granularity": "day",
+      "from": "2026-09-30T00:00:00Z", "until": "2026-10-07T05:52:38Z",
+      "totals": {"request_count": 18, "usage_usd": 0.06348,
+                 "input_tokens": 673390, "cached_input_tokens": 392224,
+                 "output_tokens": 8111},
+      "buckets": [{"from": "...", "until": "...", "partial": true,
+                   "request_count": 0, "usage_usd": 0, ...}]
+    }
+
+`range` is one of `24h` (hourly buckets), `7d` or `30d` (daily). Anything else
+returns 400, as does any unrecognised parameter. There is no per-model
+breakdown in the API — Ollama lists "usage breakdowns by model and API key"
+under "Coming soon", and /api/usage/models, ?granularity=model, /api/activity
+and /api/models/usage all 404 or 400 — while ollama.com/settings does render
+one. So the card shows range spend plus request and token counts, and says
+where the per-model figures live rather than inventing them.
+
+**No plan.** `POST /api/me` returns `"Plan": "free"`, but that is a write-shaped
+request to repeat on every refresh for a label, so it is not used. `plan` stays
+None.
+
+Both endpoints allow 10 requests per minute per user, shared across API keys and
+devices, and answer a breach with 429 + `Retry-After`. Three calls per refresh
+(usage, balance, profile) sit well inside that, but the calls are spaced rather
+than fired at once.
 """
 from __future__ import annotations
 
@@ -60,19 +90,32 @@ from decimal import Decimal
 from typing import Optional
 
 from .api_keys import amount
-from .base import Deadline, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import (
+    AccountBalance,
+    Deadline,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    urlopen_no_redirect,
+)
 from .registry import register
 
 _PROVIDER_ID = "ollama"
 _USAGE_URL = "https://ollama.com/api/usage"
+_BALANCE_URL = "https://ollama.com/api/balance"
 _ME_URL = "https://ollama.com/api/me"
+# The documented ranges are 24h / 7d / 30d. 30d is asked for because the
+# included-credit window resets monthly, so the read has to cover the period the
+# card's percentage describes.
+_USAGE_RANGE = "30d"
 _TIMEOUT_S = 15.0
 
-# Both requests run in series, so they share one deadline. quota_cache runs every
+# Three calls run in series, so they share one deadline. quota_cache runs every
 # provider under a single REFRESH_BUDGET_S (20 s by default) and records an
-# overrun as `timeout`, dropping the provider's previous value. The usage call's
-# 7 s plus an unbounded profile call could reach ~22 s on its own. Mirrors
-# cursor.py, which bounds its keychain read and two RPCs the same way.
+# overrun as `timeout`, dropping the provider's previous value. Two 7 s reads
+# plus an unbounded profile call could reach ~29 s on its own, which would cost
+# the whole sweep. Mirrors cursor.py, which bounds its keychain read and two
+# RPCs the same way.
 _FETCH_BUDGET_S = 18.0
 _HTTP_TIMEOUT_S = 7  # matches api_keys.get_json's own default
 
@@ -148,28 +191,22 @@ def _money(value) -> Optional[str]:
     return f"{number:f}"
 
 
-def _usage(key: str, timeout: float = _HTTP_TIMEOUT_S):
-    """GET /api/usage, with the caller's deadline as the socket timeout.
+def _dollars(value) -> Optional[str]:
+    """A dollar figure rounded for display — cents, because nobody reads mills.
 
-    ``api_keys.get_json`` hardcodes ``timeout=7`` and takes no override, so the
-    usage read is issued here instead of going through it -- the shared helper
-    is left untouched for every other provider that depends on it.
+    The endpoint's own precision is a byproduct of per-token rounding, not
+    meaning: a card reading "$2.43893 of $2.5" implies a resolution the number
+    does not carry. One exception keeps the widget's existing guard intact: a
+    balance that is nonzero but rounds to $0.00 would read as "no money", so
+    such a figure keeps enough digits to stay visibly nonzero.
     """
-    req = urllib.request.Request(
-        _USAGE_URL, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
-    try:
-        with urlopen_no_redirect(req, timeout=timeout) as response:
-            body = response.read(1024 * 1024 + 1)
-    except urllib.error.HTTPError as exc:
-        return None, ("auth-failed" if exc.code in (401, 403) else f"http-{exc.code}")
-    except Exception:  # noqa: BLE001 - URLError, timeout, malformed body
-        return None, "fetch-error"
-    if len(body) > 1024 * 1024:
-        return None, "oversized-response"
-    try:
-        return json.loads(body.decode("utf-8", "replace")), None
-    except (ValueError, UnicodeDecodeError):
-        return None, "parse-pending"
+    number = amount(value)
+    if number is None:
+        return None
+    cents = round(float(number), 2)
+    if cents == 0.0 and float(number) != 0.0:
+        return f"{number:.4f}"
+    return f"{cents:.2f}"
 
 
 def _profile(secret: str, timeout: float = _TIMEOUT_S):
@@ -204,196 +241,259 @@ def _profile(secret: str, timeout: float = _TIMEOUT_S):
     return (data, None) if isinstance(data, dict) else (None, "parse-pending")
 
 
-def _next_monthly_reset(created_at, now=None) -> Optional[str]:
-    """The next monthly reset, derived from the account creation date.
+def _get_json(url: str, key: str, timeout: float, max_bytes: int = 1024 * 1024):
+    """(dict, None) from a Bearer GET, or (None, reason).
 
-    ollama.com/blog/transparent-pricing: "On Pro, Max, and Team plans, usage
-    resets monthly on the same day of the month your plan started ... On the free
-    plan, usage resets monthly from the date you signed up." The API publishes
-    no reset timestamp, but /api/me reports CreatedAt, so on Free — where signup
-    and subscription start are the same day — the reset is the monthly
-    anniversary of CreatedAt.
-
-    Caveat, stated rather than hidden: on a paid plan it is the *plan* start
-    that governs, and someone who subscribed later than they signed up would get
-    the wrong day. There is no field that exposes the plan start, so this cannot
-    be narrowed further from the API alone.
-
-    The result is normalised to midnight UTC because Ollama documents the reset
-    *day* only -- "resets monthly on the same day of the month your plan
-    started" -- and publishes no time. Reusing CreatedAt's clock time would
-    render a precise-looking hour that nothing supports, so the day is kept and
-    the hour is dropped rather than invented.
-
-    The candidate is compared at its real clock time and the returned value is
-    truncated to midnight, which can otherwise land *before* now: an account
-    created at 23:00 whose day-of-month is today would pass the ``> now`` test
-    and then render as a reset that already happened. Comparing the truncated
-    value instead keeps a same-day reset visible on the day it lands rather than
-    publishing a past timestamp. The day after, it advances to next month.
+    Shared by /api/usage and /api/balance. `urlopen_no_redirect` keeps the
+    credential from being replayed to a redirect target.
     """
-    if not isinstance(created_at, str) or not created_at.strip():
+    req = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"})
+    try:
+        with urlopen_no_redirect(req, timeout=timeout) as response:
+            body = response.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+        if exc.fp is not None:
+            exc.close()
+        if code in (401, 403):
+            return None, "auth-failed"
+        if code == 429:
+            return None, "http-429"
+        return None, f"http-{code}"
+    except (TimeoutError,):
+        return None, "timeout"
+    except Exception:  # noqa: BLE001 - URLError, timeout, malformed body
+        return None, "fetch-error"
+    if len(body) > max_bytes:
+        return None, "oversized-response"
+    try:
+        data = json.loads(body.decode("utf-8", "replace"))
+    except (ValueError, UnicodeDecodeError):
+        return None, "parse-pending"
+    return (data, None) if isinstance(data, dict) else (None, "parse-pending")
+
+
+def _usage(key: str, timeout: float = _HTTP_TIMEOUT_S):
+    """GET /api/usage?range=30d, with the caller's deadline as socket timeout.
+
+    ``range`` is one of 24h / 7d / 30d; anything else is a 400. 30d is asked for
+    because the included-credit window is monthly.
+    """
+    return _get_json(f"{_USAGE_URL}?range={_USAGE_RANGE}", key, timeout)
+
+
+def _balance(key: str, timeout: float = _HTTP_TIMEOUT_S):
+    """GET /api/balance — included allowance, balance, and the reset period."""
+    return _get_json(_BALANCE_URL, key, timeout)
+
+
+def _included_spend_percent(included) -> Optional[float]:
+    """(allowance - balance) / allowance as a used percent.
+
+    Both figures are dollar amounts from the same response, so this is
+    arithmetic rather than inference. A balance above the allowance (pay-as-you-
+    go overspend) yields >100% instead of being clamped; a zero allowance has no
+    denominator and yields None rather than a division error.
+    """
+    allowance = amount(included.get("allowance_usd"))
+    balance = amount(included.get("balance_usd"))
+    if allowance is None or balance is None or float(allowance) <= 0:
         return None
-    text = created_at.strip()
+    used = (float(allowance) - float(balance)) / float(allowance)
+    return round(max(0.0, used) * 100.0, 2)
+
+
+def _windows(included) -> list[QuotaWindow]:
+    """Billing windows from /api/balance's `included` block.
+
+    Current plans carry `balance_usd` + `allowance_usd` + `period.until`; legacy
+    plans carry `session` / `weekly` with Ollama's own `remaining_percent` and
+    `resets_at`. Either way the reset is the timestamp the provider published —
+    no derivation, and so nothing to be wrong by a month.
+    """
+    if not isinstance(included, dict):
+        return []
+    windows: list[QuotaWindow] = []
+
+    percent = _included_spend_percent(included)
+    reset_at = _iso_utc((included.get("period") or {}).get("until")
+                        if isinstance(included.get("period"), dict) else None)
+    if percent is not None:
+        windows.append(QuotaWindow(label="Included credits", used_percent=percent,
+                                   reset_at=reset_at))
+
+    for name, label in (("session", "Session"), ("weekly", "Weekly")):
+        block = included.get(name)
+        if not isinstance(block, dict):
+            continue
+        remaining = amount(block.get("remaining_percent"))
+        used = round(100.0 - float(remaining), 2) if remaining is not None else None
+        windows.append(QuotaWindow(
+            label=label, used_percent=used,
+            reset_at=_iso_utc(block.get("resets_at"))))
+    return windows
+
+
+def _usage_details(usage) -> list[str]:
+    """Spend, request and token lines from /api/usage's `totals`.
+
+    Per-model breakdown is gone with the old response shape and Ollama lists it
+    as "coming soon", so there is nothing per-model to report.
+    """
+    if not isinstance(usage, dict):
+        return []
+    totals = usage.get("totals")
+    if not isinstance(totals, dict):
+        return []
+    span = usage.get("range")
+    span = span if isinstance(span, str) and span.strip() else "period"
+    details: list[str] = []
+    cost = _dollars(totals.get("usage_usd"))
+    if cost is not None:
+        # "total", not just "spend": this figure spans every request, including
+        # the ones paid from the included allowance, so it does not equal
+        # "drawn from the pool" and calling it plain spend would imply it does.
+        details.append(f"Total spend ({span}): ${cost}")
+    count = totals.get("request_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+        details.append(f"Requests ({span}): {count}")
+    tokens = _compact_tokens(totals)
+    if tokens:
+        details.append(f"Tokens ({span}): {tokens}")
+    if not details:
+        # An empty `totals` block carries nothing; saying so in prose would make
+        # a data-less card look populated and defeat has_data().
+        return []
+    details.append(
+        "Total spend covers included and purchased credits; the percentage above is the included share only")
+    details.append(
+        "Per-model usage is shown on ollama.com/settings, not exposed by the API")
+    return details
+
+
+def _compact_tokens(totals: dict) -> Optional[str]:
+    """Input/output token counts, input split into cached and uncached."""
+    parts: list[str] = []
+    for key, label in (("input_tokens", "in"), ("output_tokens", "out")):
+        value = totals.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            parts.append(f"{value:,} {label}")
+    return " · ".join(parts) if parts else None
+
+
+def _balance_rows(balance) -> list[AccountBalance]:
+    """Purchased credit, as the one account-money row.
+
+    Purchased credit is the money actually in hand — ollama.com/settings labels
+    it "Usage credits / Current balance" — so it is the figure that belongs under
+    "Account balance". The included allowance is deliberately *not* a second row:
+    the widget labels every row "Account balance", so a second one would read as
+    another wallet rather than as the plan's monthly pool. It rides in the detail
+    lines, next to the percentage it is the denominator of.
+    """
+    if not isinstance(balance, dict):
+        return []
+    purchased = balance.get("purchased")
+    if not isinstance(purchased, dict):
+        return []
+    # Display-rounded, not the endpoint's raw digits: this row is the card's
+    # headline money figure and "Account balance $4.99759" reads as noise. The
+    # widget renders `total_balance` verbatim (balanceFractionDigits honours
+    # whatever precision it is given), so the rounding has to happen here.
+    value = _dollars(purchased.get("balance_usd"))
+    if value is None:
+        return []
+    return [AccountBalance(currency="USD", total_balance=value)]
+
+
+def _balance_details(balance) -> list[str]:
+    """Name the included allowance, and purchased credit when there is any.
+
+    The included line states the denominator the percentage came from, so the
+    percent is auditable against the raw dollars rather than taken on trust.
+    Purchased credit is a separate pot that does not refill at the reset, so it
+    is labelled as such instead of being added to the included figure.
+    """
+    if not isinstance(balance, dict):
+        return []
+    included = balance.get("included")
+    lines: list[str] = []
+    if isinstance(included, dict):
+        remaining = _dollars(included.get("balance_usd"))
+        allowance = _dollars(included.get("allowance_usd"))
+        if remaining is not None and allowance is not None:
+            lines.append(f"Included credits: ${remaining} of ${allowance} remaining")
+        elif remaining is not None:
+            lines.append(f"Included credits: ${remaining} remaining")
+    purchased = balance.get("purchased")
+    if isinstance(purchased, dict):
+        value = _dollars(purchased.get("balance_usd"))
+        if value is not None:
+            lines.append(f"Purchased credits: ${value} (does not refill at reset)")
+    return lines
+
+
+def _iso_utc(value) -> Optional[str]:
+    """A provider timestamp, normalised to `Z` and rejected if it is not a time.
+
+    `/api/balance` publishes UTC with a trailing Z, but the field is echoed into
+    the cache and rendered as a countdown, so anything unparseable is dropped
+    rather than shown as a reset that never arrives.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
     try:
-        started = datetime.datetime.fromisoformat(text)
+        parsed = datetime.datetime.fromisoformat(text)
     except (ValueError, TypeError):
         return None
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=datetime.timezone.utc)
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=datetime.timezone.utc)
-    day = started.day
-
-    def candidate(year: int, month: int) -> Optional[datetime.datetime]:
-        # A 29th/30th/31st start has no counterpart in February; clamp to the
-        # last day that exists rather than skipping the month entirely.
-        last = [31, 29 if _is_leap(year) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
-        return datetime.datetime(year, month, min(day, last),
-                                 started.hour, started.minute, started.second,
-                                 tzinfo=datetime.timezone.utc)
-
-    this_month = candidate(now.year, now.month)
-    if this_month is not None:
-        # Compare the value we will actually return, not the raw candidate: the
-        # returned timestamp is midnight, so testing the 23:00 candidate against
-        # "now" could select a day that has already passed. See the docstring.
-        midnight = this_month.replace(hour=0, minute=0, second=0)
-        if midnight > now:
-            chosen = midnight
-        else:
-            year, month = (now.year + 1, 1) if now.month == 12 else (now.year, now.month + 1)
-            chosen = candidate(year, month)
-            if chosen is not None:
-                chosen = chosen.replace(hour=0, minute=0, second=0)
-    else:
-        chosen = None
-    if chosen is None:
-        return None
-    return chosen.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _is_leap(year: int) -> bool:
-    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-
-
-def _used_percent(value) -> Optional[float]:
-    """`limits.monthly.usage` as a percent, from the server-reported fraction.
-
-    Accepts 0.0 and above: with pay-as-you-go an account can spend past its
-    included pool, and >100% used is then the honest reading. `amount` rejects
-    bools, non-finite numbers and absurd magnitudes.
-    """
-    number = amount(value)
-    if number is None:
-        return None
-    # A negative fraction is a schema surprise, not "quota in credit": it would
-    # render as a negative percentage and a >100% bar. Drop the window and keep
-    # whatever spend detail the response still provides.
-    if number < 0:
-        return None
-    return round(float(number) * 100.0, 2)
-
-
-def _per_model(entry) -> Optional[str]:
-    """One `name: N requests · $X` line, or None if the shape is unusable."""
-    if not isinstance(entry, dict):
-        return None
-    name = entry.get("name")
-    if not isinstance(name, str) or not name.strip():
-        return None
-    name = name.strip()
-    count = entry.get("request_count")
-    parts = []
-    if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
-        parts.append(f"{count} request{'' if count == 1 else 's'}")
-    cost = _money(entry.get("cost"))
-    if cost is not None:
-        parts.append(f"${cost}")
-    elif not parts:
-        return None
-    return f"{name}: " + " · ".join(parts)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 @register(_PROVIDER_ID)
 def fetch_ollama_quota() -> QuotaResult:
-    # The usage call and the profile call are serial, so they share one
-    # deadline sized under the cache's own refresh budget.
+    # usage, balance and profile run in series under one deadline, sized under
+    # the cache's own refresh budget so a slow Ollama cannot eat the sweep.
     deadline = Deadline(_FETCH_BUDGET_S)
     key = _resolve_key()
     if not key:
         return build_unavailable(_PROVIDER_ID, "no-credentials")
-    if deadline.expired():
-        return build_unavailable(_PROVIDER_ID, "timeout")
-    payload, error = _usage(key, deadline.slice(_HTTP_TIMEOUT_S))
-    if error:
-        return build_unavailable(_PROVIDER_ID, error)
-    if not isinstance(payload, dict):
-        return build_unavailable(_PROVIDER_ID, "parse-pending")
 
-    # Best effort: the plan label and the derived reset both come from /api/me.
-    # A failure here costs the label, never the card. Skip the call outright
-    # once the budget is gone rather than starting a request with no time left.
+    # 30d rather than the 7d default: the included-credit window is monthly, so
+    # a 30d read covers the whole billing period the card's percent describes.
+    usage, usage_error = _usage(key, deadline.slice(_HTTP_TIMEOUT_S))
+    balance, balance_error = None, "timeout"
+    if not deadline.expired():
+        balance, balance_error = _balance(key, deadline.slice(_HTTP_TIMEOUT_S))
     if deadline.expired():
         profile, profile_error = None, "timeout"
     else:
         profile, profile_error = _profile(key, deadline.slice(_TIMEOUT_S))
-    if profile is None and profile_error == "auth-failed":
-        # The usage call already succeeded, so this is not a credential
-        # problem; keep going rather than downgrading a working card.
-        profile = {}
 
-    activity = payload.get("activity")
-    limits = payload.get("limits")
-    activity = activity if isinstance(activity, dict) else {}
-    limits = limits if isinstance(limits, dict) else {}
+    # The balance endpoint is what carries the window; usage carries the spend
+    # lines. Either one alone is a card, so a failure on one side must not
+    # discard the other's data — only losing both makes the provider dead.
+    included = balance.get("included") if isinstance(balance, dict) else None
+    windows = _windows(included)
+    details = _balance_details(balance) + _usage_details(usage)
+    balances = _balance_rows(balance)
 
-    details: list[str] = []
-    windows: list[QuotaWindow] = []
-
-    # Monthly included usage. `usage` is a server-reported fraction (0.004 ->
-    # "0.4% used" on ollama.com/settings), used as used/1. See the docstring.
-    monthly = limits.get("monthly")
-    monthly = monthly if isinstance(monthly, dict) else {}
-    used = _used_percent(monthly.get("usage"))
-    reset_at = _next_monthly_reset(profile.get("CreatedAt")) if profile else None
-    if used is not None:
-        windows.append(QuotaWindow(
-            label="Monthly", used_percent=used, reset_at=reset_at))
-
-    # Spend over the rolling window. `cost` is explicitly a dollar string.
-    period = activity.get("period")
-    window = "last 4 weeks"
-    if isinstance(period, dict):
-        kind = period.get("type")
-        if isinstance(kind, str) and kind.strip():
-            window = kind.strip().replace("_", " ")
-    cost = _money(activity.get("cost"))
-    if cost is not None:
-        details.append(f"Spend ({window}): ${cost}")
-
-    # Per-model lines: activity first (it carries cost), then the monthly
-    # counters (request counts only).
-    seen: set[str] = set()
-    for source in (activity.get("models"), monthly.get("models")):
-        if not isinstance(source, list):
-            continue
-        for entry in source:
-            line = _per_model(entry)
-            if line and line not in seen:
-                seen.add(line)
-                details.append(line)
-
-    if not windows and not details:
-        return build_unavailable(_PROVIDER_ID, "no-data")
+    if not windows and not details and not balances:
+        # Nothing survived: report the first failure so the reason names the
+        # call that actually broke, and fall back to no-data when neither
+        # endpoint reported an error (both answered, neither carried a figure).
+        return build_unavailable(
+            _PROVIDER_ID, usage_error or balance_error or "no-data")
 
     # /api/me reports the plan verbatim ("free", "pro", ...). Only the name is
     # used -- never the ID, name or email that come back in the same payload.
     plan = None
-    if profile:
+    if profile and profile_error != "auth-failed":
         raw_plan = profile.get("Plan")
         if isinstance(raw_plan, str) and raw_plan.strip():
             # /api/me reports it lower-case ("free"); the widget shows the plan
@@ -408,4 +508,5 @@ def fetch_ollama_quota() -> QuotaResult:
         plan=plan,
         unavailable_reason=None,
         details=details,
+        account_balances=balances,
     )
