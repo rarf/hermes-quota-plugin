@@ -108,6 +108,35 @@ Sensitive-source rule: anything that reads **browser cookies** or other
 user-session material must be **opt-in** (config flag checked at fetch time,
 like `grok.py`'s `grokEnabled`) and default to `opt-in-disabled`.
 
+### Showing several accounts for one provider
+
+A provider with more than one login (as `anthropic` now does for Claude
+subscriptions) attaches `QuotaAccount` entries to its `QuotaResult` instead of
+inventing new provider ids:
+
+```python
+from .base import QuotaAccount, QuotaResult
+
+return QuotaResult(
+    label="anthropic",
+    windows=[...],
+    accounts=[
+        QuotaAccount(id="work", label="Work", windows=[...]),
+        QuotaAccount(id="dead", label="Dead", unavailable_reason="no-credentials"),
+    ],
+)
+```
+
+The cache flattens each account into its own `<provider>:<account_id>` row, so
+the footer, `/quota` and the widget render accounts with no account-specific
+code: the widget resolves the base provider for the icon and shows
+`<Provider> · <label>`. Keep it honest: an account `id` is stable and unique; an
+account is never merged into another by organization or by an equal quota; a
+token or a filesystem path must never reach the record; the same canonical
+source, or the same credential as the primary, must not be duplicated; and an
+unreadable account is a truthful `unavailable (<reason>)` row, never a hidden
+one.
+
 ### 3. Register + surface it
 
 1. Import your module for its side effect in `quota_providers/__init__.py`.

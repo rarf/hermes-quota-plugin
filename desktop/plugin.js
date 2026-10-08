@@ -50,7 +50,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.9.0";
+const WIDGET_VERSION = "2.10.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -373,20 +373,42 @@ const PROVIDER_META = {
 	ollama: { name: "Ollama", mono: "OL" },
 };
 
+function baseProviderId(pid) {
+	// Extra accounts are cached as <provider>:<account_id>; the icon and
+	// display name come from the base provider, while the account label
+	// distinguishes the row.
+	const text = String(pid || "");
+	const colon = text.indexOf(":");
+	return colon > 0 ? text.slice(0, colon) : text;
+}
+
 function providerMeta(pid) {
+	const base = baseProviderId(pid);
 	return (
-		PROVIDER_META[pid] || {
-			name: pid,
-			mono: String(pid || "?")
+		PROVIDER_META[base] || {
+			name: base,
+			mono: String(base || "?")
 				.slice(0, 2)
 				.toUpperCase(),
 		}
 	);
 }
 
+// A row's own account label is preferred over the plain provider name so a
+// second Claude login reads "Anthropic · Work" instead of a duplicate
+// "Anthropic".
+function providerDisplayName(pid, provider) {
+	const meta = providerMeta(pid);
+	const account =
+		provider && typeof provider.account_label === "string"
+			? provider.account_label.trim()
+			: "";
+	return account ? `${meta.name} · ${account}` : meta.name;
+}
+
 function ProviderBadge({ pid }) {
 	const meta = providerMeta(pid);
-	const svg = PROVIDER_SVGS[pid];
+	const svg = PROVIDER_SVGS[baseProviderId(pid)];
 	if (svg) {
 		// dangerouslySetInnerHTML is safe here: the path data is a build-time
 		// constant inlined from @lobehub/icons, never user input.
@@ -1090,7 +1112,7 @@ function QuotaChipWithBar() {
 		if (r == null) continue;
 		if (worst == null || r < worst) {
 			worst = r;
-			worstLabel = providerMeta(pid).name;
+			worstLabel = providerDisplayName(pid, p);
 		}
 	}
 	if (worst == null) {
@@ -1134,7 +1156,7 @@ function ProviderChip({ pid, provider }) {
 	const value = provider && provider.unavailable_reason ? "unavailable" : r != null ? `${r}%` : facts.balances.length ? facts.balances.map(balanceText).join(" · ") : facts.available === true ? "available" : facts.available === false ? "unavailable" : "—";
 	const tone = providerTone(provider);
 	const dot = toneColor(tone);
-	const label = providerMeta(pid).name;
+	const label = providerDisplayName(pid, provider);
 	const tip = makeProviderTip(pid, provider);
 	return jsxs(
 		"button",
@@ -1174,15 +1196,15 @@ function makeWorstTip(worstLabel, worst, providersObj) {
 // Build a rich multiline tip for a single provider: lists ALL its windows
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
-	const meta = providerMeta(pid);
-	if (!provider) return `${meta.name}: unavailable`;
-	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
+	const name = providerDisplayName(pid, provider);
+	if (!provider) return `${name}: unavailable`;
+	if (provider.unavailable_reason) return `${name}: unavailable (${provider.unavailable_reason})`;
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
 	lines.push(...facts.balances.map((b) => `Account balance: ${balanceText(b)}`));
 	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
-	lines.unshift(meta.name);
+	lines.unshift(name);
 	const details = asList(provider && provider.details);
 	if (details.length) lines.push(...details);
 	lines.push("Click to open Quota pane");
@@ -1253,7 +1275,7 @@ function ProviderRow({ id, provider }) {
 	const reason = provider ? provider.unavailable_reason : "no-data";
 	const details = asList(provider && provider.details);
 	const facts = accountFacts(provider);
-	const displayName = providerMeta(id).name;
+	const displayName = providerDisplayName(id, provider);
 	// Inline sizing is intentional: plugin-only utility classes might not be
 	// in the host's compiled Tailwind stylesheet.
 	const cardStyle = { flexShrink: 0, minWidth: 0, overflowWrap: "anywhere" };
@@ -1599,7 +1621,7 @@ function DisabledProvidersControl() {
 										children: enabled ? "●" : "○",
 									}),
 									jsx(ProviderBadge, { pid }),
-									jsx("span", { children: providerMeta(pid).name }),
+									jsx("span", { children: providerDisplayName(pid, p) }),
 								],
 							}),
 						},

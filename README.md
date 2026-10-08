@@ -165,7 +165,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 | Provider | Source | Notes |
 | --- | --- | --- |
-| `anthropic` | Anthropic OAuth usage API | One bounded read maps session/weekly windows, model-scoped weekly limits such as **Fable week**, and extra usage |
+| `anthropic` | Anthropic OAuth usage API | One bounded read maps session/weekly windows, model-scoped weekly limits such as **Fable week**, and extra usage. Additional Claude logins can be shown side by side — see [Claude accounts](#claude-accounts-multiple-logins) |
 | `openai-codex` | local OAuth | Also parses `additional_rate_limits` to surface **per-model Spark limits** (`5.3 Codex Spark · 5h`, `· Weekly`) that stay hidden elsewhere |
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
@@ -184,6 +184,84 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Claude accounts (multiple logins)
+
+By default the `anthropic` provider shows the single login Hermes already uses.
+To show additional Claude subscription logins side by side, list them explicitly
+under the quota plugin's own settings. Nothing is discovered for you.
+
+**Claude Code's own setting (not invented here):** `CLAUDE_CONFIG_DIR` relocates
+Claude Code's whole config directory, and Claude Code keeps the OAuth login in
+`<CLAUDE_CONFIG_DIR or ~/.claude>/.credentials.json` on Linux and Windows. That
+is Claude Code's documented behaviour. This plugin only **reads** that file: it
+never writes it, never refreshes it, and never moves a token between
+directories.
+
+**This plugin's opt-in setting:** `claudeAccounts`, a list under
+`plugins.entries.quota.settings`. Each entry is `{id, label, configDir}`:
+
+- `id` — required, stable, unique, ≤ 64 chars. Becomes the cache key
+  `anthropic:<id>`.
+- `label` — optional display name (defaults to `id`).
+- `configDir` — required. The directory holding the `.credentials.json` written
+  by Claude Code for **that** login.
+
+```sh
+hermes config set plugins.entries.quota.settings.claudeAccounts \
+  '[{"id":"work","label":"Work","configDir":"~/.claude-work"},
+    {"id":"personal","configDir":"~/claude/personal"}]'
+```
+
+The directories above are illustrative, portable and synthetic — substitute
+your own. There is no repository- or plugin-defined naming standard for extra
+Claude config directories, so the plugin assumes none: only the directories you
+list are read.
+
+The account list itself is edited through the config setting above; the Desktop
+widget has no list editor. It **displays** each account as its own row and the
+Settings cherry-picker can hide or show it like any other provider.
+
+Rules the plugin holds to:
+
+- **Opt-in only.** With no `claudeAccounts` (or an empty list) nothing changes —
+  one request, one `anthropic` card. No account is read unless it is listed; the
+  plugin never scans `$HOME` and never guesses a directory.
+- **Read-only, Claude-managed.** The plugin reads an access token from the
+  configured `.credentials.json` and sends it to the fixed Anthropic usage
+  endpoint (`https://api.anthropic.com/api/oauth/usage`, redirects refused). It
+  never exchanges or rewrites a refresh token and never writes to any Claude
+  file. Claude Code remains the only thing that logs in or refreshes.
+- **Precedence.** The account Hermes already resolves (honouring
+  `CLAUDE_CONFIG_DIR`) is the primary card. An entry pointing at that same
+  canonical directory is skipped — its quota is already shown once. Two entries
+  with the same directory, or two logins whose access token is byte-identical,
+  collapse to a single card. Accounts are **never** merged by organization or by
+  an equal quota.
+- **Per-account honesty.** Each account is its own row; one account failing
+  (`no-credentials`, `auth-failed`, `timeout`, `config-invalid`) never hides
+  another's windows, and quota numbers are never summed.
+- **Bounded.** At most 8 accounts are read, sharing one refresh budget, so extra
+  logins cannot stretch a cache sweep.
+
+Platform notes — only what is proven:
+
+- **Linux / Windows:** a `.credentials.json` in the configured directory is read
+  as `{"claudeAiOauth": {"accessToken": "…"}}` — the same file Claude Code and
+  Hermes write.
+- **macOS:** Claude Code keeps its login in the Keychain (service
+  `Claude Code-credentials`). Per-directory Keychain item naming is not
+  documented, so the plugin does **not** read the Keychain for extra accounts. A
+  macOS extra account needs a directory that contains a `.credentials.json`;
+  otherwise its row reads `unavailable (unsupported-platform)`. The default
+  Hermes login is unaffected.
+- **Invalid entries** surface as `unavailable (config-invalid)` with the exact
+  fix in the detail line. Nothing is silently ignored and no credential is read
+  for a malformed entry.
+
+Account identity is never stored: the cache carries only your `id`/`label`, the
+computed windows and machine-readable reasons — never a token or a filesystem
+path.
 
 ### Ollama
 
@@ -372,6 +450,8 @@ backend spawn.
 | Notice: *Widget vX · backend vY* | The two halves are different builds | Reload desktop plugins; restart the app if the backend is the older one |
 | *Update available* banner while `hermes plugins update` reports **already at catalog pin** | The install is Hermes-managed and pinned to the catalog entry's commit; the banner compares the installed build against the default branch | Update past the pin as described under [Updating](#updating), or wait for the catalog entry to advance |
 | `unavailable (opt-in-disabled)` for grok | Grok is opt-in | `hermes config set plugins.entries.quota.settings.grokEnabled true` |
+| `unavailable (config-invalid)` under an Anthropic account | A `claudeAccounts` entry is malformed (missing `id`/`configDir`, duplicate `id`, wrong type) | The row's detail line names the entry to fix; see [Claude accounts](#claude-accounts-multiple-logins) |
+| `unavailable (unsupported-platform)` for an Anthropic account on macOS | Claude Code's macOS login lives in the Keychain, which this plugin does not read per directory | Point `configDir` at a directory containing `.credentials.json`, or use the default Hermes login |
 | `unavailable (timeout)` after a refresh | A provider endpoint hung past the sweep budget | It drops its previous value until a refresh succeeds; check the provider's status page |
 | `unavailable (503 …)` for opencode-go | Upstream flakiness, not your key | The fetcher already retries; it recovers on a later poll |
 | Numbers not changing | Check the pane footer: `· <age> old · poll <N>s` | If the age grows past the interval, report it — the poll should be exact |
@@ -389,6 +469,10 @@ Typed failure reasons surfaced by a refresh: `chrome-tcc-denied`,
 - No telemetry. Cookies and tokens are never printed.
 - Grok cookies are used only for the Grok billing request, and only when you opt in.
 - Chrome/Firefox cookie values are never printed, cached, or written back to disk.
+- Extra Claude accounts are opt-in and read-only: an access token is read from the
+  listed `.credentials.json`, used for one usage request, and never cached,
+  logged, or written back. Only the account `id`/`label`, its windows and
+  machine-readable reasons reach the cache — never a token or a filesystem path.
 - Missing credentials produce an explicit `unavailable` state — no fake zeros.
 - The plugin does not request permission to override built-in Hermes tools.
 

@@ -59,6 +59,25 @@ class AccountBalance:
 
 
 @dataclass
+class QuotaAccount:
+    """One additional account for a provider (e.g. a second Claude login).
+
+    Rendered as its own row — keyed ``<provider_id>:<id>`` by the cache — so
+    one account's failure never masks another's windows. ``id`` is a stable,
+    user-chosen identifier; ``label`` is its display name. Everything else
+    mirrors a :class:`QuotaResult` so the existing render paths need no
+    account-specific code.
+    """
+
+    id: str
+    label: str = ""
+    windows: list[QuotaWindow] = field(default_factory=list)
+    plan: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+    details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class QuotaResult:
     """Normalized quota for one provider, ready to cache."""
 
@@ -71,6 +90,10 @@ class QuotaResult:
     details: list[str] = field(default_factory=list)
     account_balances: list[AccountBalance] = field(default_factory=list)
     api_calls_available: Optional[bool] = None
+    # Additional accounts for this provider. Generic: any fetcher may attach
+    # them and the cache expands each into a sibling provider row, so every
+    # consumer sees a plain list of provider records.
+    accounts: list[QuotaAccount] = field(default_factory=list)
 
     def has_data(self) -> bool:
         return (bool(self.windows) or bool(self.details) or bool(self.account_balances)) and self.unavailable_reason is None

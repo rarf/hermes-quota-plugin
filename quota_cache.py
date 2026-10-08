@@ -95,7 +95,7 @@ def quota_cache_age_seconds() -> Optional[float]:
 
 
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
-    return {
+    record: dict[str, Any] = {
         "label": res.label,
         "plan": res.plan,
         "unavailable_reason": res.unavailable_reason,
@@ -111,6 +111,72 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
             for w in res.windows
         ],
     }
+    # Extra accounts ride along nested here and are flattened into sibling rows
+    # by ``_expand_accounts`` before the cache is written, so the on-disk shape
+    # stays a flat provider map. Only present when a fetcher attached some.
+    if res.accounts:
+        record["accounts"] = [
+            {
+                "id": a.id,
+                "label": a.label,
+                "plan": a.plan,
+                "unavailable_reason": a.unavailable_reason,
+                "details": list(a.details or []),
+                "windows": [
+                    {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
+                    for w in a.windows
+                ],
+            }
+            for a in res.accounts
+        ]
+    return record
+
+
+def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
+    """Flatten a provider record and its nested accounts into sibling rows.
+
+    The fetcher owns the account/config logic and attaches accounts nested on
+    its result; here each one becomes a ``<provider_id>:<account_id>`` record so
+    the cache stays a plain ``provider -> record`` map. Every offline consumer
+    (footer, /quota, widget) then reads account rows with no account-specific
+    code, and an account with no data is a truthful muted row rather than a
+    missing one.
+    """
+    if not isinstance(record, dict):
+        return {provider_id: record}
+    nested = record.pop("accounts", None)
+    rows: dict[str, Any] = {provider_id: record}
+    if not isinstance(nested, list):
+        return rows
+    base_label = record.get("label") or provider_id
+    for index, account in enumerate(nested):
+        if not isinstance(account, dict):
+            continue
+        account_id = account.get("id")
+        if isinstance(account_id, str) and account_id.strip():
+            key = f"{provider_id}:{account_id.strip()}"
+        else:
+            key = f"{provider_id}:account-{index + 1}"
+        if key in rows:  # duplicate id in one payload: keep the first
+            continue
+        label = account.get("label")
+        account_label = label.strip() if isinstance(label, str) and label.strip() else None
+        reason = account.get("unavailable_reason")
+        details = account.get("details")
+        windows = account.get("windows")
+        rows[key] = {
+            "label": f"{base_label} · {account_label}" if account_label else base_label,
+            "provider": provider_id,
+            "account_id": account_id.strip() if isinstance(account_id, str) and account_id.strip() else None,
+            "account_label": account_label,
+            "plan": account.get("plan"),
+            "unavailable_reason": reason if isinstance(reason, str) and reason else None,
+            "details": [str(d) for d in details] if isinstance(details, list) else [],
+            "windows": windows if isinstance(windows, list) else [],
+            "account_balances": [],
+            "api_calls_available": None,
+        }
+    return rows
 
 
 def _unavailable_record(provider_id: str, reason: str) -> dict[str, Any]:
@@ -192,11 +258,10 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
         event.wait(max(0.0, deadline - time.monotonic()))
 
     with lock:
-        providers: dict[str, Any] = {
-            provider_id: results.get(provider_id)
-            or _unavailable_record(provider_id, "timeout")
-            for provider_id, _fetcher in items
-        }
+        providers: dict[str, Any] = {}
+        for provider_id, _fetcher in items:
+            record = results.get(provider_id) or _unavailable_record(provider_id, "timeout")
+            providers.update(_expand_accounts(provider_id, record))
 
     cache = {"fetched_at": datetime.now(timezone.utc).isoformat(), "providers": providers}
 
