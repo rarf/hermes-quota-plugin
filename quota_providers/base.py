@@ -5,7 +5,7 @@ from __future__ import annotations
 import urllib.request
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -59,6 +59,35 @@ class AccountBalance:
 
 
 @dataclass
+class QuotaAccount:
+    """One additional account for a provider (e.g. a second Claude login).
+
+    Rendered as its own row — keyed ``<provider_id>:<id>`` by the cache — so
+    one account's failure never masks another's windows. ``id`` is a stable,
+    user-chosen identifier; ``label`` is its display name. Everything else
+    mirrors a :class:`QuotaResult` so the existing render paths need no
+    account-specific code.
+    """
+
+    id: str
+    label: str = ""
+    windows: list[QuotaWindow] = field(default_factory=list)
+    plan: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+    details: list[str] = field(default_factory=list)
+
+    def has_data(self) -> bool:
+        return (bool(self.windows) or bool(self.details)) and self.unavailable_reason is None
+
+
+#: Prefix the cache gives an account row that has no usable user ``id`` (a
+#: malformed entry, or a fetcher that omitted one). It is only a hint: the
+#: cache still disambiguates any real collision with a deterministic suffix, so
+#: a generated row and a configured row can never silently hide each other.
+GENERATED_ACCOUNT_ID_PREFIX = "__invalid-"
+
+
+@dataclass
 class QuotaResult:
     """Normalized quota for one provider, ready to cache."""
 
@@ -71,13 +100,19 @@ class QuotaResult:
     details: list[str] = field(default_factory=list)
     account_balances: list[AccountBalance] = field(default_factory=list)
     api_calls_available: Optional[bool] = None
-    # Optional per-account records; no identity or credential material.
-    accounts: list[QuotaResult] = field(default_factory=list)
-    # Optional explicit display label for the legacy single-account shape.
+    # Additional provider accounts: Claude uses QuotaAccount rows with stable IDs;
+    # Codex uses nested QuotaResult records for saved-account display.
+    accounts: list[Union[QuotaAccount, QuotaResult]] = field(default_factory=list)
+    # Explicit label for legacy single-account provider records (Codex).
     account_label: Optional[str] = None
 
     def has_data(self) -> bool:
-        return (bool(self.windows) or bool(self.details) or bool(self.account_balances) or any(a.has_data() for a in self.accounts)) and self.unavailable_reason is None
+        return (
+            bool(self.windows)
+            or bool(self.details)
+            or bool(self.account_balances)
+            or any(a.has_data() for a in self.accounts)
+        ) and self.unavailable_reason is None
 
 
 def build_unavailable(

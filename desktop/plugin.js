@@ -51,7 +51,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "2.9.0";
+const WIDGET_VERSION = "2.10.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -379,20 +379,50 @@ const PROVIDER_META = {
 	ollama: { name: "Ollama", mono: "OL" },
 };
 
+function baseProviderId(pid) {
+	// Extra accounts are cached as <provider>:<account_id>; the icon and
+	// display name come from the base provider, while the account label
+	// distinguishes the row.
+	const text = String(pid || "");
+	const colon = text.indexOf(":");
+	return colon > 0 ? text.slice(0, colon) : text;
+}
+
 function providerMeta(pid) {
+	const base = baseProviderId(pid);
 	return (
-		PROVIDER_META[pid] || {
-			name: pid,
-			mono: String(pid || "?")
+		PROVIDER_META[base] || {
+			name: base,
+			mono: String(base || "?")
 				.slice(0, 2)
 				.toUpperCase(),
 		}
 	);
 }
 
+// A row's own account label is preferred over the plain provider name so a
+// second Claude login reads "Anthropic · Work" instead of a duplicate
+// "Anthropic".
+function providerDisplayName(pid, provider) {
+	const meta = providerMeta(pid);
+	let account =
+		provider && typeof provider.account_label === "string"
+			? provider.account_label.trim()
+			: "";
+	if (!account) {
+		// Fall back to the pid suffix ("anthropic:work") when the provider
+		// object is missing, so an account row is never shown as a bare
+		// duplicate of its base provider.
+		const text = String(pid || "");
+		const colon = text.indexOf(":");
+		account = colon > 0 ? text.slice(colon + 1).trim() : "";
+	}
+	return account ? `${meta.name} · ${account}` : meta.name;
+}
+
 function ProviderBadge({ pid }) {
 	const meta = providerMeta(pid);
-	const svg = PROVIDER_SVGS[pid];
+	const svg = PROVIDER_SVGS[baseProviderId(pid)];
 	if (svg) {
 		// dangerouslySetInnerHTML is safe here: the path data is a build-time
 		// constant inlined from @lobehub/icons, never user input.
@@ -1233,10 +1263,6 @@ function codexAccountsTip(provider) {
 	return lines.join("\n");
 }
 
-function providerDisplayName(pid, provider) {
-	return providerMeta(pid).name + (provider?.account_label ? ` · ${provider.account_label}` : "");
-}
-
 function ProviderChip({ pid, provider }) {
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? provider.display_remaining : worstWindow(provider);
 	const facts = accountFacts(provider);
@@ -1288,16 +1314,21 @@ function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 // plus plan and detail lines (credits, banked resets).
 function makeProviderTip(pid, provider) {
 	if (provider?.display_accounts) return codexAccountsTip(provider);
-	const meta = { name: providerDisplayName(pid, provider) };
-	if (!provider) return `${meta.name}: unavailable`;
-	if (provider.unavailable_reason) return `${meta.name}: unavailable (${provider.unavailable_reason})`;
+	const name = providerDisplayName(pid, provider);
+	if (!provider) return `${name}: unavailable`;
+	const details = asList(provider && provider.details);
+	if (provider.unavailable_reason) {
+		// Preserve actionable diagnostics alongside the reason code.
+		const lines = [`${name}: unavailable (${provider.unavailable_reason})`, ...details];
+		lines.push("Click to open Quota pane");
+		return lines.join("\n");
+	}
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
 	lines.push(...facts.balances.map((b) => `Account balance: ${balanceText(b)}`));
 	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
-	lines.unshift(meta.name);
-	const details = asList(provider && provider.details);
+	lines.unshift(name);
 	if (details.length) lines.push(...details);
 	lines.push("Click to open Quota pane");
 	return lines.join("\n");
@@ -1714,7 +1745,7 @@ function DisabledProvidersControl() {
 										children: enabled ? "●" : "○",
 									}),
 									jsx(ProviderBadge, { pid }),
-									jsx("span", { children: providerMeta(pid).name }),
+									jsx("span", { children: providerDisplayName(pid, p) }),
 								],
 							}),
 						},

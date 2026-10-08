@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from .quota_providers import PROVIDER_FETCHERS, QuotaResult
+from .quota_providers import PROVIDER_FETCHERS, QuotaAccount, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
 from .quota_providers.codex import display_label
 
 logger = logging.getLogger(__name__)
@@ -112,9 +112,7 @@ def iter_account_records(providers):
 
 
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
-    return {
-        **({"account_label": res.account_label} if res.account_label else {}),
-        **({"accounts": [_result_to_record(a) for a in res.accounts]} if res.accounts else {}),
+    record: dict[str, Any] = {
         "label": res.label,
         "plan": res.plan,
         "unavailable_reason": res.unavailable_reason,
@@ -130,6 +128,98 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
             for w in res.windows
         ],
     }
+    if res.account_label:
+        record["account_label"] = res.account_label
+    if res.accounts:
+        record["accounts"] = [
+            ({
+                "id": account.id,
+                "label": account.label,
+                "plan": account.plan,
+                "unavailable_reason": account.unavailable_reason,
+                "details": list(account.details or []),
+                "windows": [
+                    {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
+                    for w in account.windows
+                ],
+            } if isinstance(account, QuotaAccount) else _result_to_record(account))
+            for account in res.accounts
+        ]
+    return record
+
+
+def _account_row_key(rows: dict[str, Any], provider_id: str,
+                     account_id: Optional[str], index: int) -> str:
+    """A cache key for one account row that never collides with an existing one.
+
+    A generated id (an account with no usable user id) uses the reserved
+    ``GENERATED_ACCOUNT_ID_PREFIX`` namespace; if it — or any configured id —
+    still matches an existing row, a deterministic ``#N`` suffix keeps both rows
+    visible instead of silently dropping one.
+    """
+    if isinstance(account_id, str) and account_id.strip():
+        base = f"{provider_id}:{account_id.strip()}"
+    else:
+        base = f"{provider_id}:{GENERATED_ACCOUNT_ID_PREFIX}{index + 1}"
+    if base not in rows:
+        return base
+    suffix = 2
+    candidate = f"{base}#{suffix}"
+    while candidate in rows:
+        suffix += 1
+        candidate = f"{base}#{suffix}"
+    return candidate
+
+
+def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
+    """Flatten a provider record and its nested accounts into sibling rows.
+
+    The fetcher owns the account/config logic and attaches accounts nested on
+    its result; here each one becomes a ``<provider_id>:<account_id>`` record so
+    the cache stays a plain ``provider -> record`` map. Every offline consumer
+    (footer, /quota, widget) then reads account rows with no account-specific
+    code, and an account with no data is a truthful muted row rather than a
+    missing one.
+    """
+    if not isinstance(record, dict):
+        return {provider_id: record}
+    # Shallow copy: never mutate the fetcher's own record while stripping the
+    # nested accounts key that only exists on the wire.
+    record = dict(record)
+    nested = record.pop("accounts", None)
+    # Codex keeps its saved accounts nested: its Desktop selector and tooltip
+    # consume that shape. Claude QuotaAccount rows have stable IDs and are
+    # expanded below into collision-safe provider siblings.
+    if provider_id == "openai-codex" and isinstance(nested, list):
+        record["accounts"] = nested
+        return {provider_id: record}
+    rows: dict[str, Any] = {provider_id: record}
+    if not isinstance(nested, list):
+        return rows
+    base_label = record.get("label") or provider_id
+    for index, account in enumerate(nested):
+        if not isinstance(account, dict):
+            continue
+        account_id = account.get("id")
+        key = _account_row_key(rows, provider_id, account_id, index)
+        label = account.get("label")
+        account_label = label.strip() if isinstance(label, str) and label.strip() else None
+        reason = account.get("unavailable_reason")
+        details = account.get("details")
+        windows = account.get("windows")
+        rows[key] = {
+            "label": f"{base_label} · {account_label}" if account_label else base_label,
+            "provider": provider_id,
+            "account_id": account_id.strip() if isinstance(account_id, str) and account_id.strip() else None,
+            "account_label": account_label,
+            "plan": account.get("plan"),
+            "unavailable_reason": reason if isinstance(reason, str) and reason else None,
+            "details": [str(d) for d in details] if isinstance(details, list) else [],
+            "windows": windows if isinstance(windows, list) else [],
+            "account_balances": [],
+            "api_calls_available": None,
+        }
+    return rows
 
 
 def _unavailable_record(provider_id: str, reason: str) -> dict[str, Any]:
@@ -211,11 +301,10 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
         event.wait(max(0.0, deadline - time.monotonic()))
 
     with lock:
-        providers: dict[str, Any] = {
-            provider_id: results.get(provider_id)
-            or _unavailable_record(provider_id, "timeout")
-            for provider_id, _fetcher in items
-        }
+        providers: dict[str, Any] = {}
+        for provider_id, _fetcher in items:
+            record = results.get(provider_id) or _unavailable_record(provider_id, "timeout")
+            providers.update(_expand_accounts(provider_id, record))
 
     cache = {"fetched_at": datetime.now(timezone.utc).isoformat(), "providers": providers}
 

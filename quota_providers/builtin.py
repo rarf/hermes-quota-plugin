@@ -5,17 +5,38 @@ is fetched directly because its single OAuth payload contains both the legacy
 windows and newer model-scoped limits. We adapt those snapshots into the
 plugin's QuotaResult shape and register them so the cache builder treats them
 uniformly with the other fetchers.
+
+Anthropic also supports additional Claude subscription logins: an explicit,
+opt-in ``claudeAccounts`` list in the plugin settings points at other Claude
+config directories, each read read-only for its access token. Those accounts
+are attached as ``QuotaAccount`` rows and flattened by the cache into sibling
+provider rows, so the footer, /quota and the widget render them with no
+account-specific code. No account is read unless it was listed.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import re
+import stat
+import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import (
+    GENERATED_ACCOUNT_ID_PREFIX,
+    Deadline,
+    QuotaAccount,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    urlopen_no_redirect,
+)
 from .registry import register as _register
 
 
@@ -97,6 +118,39 @@ _ANTHROPIC_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 # Keep one direct usage read below the cache refresh budget. The response is
 # parsed for both the legacy top-level windows and the newer ``limits`` list.
 _ANTHROPIC_TIMEOUT_S = 15.0
+# The whole multi-account fetch (primary plus every extra account, run
+# serially) shares this budget, so N accounts cannot each spend the full
+# timeout and blow through ``quota_cache.REFRESH_BUDGET_S`` (20s). Serially is
+# deliberate: it bounds concurrent work to one request at a time and lets a
+# spent budget mark later accounts ``timeout`` truthfully instead of opening N
+# threads.
+_ANTHROPIC_MULTI_BUDGET_S = 18.0
+# Extra Claude subscription accounts live in the quota plugin settings as
+# ``claudeAccounts``: an explicit, opt-in list of {id, label, configDir}. No
+# account is read unless the user added it here; an absent setting keeps the
+# single-account path byte-identical.
+_CLAUDE_ACCOUNTS_SETTING = "claudeAccounts"
+_CLAUDE_ACCOUNT_ID_MAX = 64
+_MAX_CLAUDE_ACCOUNTS = 8
+_CLAUDE_CREDENTIALS_FILENAME = ".credentials.json"
+# Upper bound on a single ``.credentials.json`` read. The real file is a few
+# hundred bytes of JSON; anything larger is refused rather than slurped, and the
+# file is only ever read through a stat-verified regular-file descriptor.
+_MAX_CREDENTIAL_BYTES = 65536
+# Upper bound on one usage response body, read with a ``+1`` probe so an
+# oversized body is detected rather than silently truncated.
+_MAX_HTTP_BYTES = 65536
+_CLAUDE_LIMIT_REASON = "config-limit"
+_MACOS_UNSUPPORTED_DETAIL = (
+    "macOS Claude Code keeps its login in the Keychain (service "
+    "\"Claude Code-credentials\"); per-directory Keychain items are not "
+    "documented or read here. Point configDir at a directory that contains "
+    ".credentials.json, or use the default Hermes login."
+)
+_ACCOUNT_TIMEOUT_DETAIL = "Shared refresh budget was spent before this account was read."
+_ACCOUNT_LIMIT_DETAIL = (
+    f"Only the first {_MAX_CLAUDE_ACCOUNTS} claudeAccounts entries are read."
+)
 
 
 def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
@@ -157,13 +211,14 @@ def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
     return windows
 
 
-def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Fetch the OAuth usage payload once, including all supported shapes."""
-    token = _core_anthropic_token()
-    if not token:
-        return None, "no-credentials"
-    if _core_anthropic_is_oauth(token) is False:
-        return None, _ANTHROPIC_OAUTH_REQUIRED_REASON
+def _request_anthropic_usage(
+    token: str, *, timeout: float = _ANTHROPIC_TIMEOUT_S
+) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """One bounded, redirect-free usage read for a given bearer token.
+
+    ``token`` is passed in, never resolved here, so the same request path
+    serves the core-resolved account and every configured extra account.
+    """
     request = urllib.request.Request(
         _ANTHROPIC_USAGE_URL,
         headers={
@@ -171,13 +226,16 @@ def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]
             "Accept": "application/json",
             "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.0",
+            "User-Agent": "hermes-quota-plugin/2.10.0",
         },
         method="GET",
     )
     try:
-        with urlopen_no_redirect(request, timeout=_ANTHROPIC_TIMEOUT_S) as resp:
-            payload = json.loads(resp.read())
+        with urlopen_no_redirect(request, timeout=timeout) as resp:
+            body = resp.read(_MAX_HTTP_BYTES + 1)
+        if len(body) > _MAX_HTTP_BYTES:
+            return None, "bad-json"
+        payload = json.loads(body)
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return None, "auth-failed"
@@ -187,6 +245,16 @@ def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]
     if not isinstance(payload, dict):
         return None, "bad-json"
     return payload, None
+
+
+def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Fetch the OAuth usage payload once for the core-resolved account."""
+    token = _core_anthropic_token()
+    if not token:
+        return None, "no-credentials"
+    if _core_anthropic_is_oauth(token) is False:
+        return None, _ANTHROPIC_OAUTH_REQUIRED_REASON
+    return _request_anthropic_usage(token)
 
 
 def _parse_anthropic_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], list[str]]:
@@ -248,7 +316,316 @@ def _parse_anthropic_usage(payload: dict[str, Any]) -> tuple[list[QuotaWindow], 
     return windows, details
 
 
-def _fetch_anthropic() -> QuotaResult:
+# -- Anthropic extra accounts (opt-in, config-driven) -------------------------
+# Claude Code relocates its whole config directory with ``CLAUDE_CONFIG_DIR``
+# and keeps the OAuth login in ``<dir>/.credentials.json`` as
+# ``{"claudeAiOauth": {"accessToken": ...}}``. That file is the one Claude
+# Code's own CLI writes; it is read here, never written. Additional accounts
+# are declared explicitly under ``claudeAccounts``; nothing is discovered by
+# scanning the home directory or by reading any account that was not listed.
+
+
+def _effective_claude_config_dir() -> Path:
+    """The Claude config dir the current process already resolves to.
+
+    Delegates to the installed Claude reader so ``CLAUDE_CONFIG_DIR`` and the
+    platform default are honoured exactly as the rest of Hermes sees them.
+    """
+    try:
+        from agent.anthropic_credentials import claude_code_credentials_path
+
+        return claude_code_credentials_path().parent
+    except Exception:  # noqa: BLE001 - standalone install / core not importable
+        override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+        return Path(override).expanduser() if override else Path.home() / ".claude"
+
+
+def _canonical_dir(path: Path) -> str:
+    """Stable key for "the same directory" — literal path, never printed."""
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+    except OSError:
+        resolved = path.expanduser()
+    return os.path.normcase(str(resolved))
+
+
+def _token_fingerprint(token: Optional[str]) -> Optional[str]:
+    """One-way fingerprint used only to dedupe identical credentials in memory."""
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _claude_accounts_setting() -> tuple[list[dict[str, Any]], bool]:
+    """Validated ``claudeAccounts`` entries and whether the setting is present.
+
+    ``configured`` is False when the setting is absent *or* an empty list — both
+    keep the byte-identical single-account path. Present-but-malformed values
+    become explicit ``config-invalid`` entries so the user sees an actionable
+    card instead of a silent no-op. Parsing is bounded to
+    ``_MAX_CLAUDE_ACCOUNTS`` entries plus one ``config-limit`` summary row, so a
+    config with hundreds of items cannot flood the cache or the UI.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:  # noqa: BLE001 - standalone install / locked store
+        return [], False
+    plugins = config.get("plugins") if isinstance(config, dict) else None
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get("quota") if isinstance(entries, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    if not isinstance(settings, dict) or _CLAUDE_ACCOUNTS_SETTING not in settings:
+        return [], False
+    raw = settings.get(_CLAUDE_ACCOUNTS_SETTING)
+    if raw is None:
+        return [], True
+    # ``hermes config set`` parses a JSON/YAML list literal into a real list
+    # before writing it (verified against the installed CLI), but a value stored
+    # by another writer may still be a JSON string: accept both, and reject a
+    # string that is not valid JSON with an actionable message.
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return [], False
+        try:
+            raw = json.loads(text)
+        except ValueError:
+            return [{
+                "error": "config-invalid",
+                "detail": f"settings.{_CLAUDE_ACCOUNTS_SETTING} is not valid JSON.",
+            }], True
+    if not isinstance(raw, list):
+        return [{
+            "error": "config-invalid",
+            "detail": f"settings.{_CLAUDE_ACCOUNTS_SETTING} must be a list of "
+                      "{id, label, configDir} objects.",
+        }], True
+    if not raw:
+        return [], False  # an empty list behaves exactly like an absent one
+
+    out: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    truncated = len(raw) > _MAX_CLAUDE_ACCOUNTS
+    for index, item in enumerate(raw[:_MAX_CLAUDE_ACCOUNTS]):
+        position = index + 1
+        if not isinstance(item, dict):
+            out.append({"index": position, "error": "config-invalid",
+                        "detail": f"account #{position} is not an object; expected "
+                                  "{id, label, configDir}."})
+            continue
+        label = item.get("label")
+        if label is not None and (
+            not isinstance(label, str) or len(label) > 80
+            or any(ord(char) < 32 or ord(char) == 127 for char in label)
+        ):
+            out.append({"index": position, "error": "config-invalid",
+                        "detail": f"account #{position} label must be at most 80 characters with no control characters."})
+            continue
+        account_id = item.get("id")
+        config_dir = item.get("configDir", item.get("config_dir"))
+        if not isinstance(account_id, str) or not account_id.strip():
+            out.append({"index": position, "label": label if isinstance(label, str) else None,
+                        "error": "config-invalid",
+                        "detail": f"account #{position} needs a non-empty string 'id'."})
+            continue
+        account_id = account_id.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", account_id):
+            out.append({"index": position, "label": label if isinstance(label, str) else None,
+                        "error": "config-invalid",
+                        "detail": f"account id for #{position} must start with an ASCII letter or digit and contain only ASCII letters, digits, '.', '_' or '-' (maximum {_CLAUDE_ACCOUNT_ID_MAX} characters)."})
+            continue
+        if account_id in seen_ids:
+            out.append({"index": position, "label": label if isinstance(label, str) else None,
+                        "error": "config-invalid",
+                        "detail": f"duplicate claudeAccounts id '{account_id}'."})
+            continue
+        if not isinstance(config_dir, str) or not config_dir.strip():
+            out.append({"index": position, "id": account_id, "label": label if isinstance(label, str) else None,
+                        "error": "config-invalid",
+                        "detail": f"account '{account_id}' needs a non-empty string 'configDir'."})
+            continue
+        seen_ids.add(account_id)
+        out.append({
+            "id": account_id,
+            "label": label.strip() if isinstance(label, str) and label.strip() else account_id,
+            "config_dir": config_dir.strip(),
+        })
+    if truncated:
+        out.append({
+            "index": _MAX_CLAUDE_ACCOUNTS + 1,
+            "error": _CLAUDE_LIMIT_REASON,
+            "detail": _ACCOUNT_LIMIT_DETAIL,
+        })
+    return out, True
+
+
+def _read_claude_account_token(config_dir: str) -> tuple[Optional[str], Optional[str]]:
+    """Read-only access token from a Claude config dir, or a failure reason.
+
+    The path mirrors the installed Claude reader: ``<configDir>/.credentials.json``
+    holding ``{"claudeAiOauth": {"accessToken": "..."}}``. That layout is
+    implementation-derived from Claude Code's own reader, not a published
+    credential spec, and only the Linux form is verified here.
+
+    The file is opened once with ``O_NONBLOCK`` and the *descriptor* is fstat'd,
+    so a symlink to a FIFO/device (or a file swapped in between a path check and
+    the open) can neither block the worker thread nor be slurped without bound:
+    only a regular file of at most ``_MAX_CREDENTIAL_BYTES`` is read. The token
+    and the resolved path are never logged, returned in a reason, or cached. A
+    missing file on macOS is ``unsupported-platform`` (the login there lives in
+    a Keychain item this plugin cannot address per directory); elsewhere it is
+    ``no-credentials``.
+    """
+    path = Path(config_dir).expanduser() / _CLAUDE_CREDENTIALS_FILENAME
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        if sys.platform == "darwin":
+            return None, "unsupported-platform"
+        return None, "no-credentials"
+    except OSError:
+        return None, "no-credentials"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CREDENTIAL_BYTES:
+            return None, "no-credentials"
+        chunks: list[bytes] = []
+        remaining = _MAX_CREDENTIAL_BYTES
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks).decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None, "no-credentials"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None, "no-credentials"
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    token = oauth.get("accessToken") if isinstance(oauth, dict) else None
+    if isinstance(token, str) and token.strip():
+        return token.strip(), None
+    return None, "no-credentials"
+
+
+def _invalid_account(entry: dict[str, Any]) -> QuotaAccount:
+    """An actionable ``config-invalid``/``config-limit`` row for a bad entry."""
+    account_id = entry.get("id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        account_id = f"{GENERATED_ACCOUNT_ID_PREFIX}{entry.get('index') or 'x'}"
+    label = entry.get("label")
+    if not isinstance(label, str) or not label.strip():
+        position = entry.get("index")
+        label = f"Account {position}" if position else account_id
+    detail = entry.get("detail") if isinstance(entry.get("detail"), str) else "Invalid claudeAccounts entry."
+    error = entry.get("error")
+    reason = error if isinstance(error, str) and error else "config-invalid"
+    return QuotaAccount(id=account_id.strip(), label=label.strip(),
+                        unavailable_reason=reason, details=[detail])
+
+
+def _credential_details(reason: Optional[str]) -> list[str]:
+    if reason == "unsupported-platform":
+        return [_MACOS_UNSUPPORTED_DETAIL]
+    return []
+
+
+def _claude_account_results(
+    entries: list[dict[str, Any]],
+    *,
+    primary_token: Optional[str],
+    deadline: Deadline,
+) -> list[QuotaAccount]:
+    """Fetch every configured extra account under one shared deadline.
+
+    Identity is never inferred from a directory. A listed account is read even
+    when it points at the same directory the core resolver uses, because the
+    core token may come from ``ANTHROPIC_API_KEY``, the environment, or a
+    different OAuth grant rather than that file. Dedup is exact: a listed
+    directory seen twice, or an access token byte-identical to the primary's or
+    to a previously listed account's, becomes one card. Accounts are never
+    merged by organization or by an equal quota.
+
+    The result is bounded: at most ``_MAX_CLAUDE_ACCOUNTS`` rows are produced,
+    and when entries remain beyond the bound exactly one ``config-limit`` row is
+    appended, so a huge or all-invalid config cannot flood the cache and UI.
+    """
+    accounts: list[QuotaAccount] = []
+    # Only directories the user actually listed are collapsed together; the
+    # primary's directory is deliberately absent so a listed account pointing at
+    # it is still read (and deduped by token, not by path).
+    seen_dirs: set[str] = set()
+    seen_tokens: set[str] = set()
+    primary_fp = _token_fingerprint(primary_token)
+    if primary_fp:
+        seen_tokens.add(primary_fp)
+    fetched = 0
+    overflow = False
+    for entry in entries:
+        if len(accounts) >= _MAX_CLAUDE_ACCOUNTS:
+            overflow = True
+            break
+        if "error" in entry:
+            accounts.append(_invalid_account(entry))
+            continue
+        if fetched >= _MAX_CLAUDE_ACCOUNTS:
+            overflow = True
+            break
+        account_dir = Path(entry["config_dir"]).expanduser()
+        canonical = _canonical_dir(account_dir)
+        if canonical in seen_dirs:
+            continue
+        seen_dirs.add(canonical)
+        fetched += 1
+        if deadline.expired():
+            accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                         unavailable_reason="timeout",
+                                         details=[_ACCOUNT_TIMEOUT_DETAIL]))
+            continue
+        token, reason = _read_claude_account_token(str(account_dir))
+        if not token:
+            accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                         unavailable_reason=reason or "no-credentials",
+                                         details=_credential_details(reason)))
+            continue
+        fingerprint = _token_fingerprint(token)
+        if fingerprint in seen_tokens:
+            continue
+        seen_tokens.add(fingerprint)
+        payload, reason = _request_anthropic_usage(
+            token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+        if payload is None:
+            accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                         unavailable_reason=reason or "no-data"))
+            continue
+        windows, details = _parse_anthropic_usage(payload)
+        if not windows and not details:
+            accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                         unavailable_reason="no-data"))
+            continue
+        accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                     windows=windows, details=details))
+    if overflow:
+        accounts.append(QuotaAccount(
+            id=f"{GENERATED_ACCOUNT_ID_PREFIX}limit",
+            label="Additional accounts",
+            unavailable_reason=_CLAUDE_LIMIT_REASON,
+            details=[_ACCOUNT_LIMIT_DETAIL]))
+    return accounts
+
+
+def _fetch_anthropic_single() -> QuotaResult:
     """Fetch and parse Anthropic's usage payload in one network request."""
     try:
         payload, reason = _anthropic_usage_payload()
@@ -269,6 +646,46 @@ def _fetch_anthropic() -> QuotaResult:
         unavailable_reason=None,
         details=details,
     )
+
+
+def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
+    """Fetch the core account plus every configured extra account."""
+    deadline = Deadline(_ANTHROPIC_MULTI_BUDGET_S)
+    token = _core_anthropic_token()
+    primary: Optional[QuotaResult] = None
+    primary_reason: Optional[str] = None
+    if not token:
+        primary_reason = "no-credentials"
+    elif _core_anthropic_is_oauth(token) is False:
+        primary_reason = _ANTHROPIC_OAUTH_REQUIRED_REASON
+    else:
+        payload, reason = _request_anthropic_usage(
+            token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+        if payload is None:
+            primary_reason = reason or "no-data"
+        else:
+            windows, details = _parse_anthropic_usage(payload)
+            if windows or details:
+                primary = QuotaResult(label="anthropic", windows=windows, details=details)
+            else:
+                primary_reason = "no-data"
+
+    result = primary or build_unavailable("anthropic", primary_reason or "no-data")
+    result.accounts = _claude_account_results(
+        entries, primary_token=token, deadline=deadline)
+    return result
+
+
+def _fetch_anthropic() -> QuotaResult:
+    """Anthropic usage: the core account, plus any configured extra accounts.
+
+    With no ``claudeAccounts`` — or an empty list — this is exactly the
+    historical single-account fetch: same request, same result, no accounts.
+    """
+    entries, configured = _claude_accounts_setting()
+    if not configured or not entries:
+        return _fetch_anthropic_single()
+    return _fetch_anthropic_multi(entries)
 
 
 _register("anthropic")(_fetch_anthropic)

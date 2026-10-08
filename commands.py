@@ -22,7 +22,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
 from .quota_providers import PROVIDER_FETCHERS
@@ -72,6 +72,22 @@ def _age_label() -> str:
     return f"stale ({int(age // 60)}m old)"
 
 
+def _matches_filter(pf: str, name: str, rec: Any) -> bool:
+    """Whether a ``/quota <filter>`` matches this provider row.
+
+    A row matches on its cache key, its label, and — for an account row — its
+    base provider and its account label, so ``/quota anthropic`` lists the
+    primary login and every configured Claude account together.
+    """
+    candidates = {name.lower()}
+    if isinstance(rec, dict):
+        for key in ("label", "provider", "account_label"):
+            value = rec.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.add(value.strip().lower())
+    return pf in candidates
+
+
 def _render_quota(provider_filter: Optional[str]) -> str:
     """Render the per-provider quota breakdown (optionally filtered)."""
     cache = read_quota_cache()
@@ -84,20 +100,24 @@ def _render_quota(provider_filter: Optional[str]) -> str:
     lines = [f"📊 **quota** ({_age_label()})", ""]
     shown = 0
     for name, rec in iter_account_records(providers):
-        if pf and pf not in (name.lower(), (rec.get("label") or "").lower()):
+        if pf and not _matches_filter(pf, name, rec):
             continue
         shown += 1
         if not isinstance(rec, dict):
             continue
         label = rec.get("label") or name
         reason = rec.get("unavailable_reason")
+        details = rec.get("details")
+        if not isinstance(details, list):
+            details = []
         if reason:
+            # Keep the reason AND its actionable detail lines: "unavailable
+            # (config-invalid)" alone hides the exact fix the detail carries.
             lines.append(f"• **{label}**: unavailable ({reason})")
-            for detail in rec.get("details") or []:
-                lines.append(f"• **{label}** · {detail}")
+            for detail in details:
+                lines.append(f"  · {detail}")
             continue
         windows = rec.get("windows") or []
-        details = rec.get("details") or []
         for detail in details:
             lines.append(f"• **{label}** · {detail}")
         if not windows:
