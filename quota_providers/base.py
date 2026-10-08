@@ -5,7 +5,7 @@ from __future__ import annotations
 import urllib.request
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -76,6 +76,9 @@ class QuotaAccount:
     unavailable_reason: Optional[str] = None
     details: list[str] = field(default_factory=list)
 
+    def has_data(self) -> bool:
+        return (bool(self.windows) or bool(self.details)) and self.unavailable_reason is None
+
 
 #: Prefix the cache gives an account row that has no usable user ``id`` (a
 #: malformed entry, or a fetcher that omitted one). It is only a hint: the
@@ -97,17 +100,34 @@ class QuotaResult:
     details: list[str] = field(default_factory=list)
     account_balances: list[AccountBalance] = field(default_factory=list)
     api_calls_available: Optional[bool] = None
-    # Additional accounts for this provider. Generic: any fetcher may attach
-    # them and the cache expands each into a sibling provider row, so every
-    # consumer sees a plain list of provider records.
-    accounts: list[QuotaAccount] = field(default_factory=list)
+    # Additional provider accounts: Claude uses QuotaAccount rows with stable IDs;
+    # Codex uses nested QuotaResult records for saved-account display.
+    accounts: list[Union[QuotaAccount, QuotaResult]] = field(default_factory=list)
+    # Explicit label for legacy single-account provider records (Codex).
+    account_label: Optional[str] = None
 
     def has_data(self) -> bool:
-        return (bool(self.windows) or bool(self.details) or bool(self.account_balances)) and self.unavailable_reason is None
+        return (
+            bool(self.windows)
+            or bool(self.details)
+            or bool(self.account_balances)
+            or any(a.has_data() for a in self.accounts)
+        ) and self.unavailable_reason is None
 
 
-def build_unavailable(label: str, reason: str) -> QuotaResult:
-    return QuotaResult(label=label, windows=[], plan=None, unavailable_reason=reason)
+def build_unavailable(
+    label: str,
+    reason: str,
+    details: Optional[list[str]] = None,
+) -> QuotaResult:
+    """Unavailable record; optional details carry per-credential diagnostics."""
+    return QuotaResult(
+        label=label,
+        windows=[],
+        plan=None,
+        unavailable_reason=reason,
+        details=details or [],
+    )
 
 
 def opt_in_flag(value: object) -> bool:

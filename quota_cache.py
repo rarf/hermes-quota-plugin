@@ -46,7 +46,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from .quota_providers import PROVIDER_FETCHERS, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
+from .quota_providers import PROVIDER_FETCHERS, QuotaAccount, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
+from .quota_providers.codex import display_label
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,22 @@ def quota_cache_age_seconds() -> Optional[float]:
         return None
 
 
+def iter_account_records(providers):
+    """Expand optional Codex accounts without changing the provider identity."""
+
+    for name, record in providers.items():
+        accounts = record.get("accounts") if name == "openai-codex" and isinstance(record, dict) else None
+        if isinstance(accounts, list) and accounts:
+            for index, account in enumerate(accounts):
+                if isinstance(account, dict):
+                    label = display_label(account.get("label")) or f"Account {index + 1}"
+                    yield name, {**account, "label": f"{name} · {label}"}
+        elif name == "openai-codex" and isinstance(record, dict) and display_label(record.get("account_label")):
+            yield name, {**record, "label": f"{name} · {display_label(record['account_label'])}"}
+        else:
+            yield name, record
+
+
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     record: dict[str, Any] = {
         "label": res.label,
@@ -111,23 +128,22 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
             for w in res.windows
         ],
     }
-    # Extra accounts ride along nested here and are flattened into sibling rows
-    # by ``_expand_accounts`` before the cache is written, so the on-disk shape
-    # stays a flat provider map. Only present when a fetcher attached some.
+    if res.account_label:
+        record["account_label"] = res.account_label
     if res.accounts:
         record["accounts"] = [
-            {
-                "id": a.id,
-                "label": a.label,
-                "plan": a.plan,
-                "unavailable_reason": a.unavailable_reason,
-                "details": list(a.details or []),
+            ({
+                "id": account.id,
+                "label": account.label,
+                "plan": account.plan,
+                "unavailable_reason": account.unavailable_reason,
+                "details": list(account.details or []),
                 "windows": [
                     {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
-                    for w in a.windows
+                    for w in account.windows
                 ],
-            }
-            for a in res.accounts
+            } if isinstance(account, QuotaAccount) else _result_to_record(account))
+            for account in res.accounts
         ]
     return record
 
@@ -171,6 +187,12 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
     # nested accounts key that only exists on the wire.
     record = dict(record)
     nested = record.pop("accounts", None)
+    # Codex keeps its saved accounts nested: its Desktop selector and tooltip
+    # consume that shape. Claude QuotaAccount rows have stable IDs and are
+    # expanded below into collision-safe provider siblings.
+    if provider_id == "openai-codex" and isinstance(nested, list):
+        record["accounts"] = nested
+        return {provider_id: record}
     rows: dict[str, Any] = {provider_id: record}
     if not isinstance(nested, list):
         return rows

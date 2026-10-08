@@ -856,47 +856,16 @@ _register("nous")(_fetch_nous_portal)
 # -- OpenAI Codex (with per-model Spark limits) ------------------------------
 # The core fetcher covers plan-level Session/Weekly windows, but drops
 # ``additional_rate_limits`` — the per-model quotas (e.g. GPT-5.3-Codex-Spark)
-# the Codex backend reports alongside them. This fetcher reuses the core
-# credential resolution and parses the raw payload so Spark windows surface.
+# the Codex backend reports alongside them. The read-only adapter enumerates
+# saved credentials; this parser normalizes each account independently.
 
 def _fetch_codex_with_models() -> QuotaResult:
-    try:
-        from agent.account_usage import _resolve_codex_usage_credentials
-        try:
-            from agent.account_usage import _codex_backend_urls
-        except ImportError:
-            _codex_backend_urls = None
-        try:
-            from agent.account_usage import _resolve_codex_usage_url
-        except ImportError:
-            _resolve_codex_usage_url = None
-        if _codex_backend_urls is None and _resolve_codex_usage_url is None:
-            raise ImportError("no Codex usage URL helper")
-    except Exception:
-        return build_unavailable("openai-codex", "fetcher-unavailable")
+    from .codex import fetch_codex_quota
 
-    import httpx
+    return fetch_codex_quota(_parse_codex_payload)
 
-    try:
-        token, base_url, account_id = _resolve_codex_usage_credentials(None, None)
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-            "User-Agent": "codex-cli",
-        }
-        if account_id:
-            headers["ChatGPT-Account-Id"] = account_id
-        if _codex_backend_urls is not None:
-            usage_url = _codex_backend_urls(base_url)[0]
-        else:
-            usage_url = _resolve_codex_usage_url(base_url)
-        with httpx.Client(timeout=15.0) as client:
-            response = client.get(usage_url, headers=headers)
-            response.raise_for_status()
-        payload = response.json() or {}
-    except Exception:
-        return build_unavailable("openai-codex", "fetch-error")
 
+def _parse_codex_payload(payload: dict) -> QuotaResult:
     from datetime import datetime, timezone
 
     def _iso(ts):
@@ -910,6 +879,8 @@ def _fetch_codex_with_models() -> QuotaResult:
             return None
 
     def _window(raw: dict, label: str) -> Optional[QuotaWindow]:
+        if not isinstance(raw, dict):
+            return None
         used = raw.get("used_percent")
         if not isinstance(used, (int, float)) or isinstance(used, bool):
             return None
@@ -926,18 +897,27 @@ def _fetch_codex_with_models() -> QuotaResult:
         )
 
     windows: list[QuotaWindow] = []
-    # Everything below runs after the request try/except has closed, so each
-    # value is shape-checked here rather than assumed to be a dict.
+    # A malformed optional field must not erase healthy quota windows.
     rate_limit = payload.get("rate_limit")
     if not isinstance(rate_limit, dict):
         rate_limit = {}
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
-        w = _window(rate_limit.get(key) or {}, label)
+    duration_labels = {18_000: "Session", 604_800: "Weekly"}
+    for key, fallback in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+        raw_window = rate_limit.get(key)
+        raw_window = raw_window if isinstance(raw_window, dict) else {}
+        seconds = raw_window.get("limit_window_seconds")
+        label = fallback
+        if isinstance(seconds, int) and not isinstance(seconds, bool):
+            label = duration_labels.get(seconds, fallback)
+        elif isinstance(seconds, float) and math.isfinite(seconds):
+            label = duration_labels.get(int(seconds), fallback)
+        w = _window(raw_window, label)
         if w is not None:
             windows.append(w)
 
     # Per-model limits (research-preview models like Codex Spark).
-    for extra in payload.get("additional_rate_limits") or []:
+    extras = payload.get("additional_rate_limits")
+    for extra in extras if isinstance(extras, list) else ():
         if not isinstance(extra, dict):
             continue
         model_name = str(extra.get("limit_name") or "").strip()
@@ -956,8 +936,17 @@ def _fetch_codex_with_models() -> QuotaResult:
     reset_credits = payload.get("rate_limit_reset_credits")
     if not isinstance(reset_credits, dict):
         reset_credits = {}
-    banked = reset_credits.get("available_count")
-    if isinstance(banked, (int, float)) and not isinstance(banked, bool) and int(banked) > 0:
+    def _finite_number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)
+            return value if math.isfinite(value) else None
+        except (OverflowError, ValueError):
+            return None
+
+    banked = _finite_number(reset_credits.get("available_count"))
+    if banked is not None and banked >= 1:
         count = int(banked)
         plural = "s" if count != 1 else ""
         details.append(f"You have {count} reset{plural} banked - use /usage reset to activate")
@@ -965,8 +954,8 @@ def _fetch_codex_with_models() -> QuotaResult:
     if not isinstance(credits, dict):
         credits = {}
     if credits.get("has_credits"):
-        balance = credits.get("balance")
-        if isinstance(balance, (int, float)):
+        balance = _finite_number(credits.get("balance"))
+        if balance is not None:
             details.append(f"Credits balance: ${float(balance):.2f}")
         elif credits.get("unlimited"):
             details.append("Credits balance: unlimited")

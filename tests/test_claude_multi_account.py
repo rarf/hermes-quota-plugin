@@ -820,7 +820,7 @@ class WidgetAccountRenderTests(unittest.TestCase):
                         windows=[],
                         details=["account #2 needs a non-empty string 'configDir'."])
         tree = render(component="chip", id="anthropic:work", provider=provider)
-        tip = tree["props"]["title"]
+        tip = tree["props"]["label"]["props"]["children"]
         self.assertIn("unavailable (config-invalid)", tip)
         self.assertIn("needs a non-empty string 'configDir'", tip)
 

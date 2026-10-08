@@ -269,13 +269,9 @@ class ResetDerivationTests(unittest.TestCase):
     documented rule. Verified against the live account: CreatedAt 2026-02-22
     with the settings page reading "Resets in 2 weeks" on 2026-10-03."""
 
-    def test_live_account_reset_lands_in_two_weeks(self):
+    def test_live_account_reset_uses_monthly_anniversary(self):
         got = ollama._next_monthly_reset("2026-02-22T09:45:23.470675Z")
-        self.assertTrue(got.startswith("2026-10-22"), got)
-        when = datetime.datetime.strptime(got, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=datetime.timezone.utc)
-        days = (when - datetime.datetime.now(datetime.timezone.utc)).days
-        self.assertEqual(days // 7, 2, "the page says 'Resets in 2 weeks'")
+        self.assertEqual(got, "2026-10-22T00:00:00Z")
 
     def test_always_returns_a_future_date(self):
         for created in ("2020-01-01T00:00:00Z", "2026-01-31T00:00:00Z",
@@ -294,9 +290,10 @@ class ResetDerivationTests(unittest.TestCase):
         self.assertTrue(got.endswith("T00:00:00Z"), got)
 
     def test_day_is_preserved(self):
-        self.assertTrue(ollama._next_monthly_reset("2026-02-22T09:45:23Z")
+        fixed_now = datetime.datetime(2026, 9, 30, 12, tzinfo=datetime.timezone.utc)
+        self.assertTrue(ollama._next_monthly_reset("2026-02-22T09:45:23Z", fixed_now)
                         .startswith("2026-10-22"))
-        self.assertTrue(ollama._next_monthly_reset("2026-08-05T00:00:00Z")
+        self.assertTrue(ollama._next_monthly_reset("2026-08-05T00:00:00Z", fixed_now)
                         .startswith("2026-10-05"))
 
     def test_short_month_start_clamps_rather_than_skipping(self):

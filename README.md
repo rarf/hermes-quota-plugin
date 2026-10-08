@@ -21,8 +21,6 @@ cd hermes-quota-plugin
 
 **The source installer enables quota for all existing profiles.** Review that scope before running it. For remote Desktop setups, install/update the widget on the computer running the app as well as the backend on the gateway. [Installation and updates](docs/installation.md).
 
-The multi-account candidate is not necessarily available on the published default branch or catalog pin. Verify the approved build before expecting that feature.
-
 ```bash
 hermes plugins doctor quota --ci
 hermes quota refresh

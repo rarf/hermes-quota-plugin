@@ -135,6 +135,10 @@ a known plan. Unknown plans retain a balance-only detail instead of an invented
 label or percentage. The provider's request group has its own 10-second
 wall-clock deadline, below the cache sweep budget.
 
+### OpenAI Codex saved accounts
+
+The cache keeps saved accounts nested under `providers["openai-codex"].accounts`; the pane and CLI render each separately, and the status bar selects one representative account rather than summing percentages. This is display-only and does not change inference routing. Polling is read-only: it does not refresh tokens, rotate credentials, modify auth files or redeem resets. Expired tokens require normal Hermes sign-in. Unknown or stale account data is not treated as exhaustion. See the Codex sections in the upstream history for provider-specific handling; labels are local display text, so choose screenshot-safe names.
+
 ### OpenCode (Go)
 
 Reads `GET https://opencode.ai/zen/go/v1/usage`. The key is resolved from

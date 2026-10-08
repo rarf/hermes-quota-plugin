@@ -14,7 +14,7 @@ the whole cache refresh.
 
 from __future__ import annotations
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, GENERATED_ACCOUNT_ID_PREFIX
+from .base import AccountBalance, QuotaAccount, QuotaResult, QuotaWindow, build_unavailable, GENERATED_ACCOUNT_ID_PREFIX
 from .registry import PROVIDER_FETCHERS, register, get_fetcher
 
 from . import grok  # noqa: F401
@@ -29,6 +29,7 @@ from . import zai  # noqa: F401
 from . import commandcode  # noqa: F401
 from . import cursor  # noqa: F401
 from . import deepseek  # noqa: F401
+from . import experientiallabs  # noqa: F401
 from . import minimax  # noqa: F401
 from . import ollama  # noqa: F401
 
