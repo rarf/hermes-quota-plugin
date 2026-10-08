@@ -12,6 +12,7 @@ No network: every HTTP boundary is a synthetic opener. No real credentials.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import importlib.util
 import json
@@ -77,8 +78,12 @@ class _Resp:
     def __exit__(self, *exc: object) -> bool:
         return False
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, size: int = -1) -> bytes:
+        # ``_request_anthropic_usage`` reads with an explicit byte cap; honour it
+        # so this mock matches the real (size-bounded) reader signature.
+        if size is None or size < 0:
+            return self._body
+        return self._body[:size]
 
 
 def _opener_for(mapping: dict) -> "object":
@@ -116,8 +121,19 @@ class SingleAccountUnchangedTests(unittest.TestCase):
     def test_empty_config_reads_no_account(self):
         with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": []})):
             entries, configured = builtin._claude_accounts_setting()
-        self.assertTrue(configured)
+        # An empty list behaves exactly like an absent setting: the single path.
+        self.assertFalse(configured)
         self.assertEqual(entries, [])
+
+    def test_empty_list_uses_the_single_account_path(self):
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": []})), \
+             mock.patch.object(builtin, "_anthropic_usage_payload",
+                               return_value=(_payload(42), None)), \
+             mock.patch.object(builtin, "_fetch_anthropic_multi") as multi:
+            res = builtin._fetch_anthropic()
+        multi.assert_not_called()  # empty must not enter the multi path
+        self.assertEqual([w.used_percent for w in res.windows], [42.0])
+        self.assertEqual(res.accounts, [])
 
     def test_no_config_key_means_not_configured(self):
         with mock.patch.dict(sys.modules, _config_modules({"other": True})):
@@ -188,7 +204,14 @@ class MultiAccountFetchTests(unittest.TestCase):
 
 
 class DedupTests(unittest.TestCase):
-    def test_default_dir_entry_does_not_duplicate_the_primary(self):
+    def test_entry_at_the_default_dir_is_read_when_its_token_differs(self):
+        """A directory is never identity.
+
+        The primary token can come from ``ANTHROPIC_API_KEY``, the environment,
+        or a different OAuth grant rather than ``~/.claude/.credentials.json``,
+        so a listed entry pointing at that directory must still be read — and is
+        deduped by token, not by path.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             default = Path(tmp) / "default"
             _write_credentials(default, "SYNTH-DEFAULT")
@@ -201,8 +224,26 @@ class DedupTests(unittest.TestCase):
                                    return_value=default), \
                  mock.patch.object(builtin, "urlopen_no_redirect", _ok_opener()):
                 res = builtin._fetch_anthropic()
-        # The default dir is the core account's source; it is never a second card.
-        self.assertEqual(res.accounts, [])
+        self.assertEqual([a.id for a in res.accounts], ["self"])
+
+    def test_entry_at_the_primary_dir_with_the_primary_token_is_deduped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            default = Path(tmp) / "default"
+            _write_credentials(default, "SYNTH-PRIMARY")
+            settings = {"claudeAccounts": [
+                {"id": "self", "configDir": str(default)},
+            ]}
+            with mock.patch.dict(sys.modules, _config_modules(settings)), \
+                 mock.patch.object(builtin, "_core_anthropic_token",
+                                   return_value="SYNTH-PRIMARY"), \
+                 mock.patch.object(builtin, "_core_anthropic_is_oauth",
+                                   return_value=True), \
+                 mock.patch.object(builtin, "_effective_claude_config_dir",
+                                   return_value=default), \
+                 mock.patch.object(builtin, "urlopen_no_redirect", _ok_opener()):
+                res = builtin._fetch_anthropic()
+        self.assertIsNone(res.unavailable_reason)   # the primary resolved
+        self.assertEqual(res.accounts, [])          # same token -> one card
 
     def test_same_directory_twice_is_one_account(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -322,6 +363,61 @@ class CredentialReaderTests(unittest.TestCase):
             after = (path.read_bytes(), path.stat().st_mtime_ns)
             self.assertEqual(before, after)
 
+    def test_oversized_credential_file_is_refused_unread(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            big = Path(tmp) / ".credentials.json"
+            big.write_bytes(b'{"claudeAiOauth":{"accessToken":"x"}}'
+                            + b" " * (builtin._MAX_CREDENTIAL_BYTES + 16))
+            self.assertEqual(builtin._read_claude_account_token(tmp),
+                             (None, "no-credentials"))
+
+    def test_fifo_credential_path_is_refused_without_blocking(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkfifo(Path(tmp) / ".credentials.json")
+            # Must return immediately: a blocking read here would hang the test.
+            self.assertEqual(builtin._read_claude_account_token(tmp),
+                             (None, "no-credentials"))
+
+    def test_symlink_to_a_device_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / ".credentials.json"
+            try:
+                os.symlink("/dev/zero", link)
+            except OSError:
+                self.skipTest("cannot create a symlink here")
+            # A device is not a regular file: never read, never block.
+            self.assertEqual(builtin._read_claude_account_token(tmp),
+                             (None, "no-credentials"))
+
+
+# --- HTTP response bound -----------------------------------------------------
+
+
+class HttpBoundTests(unittest.TestCase):
+    def test_oversized_usage_response_is_rejected(self):
+        oversized = b"[" + b" " * (builtin._MAX_HTTP_BYTES + 8) + b"]"
+
+        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
+            return _Resp(oversized)
+
+        with mock.patch.object(builtin, "urlopen_no_redirect", _opener):
+            payload, reason = builtin._request_anthropic_usage("SYNTH-TOKEN")
+        self.assertIsNone(payload)
+        self.assertEqual(reason, "bad-json")
+
+    def test_bounded_response_still_parses(self):
+        body = json.dumps(_payload(12.0)).encode("utf-8")
+
+        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
+            return _Resp(body)
+
+        with mock.patch.object(builtin, "urlopen_no_redirect", _opener):
+            payload, reason = builtin._request_anthropic_usage("SYNTH-TOKEN")
+        self.assertEqual(reason, None)
+        self.assertIsInstance(payload, dict)
+
 
 # --- source precedence -------------------------------------------------------
 
@@ -419,6 +515,49 @@ class InvalidConfigTests(unittest.TestCase):
         self.assertEqual(res.accounts[0].unavailable_reason, "config-invalid")
 
 
+# --- config parsing hardening ------------------------------------------------
+
+
+class ConfigParsingHardeningTests(unittest.TestCase):
+    def test_oversized_config_parses_at_most_eight_plus_one_limit(self):
+        raw = [{"id": f"a{i}", "configDir": f"/tmp/{i}"} for i in range(50)]
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": raw})):
+            entries, configured = builtin._claude_accounts_setting()
+        self.assertTrue(configured)
+        self.assertEqual(len(entries), builtin._MAX_CLAUDE_ACCOUNTS + 1)
+        self.assertEqual(entries[-1]["error"], "config-limit")
+        self.assertEqual(sum(1 for e in entries if e.get("error")), 1)
+
+    def test_json_string_setting_is_accepted(self):
+        # A writer other than the CLI may store the list as a JSON string.
+        payload = json.dumps([{"id": "work", "label": "Work", "configDir": "/tmp/w"}])
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": payload})):
+            entries, configured = builtin._claude_accounts_setting()
+        self.assertTrue(configured)
+        self.assertEqual([e["id"] for e in entries], ["work"])
+        self.assertNotIn("error", entries[0])
+
+    def test_valid_json_string_yields_every_entry(self):
+        payload = '[{"id":"a","configDir":"/tmp/a"},{"id":"b","configDir":"/tmp/b"}]'
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": payload})):
+            entries, _ = builtin._claude_accounts_setting()
+        self.assertEqual([e["id"] for e in entries], ["a", "b"])
+
+    def test_bad_json_string_is_config_invalid_not_silent(self):
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": "{not json"})):
+            entries, configured = builtin._claude_accounts_setting()
+        self.assertTrue(configured)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["error"], "config-invalid")
+        self.assertIn("valid JSON", entries[0]["detail"])
+
+    def test_blank_string_setting_is_not_configured(self):
+        with mock.patch.dict(sys.modules, _config_modules({"claudeAccounts": "   "})):
+            entries, configured = builtin._claude_accounts_setting()
+        self.assertFalse(configured)
+        self.assertEqual(entries, [])
+
+
 # --- bounded work ------------------------------------------------------------
 
 
@@ -449,9 +588,11 @@ class BoundedWorkTests(unittest.TestCase):
                  mock.patch.object(builtin, "urlopen_no_redirect", _ok_opener()):
                 res = builtin._fetch_anthropic()
         fetched = [a for a in res.accounts if a.unavailable_reason is None]
-        capped = [a for a in res.accounts if a.unavailable_reason == "config-invalid"]
+        limited = [a for a in res.accounts if a.unavailable_reason == "config-limit"]
         self.assertEqual(len(fetched), builtin._MAX_CLAUDE_ACCOUNTS)
-        self.assertEqual(len(capped), 2)
+        # A single bounded overflow row, never one error row per excess entry.
+        self.assertEqual(len(limited), 1)
+        self.assertEqual(len(res.accounts), builtin._MAX_CLAUDE_ACCOUNTS + 1)
 
     def test_deadline_is_shared_across_accounts(self):
         """All account requests draw on one budget, not one each."""
@@ -592,8 +733,36 @@ class CacheExpansionTests(unittest.TestCase):
             base.QuotaAccount(id="dup", label="Second"),
         ])
         cache = self._run(result)
-        self.assertIn("anthropic:dup", cache["providers"])
+        keys = sorted(k for k in cache["providers"] if k.startswith("anthropic:"))
+        # Deterministic distinct keys: neither row is silently hidden.
+        self.assertEqual(keys, ["anthropic:dup", "anthropic:dup#2"])
         self.assertEqual(cache["providers"]["anthropic:dup"]["account_label"], "First")
+        self.assertEqual(cache["providers"]["anthropic:dup#2"]["account_label"], "Second")
+
+    def test_generated_account_id_does_not_hide_a_configured_id(self):
+        _, base = _cache_module()
+        result = base.QuotaResult(label="anthropic", accounts=[
+            base.QuotaAccount(id="__invalid-2", label="Configured"),
+            base.QuotaAccount(id=None, label="Generated"),  # no id -> generated key
+        ])
+        cache = self._run(result)
+        keys = sorted(k for k in cache["providers"] if k.startswith("anthropic:"))
+        self.assertEqual(len(keys), 2)  # a generated id must never hide a real one
+        labels = {cache["providers"][k]["account_label"] for k in keys}
+        self.assertEqual(labels, {"Configured", "Generated"})
+
+    def test_expand_accounts_does_not_mutate_the_fetcher_record(self):
+        qc, base = _cache_module()
+        record = {
+            "label": "anthropic",
+            "windows": [],
+            "accounts": [{"id": "w", "label": "W", "windows": []}],
+        }
+        snapshot = copy.deepcopy(record)
+        rows = qc._expand_accounts("anthropic", record)
+        self.assertEqual(record, snapshot)         # caller's dict is untouched
+        self.assertIn("anthropic:w", rows)
+        self.assertNotIn("accounts", rows["anthropic"])
 
 
 # --- widget rendering --------------------------------------------------------
@@ -645,6 +814,19 @@ class WidgetAccountRenderTests(unittest.TestCase):
         tree = render(component="row", id="deepseek",
                       provider={"windows": [{"label": "w", "used_percent": 5.0}]})
         self.assertNotIn("·", text(tree))
+
+    def test_chip_tip_keeps_details_for_an_unavailable_account(self):
+        provider = dict(self.ACCOUNT, unavailable_reason="config-invalid",
+                        windows=[],
+                        details=["account #2 needs a non-empty string 'configDir'."])
+        tree = render(component="chip", id="anthropic:work", provider=provider)
+        tip = tree["props"]["title"]
+        self.assertIn("unavailable (config-invalid)", tip)
+        self.assertIn("needs a non-empty string 'configDir'", tip)
+
+    def test_chip_without_a_provider_object_names_the_account_from_the_id(self):
+        tree = render(component="chip", id="anthropic:work", provider=None)
+        self.assertIn("Anthropic · work", text(tree))
 
 
 # --- CLI + footer rendering (fake account data, real render code) ------------
@@ -719,6 +901,11 @@ class CliRenderTests(unittest.TestCase):
         _, rendered, _, _ = self._render(self._cache())
         self.assertIn("anthropic · Work", rendered)
         self.assertIn("config-invalid", rendered)
+
+    def test_cli_shows_the_actionable_detail_for_an_unavailable_account(self):
+        _, rendered, _, _ = self._render(self._cache())
+        # The reason code alone is not enough: the fix must be visible too.
+        self.assertIn("account #2 needs a non-empty string 'configDir'.", rendered)
 
     def test_cli_filter_by_account_label_selects_one_account(self):
         _, _, by_label, _ = self._render(self._cache())

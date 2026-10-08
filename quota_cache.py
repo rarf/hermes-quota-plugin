@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from .quota_providers import PROVIDER_FETCHERS, QuotaResult
+from .quota_providers import PROVIDER_FETCHERS, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +132,29 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     return record
 
 
+def _account_row_key(rows: dict[str, Any], provider_id: str,
+                     account_id: Optional[str], index: int) -> str:
+    """A cache key for one account row that never collides with an existing one.
+
+    A generated id (an account with no usable user id) uses the reserved
+    ``GENERATED_ACCOUNT_ID_PREFIX`` namespace; if it — or any configured id —
+    still matches an existing row, a deterministic ``#N`` suffix keeps both rows
+    visible instead of silently dropping one.
+    """
+    if isinstance(account_id, str) and account_id.strip():
+        base = f"{provider_id}:{account_id.strip()}"
+    else:
+        base = f"{provider_id}:{GENERATED_ACCOUNT_ID_PREFIX}{index + 1}"
+    if base not in rows:
+        return base
+    suffix = 2
+    candidate = f"{base}#{suffix}"
+    while candidate in rows:
+        suffix += 1
+        candidate = f"{base}#{suffix}"
+    return candidate
+
+
 def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
     """Flatten a provider record and its nested accounts into sibling rows.
 
@@ -144,6 +167,9 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
     """
     if not isinstance(record, dict):
         return {provider_id: record}
+    # Shallow copy: never mutate the fetcher's own record while stripping the
+    # nested accounts key that only exists on the wire.
+    record = dict(record)
     nested = record.pop("accounts", None)
     rows: dict[str, Any] = {provider_id: record}
     if not isinstance(nested, list):
@@ -153,12 +179,7 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
         if not isinstance(account, dict):
             continue
         account_id = account.get("id")
-        if isinstance(account_id, str) and account_id.strip():
-            key = f"{provider_id}:{account_id.strip()}"
-        else:
-            key = f"{provider_id}:account-{index + 1}"
-        if key in rows:  # duplicate id in one payload: keep the first
-            continue
+        key = _account_row_key(rows, provider_id, account_id, index)
         label = account.get("label")
         account_label = label.strip() if isinstance(label, str) and label.strip() else None
         reason = account.get("unavailable_reason")

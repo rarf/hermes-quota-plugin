@@ -77,6 +77,13 @@ class QuotaAccount:
     details: list[str] = field(default_factory=list)
 
 
+#: Prefix the cache gives an account row that has no usable user ``id`` (a
+#: malformed entry, or a fetcher that omitted one). It is only a hint: the
+#: cache still disambiguates any real collision with a deterministic suffix, so
+#: a generated row and a configured row can never silently hide each other.
+GENERATED_ACCOUNT_ID_PREFIX = "__invalid-"
+
+
 @dataclass
 class QuotaResult:
     """Normalized quota for one provider, ready to cache."""

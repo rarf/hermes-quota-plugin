@@ -399,10 +399,18 @@ function providerMeta(pid) {
 // "Anthropic".
 function providerDisplayName(pid, provider) {
 	const meta = providerMeta(pid);
-	const account =
+	let account =
 		provider && typeof provider.account_label === "string"
 			? provider.account_label.trim()
 			: "";
+	if (!account) {
+		// Fall back to the pid suffix ("anthropic:work") when the provider
+		// object is missing, so an account row is never shown as a bare
+		// duplicate of its base provider.
+		const text = String(pid || "");
+		const colon = text.indexOf(":");
+		account = colon > 0 ? text.slice(colon + 1).trim() : "";
+	}
 	return account ? `${meta.name} · ${account}` : meta.name;
 }
 
@@ -1198,14 +1206,21 @@ function makeWorstTip(worstLabel, worst, providersObj) {
 function makeProviderTip(pid, provider) {
 	const name = providerDisplayName(pid, provider);
 	if (!provider) return `${name}: unavailable`;
-	if (provider.unavailable_reason) return `${name}: unavailable (${provider.unavailable_reason})`;
+	const details = asList(provider && provider.details);
+	if (provider.unavailable_reason) {
+		// Keep the actionable detail lines (macOS Keychain note, a
+		// config-invalid fix, the timeout cause): the reason code alone hides
+		// the very text that says what to do.
+		const lines = [`${name}: unavailable (${provider.unavailable_reason})`, ...details];
+		lines.push("Click to open Quota pane");
+		return lines.join("\n");
+	}
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
 	lines.push(...facts.balances.map((b) => `Account balance: ${balanceText(b)}`));
 	if (facts.available != null) lines.push(`API calls available: ${facts.available ? "yes" : "no"}`);
 	if (provider.plan) lines.unshift(`Plan: ${provider.plan}`);
 	lines.unshift(name);
-	const details = asList(provider && provider.details);
 	if (details.length) lines.push(...details);
 	lines.push("Click to open Quota pane");
 	return lines.join("\n");

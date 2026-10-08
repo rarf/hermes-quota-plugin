@@ -132,10 +132,16 @@ the footer, `/quota` and the widget render accounts with no account-specific
 code: the widget resolves the base provider for the icon and shows
 `<Provider> · <label>`. Keep it honest: an account `id` is stable and unique; an
 account is never merged into another by organization or by an equal quota; a
-token or a filesystem path must never reach the record; the same canonical
-source, or the same credential as the primary, must not be duplicated; and an
-unreadable account is a truthful `unavailable (<reason>)` row, never a hidden
-one.
+token or a filesystem path must never reach the record; only a byte-identical
+credential — including the primary's — may collapse to one row, and identity is
+**never** inferred from a directory; a generated row (one with no usable id)
+must never hide a configured one — give it the reserved
+`GENERATED_ACCOUNT_ID_PREFIX` namespace and let the cache disambiguate any
+collision deterministically; and an unreadable account is a truthful
+`unavailable (<reason>)` row, never a hidden one. Bound the work: cap how many
+entries you parse and read, emit a single overflow diagnostic past the cap, read
+local credential files through a stat-verified regular-file descriptor with a
+byte cap, and bound HTTP response reads.
 
 ### 3. Register + surface it
 

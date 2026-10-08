@@ -14,7 +14,7 @@ the whole cache refresh.
 
 from __future__ import annotations
 
-from .base import QuotaResult, QuotaWindow, build_unavailable
+from .base import QuotaResult, QuotaWindow, build_unavailable, GENERATED_ACCOUNT_ID_PREFIX
 from .registry import PROVIDER_FETCHERS, register, get_fetcher
 
 from . import grok  # noqa: F401
@@ -39,4 +39,5 @@ __all__ = [
     "QuotaResult",
     "QuotaWindow",
     "build_unavailable",
+    "GENERATED_ACCOUNT_ID_PREFIX",
 ]

@@ -107,11 +107,17 @@ def _render_quota(provider_filter: Optional[str]) -> str:
             continue
         label = rec.get("label") or name
         reason = rec.get("unavailable_reason")
+        details = rec.get("details")
+        if not isinstance(details, list):
+            details = []
         if reason:
+            # Keep the reason AND its actionable detail lines: "unavailable
+            # (config-invalid)" alone hides the exact fix the detail carries.
             lines.append(f"• **{label}**: unavailable ({reason})")
+            for detail in details:
+                lines.append(f"  · {detail}")
             continue
         windows = rec.get("windows") or []
-        details = rec.get("details") or []
         for detail in details:
             lines.append(f"• **{label}** · {detail}")
         if not windows:
