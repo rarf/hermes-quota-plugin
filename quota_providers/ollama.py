@@ -287,16 +287,24 @@ def _included_spend_percent(included) -> Optional[float]:
     """(allowance - balance) / allowance as a used percent.
 
     Both figures are dollar amounts from the same response, so this is
-    arithmetic rather than inference. A balance above the allowance (pay-as-you-
-    go overspend) yields >100% instead of being clamped; a zero allowance has no
+    arithmetic rather than inference. A zero or negative allowance has no
     denominator and yields None rather than a division error.
+
+    The result is NOT clamped, in either direction:
+
+    - Overspend past the pool puts `balance_usd` below zero, giving >100% used,
+      which is honest and matches the documented behaviour.
+    - A balance *above* the allowance (top-up, rollover, mid-cycle grant) gives
+      a negative used percent, i.e. >100% remaining. Clamping that to 0% would
+      make "exactly empty" indistinguishable from "more than the allowance",
+      which is a real state the response can carry.
     """
     allowance = amount(included.get("allowance_usd"))
     balance = amount(included.get("balance_usd"))
     if allowance is None or balance is None or float(allowance) <= 0:
         return None
     used = (float(allowance) - float(balance)) / float(allowance)
-    return round(max(0.0, used) * 100.0, 2)
+    return round(used * 100.0, 2)
 
 
 def _windows(included) -> list[QuotaWindow]:
@@ -322,12 +330,32 @@ def _windows(included) -> list[QuotaWindow]:
         block = included.get(name)
         if not isinstance(block, dict):
             continue
-        remaining = amount(block.get("remaining_percent"))
-        used = round(100.0 - float(remaining), 2) if remaining is not None else None
+        used = _used_from_remaining(block.get("remaining_percent"))
         windows.append(QuotaWindow(
             label=label, used_percent=used,
             reset_at=_iso_utc(block.get("resets_at"))))
     return windows
+
+
+def _used_from_remaining(value) -> Optional[float]:
+    """`remaining_percent` (documented range 0-100) as a used percent.
+
+    The value is the provider's own, so it is passed through rather than
+    re-derived -- but only inside the range Ollama documents. An out-of-range
+    number is a schema surprise: converting it blindly would render 150 as
+    -50% used, or -20 as 120% used, either of which is a misleading quota window
+    built from a figure nothing supports. Out of range yields None, which drops
+    the percentage while keeping the window's reset.
+
+    None and garbage both become None; only a real in-range percent produces a
+    window percentage, so this cannot invent a number the provider did not send.
+    """
+    remaining = amount(value)
+    if remaining is None:
+        return None
+    if remaining < 0 or remaining > 100:
+        return None
+    return round(100.0 - float(remaining), 2)
 
 
 def _usage_details(usage) -> list[str]:

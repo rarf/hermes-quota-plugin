@@ -260,6 +260,51 @@ class PercentDerivationTests(unittest.TestCase):
                         {"balance_usd": balance, "allowance_usd": allowance}),
                     expected)
 
+    def test_overspend_is_not_clamped_above_100(self):
+        """Review on #62: the clamp contradicted the documented behaviour.
+
+        `balance_usd` goes negative when the pool is overdrawn, so >100% used is
+        the honest reading and the widget clamps only its own % left.
+        """
+        self.assertEqual(
+            ollama._included_spend_percent({"balance_usd": -1.25,
+                                             "allowance_usd": 2.5}), 150.0)
+
+    def test_a_balance_above_the_allowance_is_not_clamped_to_zero(self):
+        """Review on #62: the other direction.
+
+        A balance above the allowance -- mid-cycle top-up, rollover, or a grant
+        -- gives a negative used percent, i.e. >100% remaining. max(0.0, used)
+        collapsed that to 0%, making "exactly empty" indistinguishable from
+        "more than the allowance".
+        """
+        self.assertEqual(
+            ollama._included_spend_percent({"balance_usd": 3.0,
+                                             "allowance_usd": 2.5}), -20.0)
+        self.assertEqual(
+            ollama._included_spend_percent({"balance_usd": 5.0,
+                                             "allowance_usd": 2.5}), -100.0)
+        # Exactly empty is still 0, and is distinguishable from the above.
+        self.assertEqual(
+            ollama._included_spend_percent({"balance_usd": 2.5,
+                                             "allowance_usd": 2.5}), 0.0)
+
+    def test_an_over_allowance_percent_reaches_the_window_unclamped(self):
+        """The fetcher's own field must carry the negative percent.
+
+        `QuotaWindow.remaining_pct()` clamps to 0-100 in base.py -- shared code
+        every provider relies on, so the widget shows "100% left" here rather
+        than 120%. That clamp is correct for the progress bar; the unclamped
+        value still has to reach the window so the cache records what the API
+        said rather than a rounded version of it.
+        """
+        w = ollama._windows({"balance_usd": 3.0, "allowance_usd": 2.5,
+                             "period": {"until": "2026-10-22T00:00:00Z"}})[0]
+        self.assertEqual(w.used_percent, -20.0)
+        # base.py clamps the derived remainder; assert the real behaviour rather
+        # than an aspiration, so a change there fails here deliberately.
+        self.assertEqual(w.remaining_pct(), 100)
+
     def test_a_zero_allowance_has_no_denominator(self):
         self.assertIsNone(
             ollama._included_spend_percent({"balance_usd": 1, "allowance_usd": 0}))
@@ -331,6 +376,38 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(ws[1].used_percent, 60.0)
         self.assertEqual(ws[0].reset_at, "2026-10-01T07:00:00Z")
         self.assertEqual(ws[1].reset_at, "2026-10-05T00:00:00Z")
+
+    def test_an_out_of_range_remaining_percent_is_rejected(self):
+        """Review on #62: `remaining_percent` is documented as 0-100.
+
+        Converting blindly turned 150 into -50% used and -20 into 120% used --
+        quota windows built from a figure nothing supports. Out of range drops
+        the percentage and keeps the reset.
+        """
+        for bad in (150, 100.5, -20, -0.1, 1000, 1e9):
+            with self.subTest(bad=bad):
+                self.assertIsNone(ollama._used_from_remaining(bad))
+
+    def test_the_documented_range_edges_are_accepted(self):
+        for value, expected in ((0, 100.0), (100, 0.0), (50, 50.0),
+                                (0.0, 100.0), (100.0, 0.0), (33.3, 66.7)):
+            with self.subTest(value=value):
+                self.assertEqual(ollama._used_from_remaining(value), expected)
+
+    def test_a_garbage_remaining_percent_yields_no_percentage(self):
+        for bad in (None, "abc", True, float("nan"), float("inf"),
+                    -float("inf"), [], {}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(ollama._used_from_remaining(bad))
+
+    def test_an_out_of_range_legacy_percent_keeps_the_window_and_reset(self):
+        """Dropping the percentage must not drop the reset with it -- the reset
+        is independently published and still true."""
+        ws = ollama._windows({"weekly": {"remaining_percent": 150,
+                                          "resets_at": "2026-10-05T00:00:00Z"}})
+        self.assertEqual(len(ws), 1)
+        self.assertIsNone(ws[0].used_percent)
+        self.assertEqual(ws[0].reset_at, "2026-10-05T00:00:00Z")
 
     def test_legacy_resets_are_normalised_too(self):
         ws = ollama._windows(
