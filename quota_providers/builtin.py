@@ -226,7 +226,7 @@ def _request_anthropic_usage(
             "Accept": "application/json",
             "Content-Type": "application/json",
             "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "claude-code/2.1.0",
+            "User-Agent": "hermes-quota-plugin/2.10.0",
         },
         method="GET",
     )

@@ -828,6 +828,69 @@ class WidgetAccountRenderTests(unittest.TestCase):
         tree = render(component="chip", id="anthropic:work", provider=None)
         self.assertIn("Anthropic · work", text(tree))
 
+    # Logo and name must hold on every render surface, not just the row text.
+    PRIMARY = {"windows": [{"label": "Current session", "used_percent": 10.0}]}
+
+    @staticmethod
+    def _logos(tree):
+        """Icon markup rendered by ProviderBadge (the inlined SVG body)."""
+        return [n["props"]["dangerouslySetInnerHTML"]["__html"]
+                for n in nodes(tree) if "dangerouslySetInnerHTML" in n.get("props", {})]
+
+    def _account_2(self, **extra):
+        return dict(self.ACCOUNT, account_id="account2", account_label="Account 2", **extra)
+
+    def test_account_row_has_the_same_logo_as_the_primary_row(self):
+        primary = render(component="row", id="anthropic", provider=self.PRIMARY)
+        account = render(component="row", id="anthropic:account2", provider=self._account_2())
+        self.assertEqual(len(self._logos(primary)), 1)
+        self.assertEqual(self._logos(account), self._logos(primary))
+        self.assertIn("Anthropic · Account 2", text(account))
+
+    def test_unavailable_account_row_keeps_logo_and_name(self):
+        provider = self._account_2(unavailable_reason="config-invalid", windows=[])
+        tree = render(component="row", id="anthropic:account2", provider=provider)
+        primary = render(component="row", id="anthropic", provider=self.PRIMARY)
+        self.assertEqual(self._logos(tree), self._logos(primary))
+        self.assertIn("Anthropic · Account 2", text(tree))
+
+    def test_account_row_without_data_keeps_logo_and_name(self):
+        provider = self._account_2(windows=[])
+        tree = render(component="row", id="anthropic:account2", provider=provider)
+        primary = render(component="row", id="anthropic", provider=self.PRIMARY)
+        self.assertEqual(self._logos(tree), self._logos(primary))
+        self.assertIn("Anthropic · Account 2", text(tree))
+
+    def test_account_without_a_label_never_shows_the_raw_key(self):
+        provider = {"windows": [{"label": "Current session", "used_percent": 55.0}],
+                    "account_label": None}
+        tree = render(component="row", id="anthropic:account2", provider=provider)
+        rendered = text(tree)
+        self.assertIn("Anthropic · account2", rendered)
+        self.assertNotIn("anthropic:account2", rendered)
+        self.assertEqual(len(self._logos(tree)), 1)
+
+    def test_pane_cards_show_logo_and_name_for_the_account(self):
+        data = {"providers": {"anthropic": self.PRIMARY, "anthropic:account2": self._account_2()},
+                "fetched_at": "2026-01-02T03:04:05Z", "age_s": 3}
+        tree = render(data=data)
+        primary_logo = self._logos(render(component="row", id="anthropic", provider=self.PRIMARY))
+        logos = self._logos(tree)
+        # The cherry-picker is closed in the harness's initial useState.
+        # Verify the two visible cards without claiming popup coverage.
+        self.assertEqual(len(logos), 2)
+        self.assertEqual(set(logos), set(primary_logo))
+        self.assertIn("Anthropic · Account 2", text(tree))
+        self.assertNotIn("anthropic:account2", text(tree))
+
+    def test_status_chip_for_account_matches_the_primary_chip(self):
+        # The status bar draws no logos for any provider; the account chip must
+        # not diverge from its primary chip on that or on the name.
+        primary = render(component="chip", id="anthropic", provider=self.PRIMARY)
+        account = render(component="chip", id="anthropic:account2", provider=self._account_2())
+        self.assertEqual(self._logos(account), self._logos(primary))
+        self.assertIn("Anthropic · Account 2", text(account))
+
 
 # --- CLI + footer rendering (fake account data, real render code) ------------
 
