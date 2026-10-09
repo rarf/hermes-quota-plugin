@@ -7,6 +7,7 @@ non-429 errors never open a cooldown, and corrupt or hostile state fails open.
 """
 import json
 import logging
+import logging.handlers
 import sys
 import tempfile
 import time
@@ -87,11 +88,20 @@ class AnthropicBackoffTests(unittest.TestCase):
         self.assertIn(builtin._backoff_key("SECRET-TOKEN-123"), text)
 
     def test_no_secret_in_logs_or_reasons_on_429_and_cooldown(self):
-        # assertNoLogs needs Python 3.10+; this host runs 3.14.
-        with self.assertNoLogs(level=logging.DEBUG):
+        # assertNoLogs is 3.10+ only; CI also runs 3.9, so capture by hand.
+        root = logging.getLogger()
+        handler = logging.handlers.MemoryHandler(capacity=1000)
+        root.addHandler(handler)
+        old_level = root.level
+        root.setLevel(logging.DEBUG)
+        try:
             with mock.patch.object(builtin, "urlopen_no_redirect", mock.Mock(side_effect=_http_error(429))):
                 _p, first = builtin._request_anthropic_usage("SECRET-TOKEN-123")
                 _p, second = builtin._request_anthropic_usage("SECRET-TOKEN-123")
+        finally:
+            root.removeHandler(handler)
+            root.setLevel(old_level)
+        self.assertEqual(handler.buffer, [], "no log records may be emitted")
         self.assertNotIn("SECRET-TOKEN-123", first)
         self.assertNotIn("SECRET-TOKEN-123", second)
         self.assertEqual(second, "rate-limited")
