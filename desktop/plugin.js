@@ -209,7 +209,7 @@ function setPaneDetail(mode) {
 
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
 const REFRESH_INTERVAL_KEY = "refreshInterval";
-const REFRESH_INTERVAL_DEFAULT = 60;
+const REFRESH_INTERVAL_DEFAULT = 600;
 const REFRESH_INTERVAL_MIN = 15;
 const REFRESH_INTERVAL_MAX = 600;
 
@@ -1247,7 +1247,8 @@ function codexAccountsTip(provider) {
 		const marker = index === provider.display_selected_index ? "●" : "○";
 		const error = account.unavailable_reason ? ` · ${account.unavailable_reason}` : "";
 		const value = codexValue(remaining) + (remaining > 0 ? " left" : "");
-		lines.push(`${marker} ${account.account_label || `Account ${index + 1}`} · ${value}${provider.display_stale ? " · stale" : ""}${error}`);
+		const planText = account.plan ? ` · ${account.plan}` : "";
+		lines.push(`${marker} ${account.account_label || `Account ${index + 1}`}${planText} · ${value}${provider.display_stale ? " · stale" : ""}${error}`);
 		// Keep historical/model-specific details in the pane, not in this summary.
 		if (provider.display_stale || account.unavailable_reason) continue;
 		const windows = asWindowList(account.windows).filter((w) => ["Session", "Weekly"].includes(w.label));

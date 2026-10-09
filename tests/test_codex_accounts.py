@@ -13,11 +13,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from quota_providers import builtin, codex
 
 
-def token(account, subject="synthetic-subject", exp=4102444800, nonce="one", email=None, **auth_claims):
+def token(account, subject="synthetic-subject", exp=4102444800, nonce="one", email=None, profile_email=None, **auth_claims):
     claims = {"sub": subject, "exp": exp, "nonce": nonce,
               "https://api.openai.com/auth": {"chatgpt_account_id": account, **auth_claims}}
     if email:
         claims["email"] = email
+    if profile_email:
+        # Real Codex tokens carry the account email in the OpenAI profile claim.
+        claims["https://api.openai.com/profile"] = {"email": profile_email}
     body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return "synthetic." + body + ".signature"
 
@@ -101,15 +104,14 @@ def payload(used):
 
 
 class CodexAccountsTests(unittest.TestCase):
-    def test_core_generated_email_label_is_not_exposed_but_custom_alias_is(self):
+    def test_generic_label_shows_token_email_and_custom_alias_wins(self):
         rows = [
-            {'access_token': token('a', email='private@example.invalid'), 'label': 'private@example.invalid'},
-            {'access_token': token('b', email='other@example.invalid'), 'label': 'Work account'},
+            {'access_token': token('a', profile_email='private@example.invalid'), 'label': 'device_code'},
+            {'access_token': token('b', profile_email='other@example.invalid'), 'label': 'Work account'},
         ]
         with mock.patch.dict(sys.modules, auth_modules(rows)), mock_http(side_effect=lambda *a, **k: BytesIO(json.dumps(payload(21)).encode())):
             result = builtin._fetch_codex_with_models()
-        self.assertEqual([account.label for account in result.accounts], ['Account 1', 'Work account'])
-        self.assertNotIn('private@example.invalid', repr(result))
+        self.assertEqual([account.label for account in result.accounts], ['private@example.invalid', 'Work account'])
 
     def test_codex_residency_claim_is_sent_as_required_header(self):
         rows = [{'access_token': token('a', chatgpt_data_residency='eu')}]
@@ -217,7 +219,9 @@ class CodexAccountsTests(unittest.TestCase):
             raw['additional_rate_limits'] = [{'limit_name': 'Synthetic Future Model',
                 'rate_limit': {'primary_window': {'used_percent': 5}}}]
             result = builtin._parse_codex_payload(raw)
-            self.assertEqual(result.plan, plan.title())
+            # prolite is the $100 tier ("Pro 100"); unknown names stay title-cased.
+            expected_plan = 'Pro 100' if plan == 'prolite' else plan.title()
+            self.assertEqual(result.plan, expected_plan)
             self.assertEqual([w.label for w in result.windows],
                              ['Session', 'Synthetic Future Model · 5h'])
 
@@ -530,7 +534,8 @@ class CodexWidgetTests(unittest.TestCase):
         from widget_harness import render, text, nodes, tooltip_text
         accounts = [{'windows': [{'label': 'Session', 'used_percent': 100}]},
                     {'windows': [{'label': 'Session', 'used_percent': 42}]}]
-        for age in [None, 60, 1801, 'bad', -1]:
+        # Stale means age >= the 600 s default refresh interval.
+        for age in [None, 600, 1801, 'bad', -1]:
             for mode in ['all', 'worst']:
                 with self.subTest(age=age, mode=mode):
                     data = {'age_s': age, 'providers': {'openai-codex': {'accounts': accounts}}}

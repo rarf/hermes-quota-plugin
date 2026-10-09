@@ -72,7 +72,7 @@ class WidgetBalanceTests(unittest.TestCase):
         self.assertIn('2025', s)
         self.assertRegex(s, r'(GMT|UTC)')
         self.assertNotIn('today', s)
-        self.assertIn('poll 60s', s)
+        self.assertIn('poll 600s', s)  # default refresh interval is 600 s
 
     def test_missing_age_does_not_claim_just_checked(self):
         tree = render(data={'providers': {'deepseek': BALANCE}, 'fetched_at': '2025-01-15T12:34:56Z', 'age_s': None})

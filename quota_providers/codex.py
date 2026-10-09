@@ -28,13 +28,31 @@ def display_label(value):
                    {"Cc", "Cf", "Cs", "Zl", "Zp"}).strip()[:64].rstrip()
 
 
+# Core-generated row labels that name the login method, not the account.
+_GENERIC_ROW_LABELS = {"device_code", "oauth", "oauth_device_code", "default"}
+
+
+def _profile_email(claims):
+    """Email from the token's OpenAI profile claim, read locally only."""
+    profile = claims.get("https://api.openai.com/profile")
+    if not isinstance(profile, dict):
+        return ""
+    return display_label(profile.get("email"))
+
+
 def _explicit_display_label(row, claims):
-    """Hide core-generated identity labels while retaining user-chosen aliases."""
+    """Account name: a user alias if one exists, else the token's own email.
+
+    Generic login-method labels such as ``device_code`` are not account names.
+    The email is decoded from the local token only; nothing is sent anywhere.
+    """
     value = display_label(row.get("label"))
     if not value:
+        # No label at all: let the caller use its "Account N" fallback.
         return ""
-    generated = {display_label(claims.get(key)) for key in ("email", "preferred_username", "upn")}
-    return "" if value in generated else value
+    if value.lower() in _GENERIC_ROW_LABELS:
+        return _profile_email(claims)
+    return value
 
 
 def _claims(token):

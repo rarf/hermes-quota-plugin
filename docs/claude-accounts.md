@@ -36,6 +36,10 @@ your own. There is no repository- or plugin-defined naming standard for extra
 Claude config directories, so the plugin assumes none: only the directories you
 list are read.
 
+**Plan names.** Each extra account's plan comes from `claudeAiOauth.subscriptionType` in its own `.credentials.json`, read locally. Only that one string is taken from the file; the access token is not read for this purpose. If the field is missing, the account shows no plan.
+
+**Rate-limit cooldown.** After an HTTP 429 from the usage endpoint, the plugin stops reading that credential for 30 minutes. The state file stores a SHA-256 digest of the token, never the token. A corrupt or out-of-range state file fails open.
+
 `hermes config set` parses that JSON array into a real YAML list before it is
 written (verified against the installed CLI), so no extra quoting is needed. If
 another writer stores the value as a JSON *string* instead, the plugin parses it
