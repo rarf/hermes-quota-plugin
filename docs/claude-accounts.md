@@ -40,6 +40,8 @@ list are read.
 
 **Rate-limit cooldown.** After an HTTP 429 from the usage endpoint, the plugin stops reading that credential for 30 minutes. The state file stores a SHA-256 digest of the token, never the token. A corrupt or out-of-range state file fails open.
 
+**Shared across profiles.** Hermes profiles usually share one Claude login, and the usage endpoint rate-limits per token, not per profile. The cooldown and the last successful usage payload are therefore kept in the Hermes root (not the active profile's home), keyed by the same token digest. A payload younger than 5 minutes is reused by every profile without a new request; while a 429 cooldown is active, the last good payload is shown for up to 60 minutes instead of an empty card. Payloads are never shared between different tokens, and a corrupt share file fails open.
+
 `hermes config set` parses that JSON array into a real YAML list before it is
 written (verified against the installed CLI), so no extra quoting is needed. If
 another writer stores the value as a JSON *string* instead, the plugin parses it
