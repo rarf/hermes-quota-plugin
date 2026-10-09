@@ -211,6 +211,91 @@ def parse_anthropic_scoped_limits(payload: Any) -> list[QuotaWindow]:
     return windows
 
 
+# After an HTTP 429 from the usage endpoint, stop reading that account for this
+# long. The widget refreshes on a timer, so without a cooldown every cycle
+# re-hits a rate-limited endpoint. Keyed by a token digest, never the token.
+_ANTHROPIC_RATE_LIMIT_COOLDOWN_S = 30 * 60
+_ANTHROPIC_BACKOFF_FILENAME = "quota_anthropic_backoff.json"
+
+
+def _backoff_state_path() -> str:
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:  # noqa: BLE001 - fail-open: fall back to the plugin dir
+        home = str(Path(__file__).resolve().parent.parent)
+    return os.path.join(home, _ANTHROPIC_BACKOFF_FILENAME)
+
+
+def _backoff_key(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+
+
+def _load_backoff() -> dict[str, float]:
+    try:
+        with open(_backoff_state_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:  # noqa: BLE001 - missing/corrupt state means no cooldown
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    import time
+
+    # Reject non-finite values (Infinity/1e999 parse as inf and would lock the
+    # account forever) and anything later than one cooldown from now (clock
+    # jumps). Bool is an int subclass, so it is excluded explicitly.
+    ceiling = time.time() + _ANTHROPIC_RATE_LIMIT_COOLDOWN_S
+    out: dict[str, float] = {}
+    for key, value in data.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        number = float(value)
+        if not math.isfinite(number) or number > ceiling:
+            continue
+        out[str(key)] = number
+    return out
+
+
+def _save_backoff(state: dict[str, float]) -> None:
+    import tempfile
+
+    tmp = None
+    try:
+        path = _backoff_state_path()
+        # mkstemp gives a unique 0600 file per writer, so concurrent writers
+        # cannot interleave in one shared temp file.
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".anthropic_backoff.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - failing to persist must not break a read
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _anthropic_cooling_down(token: str) -> bool:
+    import time
+
+    now = time.time()
+    state = _load_backoff()
+    return state.get(_backoff_key(token), 0.0) > now
+
+
+def _open_anthropic_cooldown(token: str) -> None:
+    import time
+
+    now = time.time()
+    state = {k: v for k, v in _load_backoff().items() if v > now}
+    state[_backoff_key(token)] = now + _ANTHROPIC_RATE_LIMIT_COOLDOWN_S
+    _save_backoff(state)
+
+
 def _request_anthropic_usage(
     token: str, *, timeout: float = _ANTHROPIC_TIMEOUT_S
 ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
@@ -219,6 +304,8 @@ def _request_anthropic_usage(
     ``token`` is passed in, never resolved here, so the same request path
     serves the core-resolved account and every configured extra account.
     """
+    if _anthropic_cooling_down(token):
+        return None, "rate-limited"
     request = urllib.request.Request(
         _ANTHROPIC_USAGE_URL,
         headers={
@@ -239,6 +326,8 @@ def _request_anthropic_usage(
     except urllib.error.HTTPError as exc:
         if exc.code in (401, 403):
             return None, "auth-failed"
+        if exc.code == 429:
+            _open_anthropic_cooldown(token)
         return None, f"http-{exc.code}"
     except Exception as exc:  # noqa: BLE001 - fail-open by contract
         return None, f"fetch-error:{type(exc).__name__}"
