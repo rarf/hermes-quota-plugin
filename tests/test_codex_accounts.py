@@ -217,7 +217,9 @@ class CodexAccountsTests(unittest.TestCase):
             raw['additional_rate_limits'] = [{'limit_name': 'Synthetic Future Model',
                 'rate_limit': {'primary_window': {'used_percent': 5}}}]
             result = builtin._parse_codex_payload(raw)
-            self.assertEqual(result.plan, plan.title())
+            # prolite is the $100 tier ("Pro 5x"); unknown names stay title-cased.
+            expected_plan = 'Pro 5x' if plan == 'prolite' else plan.title()
+            self.assertEqual(result.plan, expected_plan)
             self.assertEqual([w.label for w in result.windows],
                              ['Session', 'Synthetic Future Model · 5h'])
 

@@ -531,7 +531,9 @@ def _pool_entries() -> list[tuple[str, str]]:
         token = value.strip().strip("\\\"'") if value else ""
         if token and token not in seen:
             seen.add(token)
-            keys.append((token, f"env{len(keys) + 1}"))
+            # An environment variable is not an account identity; name the
+            # slot by its position so it reads as a key, not as "env1".
+            keys.append((token, f"chave {len(keys) + 1}"))
     if keys:
         return keys
     single = resolve_api_key()

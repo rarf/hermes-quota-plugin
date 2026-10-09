@@ -954,6 +954,27 @@ def _fetch_codex_with_models() -> QuotaResult:
     return fetch_codex_quota(_parse_codex_payload)
 
 
+# OpenAI's public plan names: Pro is the $100 tier ("5x" usage), Pro 20x the
+# $200 tier. The API's "prolite" is the $100 tier. Unknown values keep their
+# upstream spelling rather than being guessed.
+_CODEX_PLAN_NAMES = {
+    "free": "Free",
+    "go": "Go",
+    "plus": "Plus",
+    "prolite": "Pro 5x",
+    "pro": "Pro 20x",
+    "business": "Business",
+    "enterprise": "Enterprise",
+}
+
+
+def _codex_plan_label(raw: Any) -> Optional[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    return _CODEX_PLAN_NAMES.get(text.lower(), text.title())
+
+
 def _parse_codex_payload(payload: dict) -> QuotaResult:
     from datetime import datetime, timezone
 
@@ -1049,8 +1070,7 @@ def _parse_codex_payload(payload: dict) -> QuotaResult:
         elif credits.get("unlimited"):
             details.append("Credits balance: unlimited")
 
-    plan = str(payload.get("plan_type") or "").strip()
-    plan = plan.title() if plan else None
+    plan = _codex_plan_label(payload.get("plan_type"))
     if not windows and not details:
         return build_unavailable("openai-codex", "no-data")
     return QuotaResult(
