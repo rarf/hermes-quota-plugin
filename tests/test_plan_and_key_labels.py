@@ -15,14 +15,31 @@ from quota_providers import builtin  # noqa: E402
 
 class CodexPlanLabelTests(unittest.TestCase):
     def test_known_plans_use_public_names(self):
-        self.assertEqual(builtin._codex_plan_label("prolite"), "Pro 5x")
-        self.assertEqual(builtin._codex_plan_label("pro"), "Pro 20x")
+        self.assertEqual(builtin._codex_plan_label("prolite"), "Pro 100")
+        self.assertEqual(builtin._codex_plan_label("pro"), "Pro 200")
         self.assertEqual(builtin._codex_plan_label("plus"), "Plus")
 
     def test_unknown_plan_keeps_title_case_and_empty_is_none(self):
         self.assertEqual(builtin._codex_plan_label("synthetic-future"), "Synthetic-Future")
         self.assertIsNone(builtin._codex_plan_label(""))
         self.assertIsNone(builtin._codex_plan_label(None))
+
+
+class CodexAccountNameTests(unittest.TestCase):
+    def test_generic_login_label_falls_back_to_profile_email(self):
+        from quota_providers import codex
+        claims = {"https://api.openai.com/profile": {"email": "someone@example.com"}}
+        row = {"label": "device_code"}
+        self.assertEqual(codex._explicit_display_label(row, claims), "someone@example.com")
+
+    def test_user_alias_wins_over_email(self):
+        from quota_providers import codex
+        claims = {"https://api.openai.com/profile": {"email": "someone@example.com"}}
+        self.assertEqual(codex._explicit_display_label({"label": "Trabalho"}, claims), "Trabalho")
+
+    def test_missing_profile_gives_no_name(self):
+        from quota_providers import codex
+        self.assertEqual(codex._explicit_display_label({"label": "device_code"}, {}), "")
 
 
 class OpencodeKeyLabelTests(unittest.TestCase):

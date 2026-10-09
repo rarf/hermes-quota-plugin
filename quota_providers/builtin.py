@@ -630,6 +630,31 @@ def _credential_details(reason: Optional[str]) -> list[str]:
     return []
 
 
+def _claude_subscription_type(config_dir: str) -> Optional[str]:
+    """Plan name from ``claudeAiOauth.subscriptionType``, read locally.
+
+    Only this one string is taken from the credentials file; the token is never
+    read here. Missing, non-string or oversized values give no plan.
+    """
+    try:
+        path = Path(config_dir).expanduser() / _CLAUDE_CREDENTIALS_FILENAME
+        with open(path, "rb") as fh:
+            raw = fh.read(_MAX_CLAUDE_CREDENTIALS_BYTES + 1)
+        if len(raw) > _MAX_CLAUDE_CREDENTIALS_BYTES:
+            return None
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001 - a missing plan is not an error
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    value = oauth.get("subscriptionType") if isinstance(oauth, dict) else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 32:
+        return None
+    return text.title()
+
+
 def _claude_account_results(
     entries: list[dict[str, Any]],
     *,
@@ -704,6 +729,7 @@ def _claude_account_results(
                                          unavailable_reason="no-data"))
             continue
         accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                     plan=_claude_subscription_type(str(account_dir)),
                                      windows=windows, details=details))
     if overflow:
         accounts.append(QuotaAccount(
@@ -954,15 +980,15 @@ def _fetch_codex_with_models() -> QuotaResult:
     return fetch_codex_quota(_parse_codex_payload)
 
 
-# OpenAI's public plan names: Pro is the $100 tier ("5x" usage), Pro 20x the
-# $200 tier. The API's "prolite" is the $100 tier. Unknown values keep their
-# upstream spelling rather than being guessed.
+# Codex plan names as shown to the user: the API's "prolite" is the $100 Pro
+# tier and "pro" the $200 tier. Unknown values (including a Pro 500 tier, whose
+# raw API value is not yet confirmed) keep a title-cased upstream spelling.
 _CODEX_PLAN_NAMES = {
     "free": "Free",
     "go": "Go",
     "plus": "Plus",
-    "prolite": "Pro 5x",
-    "pro": "Pro 20x",
+    "prolite": "Pro 100",
+    "pro": "Pro 200",
     "business": "Business",
     "enterprise": "Enterprise",
 }
