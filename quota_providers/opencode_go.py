@@ -558,10 +558,13 @@ def fetch_opencode_go_quota() -> QuotaResult:
             failed.append(f"{label}: {res.unavailable_reason}")
             continue
         plan = plan or res.plan
+        # A single key needs no suffix: the window names already say enough.
+        # Several keys are told apart by their slot number.
+        suffix = f" · {label}" if len(entries) > 1 else ""
         for w in res.windows:
             windows.append(
                 QuotaWindow(
-                    label=f"{w.label} · {label}",
+                    label=f"{w.label}{suffix}",
                     used_percent=w.used_percent,
                     reset_at=w.reset_at,
                 )

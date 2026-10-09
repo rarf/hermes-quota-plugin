@@ -534,7 +534,8 @@ class CodexWidgetTests(unittest.TestCase):
         from widget_harness import render, text, nodes, tooltip_text
         accounts = [{'windows': [{'label': 'Session', 'used_percent': 100}]},
                     {'windows': [{'label': 'Session', 'used_percent': 42}]}]
-        for age in [None, 60, 1801, 'bad', -1]:
+        # Stale means age >= the 600 s default refresh interval.
+        for age in [None, 600, 1801, 'bad', -1]:
             for mode in ['all', 'worst']:
                 with self.subTest(age=age, mode=mode):
                     data = {'age_s': age, 'providers': {'openai-codex': {'accounts': accounts}}}
