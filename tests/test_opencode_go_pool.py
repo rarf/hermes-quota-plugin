@@ -68,7 +68,7 @@ class PoolEntriesTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"hermes_constants": constants}), mock.patch.dict(
             "os.environ", {"OPENCODE_GO_API_KEY_2": "sibling-token"}, clear=True
         ):
-            self.assertEqual(mod._pool_entries(), [("root-token", "root"), ("sibling-token", "chave 2")])
+            self.assertEqual(mod._pool_entries(), [("root-token", "root"), ("sibling-token", "key 2")])
 
     def test_no_pool_falls_back_to_single_key(self):
         mod = load_module()

@@ -1,6 +1,6 @@
 """Plan names and key-slot labels shown in the quota widget.
 
-Mocks only. Pins OpenAI's public plan names (prolite -> Pro 5x, pro -> Pro 20x)
+Mocks only. Pins OpenAI's public plan names (prolite -> Pro 100, pro -> Pro 200)
 and that environment-variable keys are named by slot, not "env1".
 """
 import sys
@@ -70,7 +70,7 @@ class OpencodeKeyLabelTests(unittest.TestCase):
                 mock.patch.object(opencode_go, "_pool_entries_from_store", return_value=[], create=True):
             entries = opencode_go._pool_entries()
         labels = [label for _token, label in entries]
-        self.assertTrue(all(not label.startswith("env") for label in labels), labels)
+        self.assertEqual(labels, ["key 1", "key 2"])
 
 
 if __name__ == "__main__":

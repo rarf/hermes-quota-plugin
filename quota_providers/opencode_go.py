@@ -533,7 +533,7 @@ def _pool_entries() -> list[tuple[str, str]]:
             seen.add(token)
             # An environment variable is not an account identity; name the
             # slot by its position so it reads as a key, not as "env1".
-            keys.append((token, f"chave {len(keys) + 1}"))
+            keys.append((token, f"key {len(keys) + 1}"))
     if keys:
         return keys
     single = resolve_api_key()

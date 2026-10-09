@@ -47,9 +47,12 @@ def _explicit_display_label(row, claims):
     The email is decoded from the local token only; nothing is sent anywhere.
     """
     value = display_label(row.get("label"))
-    if value and value.lower() not in _GENERIC_ROW_LABELS:
-        return value
-    return _profile_email(claims)
+    if not value:
+        # No label at all: let the caller use its "Account N" fallback.
+        return ""
+    if value.lower() in _GENERIC_ROW_LABELS:
+        return _profile_email(claims)
+    return value
 
 
 def _claims(token):
