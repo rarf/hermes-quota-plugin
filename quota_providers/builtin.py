@@ -218,14 +218,99 @@ _ANTHROPIC_RATE_LIMIT_COOLDOWN_S = 30 * 60
 _ANTHROPIC_BACKOFF_FILENAME = "quota_anthropic_backoff.json"
 
 
-def _backoff_state_path() -> str:
+def _shared_state_home() -> str:
+    # Profiles normally share one Claude login, and the usage endpoint rate-limits
+    # per token, not per profile. Keep this state in the Hermes ROOT rather than
+    # the active profile home so every profile sees the same cooldown and the same
+    # recent payload instead of each one polling the endpoint on its own.
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return str(get_default_hermes_root())
+    except Exception:  # noqa: BLE001 - older core: fall back to the profile home
+        pass
     try:
         from hermes_constants import get_hermes_home
 
-        home = str(get_hermes_home())
+        return str(get_hermes_home())
     except Exception:  # noqa: BLE001 - fail-open: fall back to the plugin dir
-        home = str(Path(__file__).resolve().parent.parent)
-    return os.path.join(home, _ANTHROPIC_BACKOFF_FILENAME)
+        return str(Path(__file__).resolve().parent.parent)
+
+
+def _backoff_state_path() -> str:
+    return os.path.join(_shared_state_home(), _ANTHROPIC_BACKOFF_FILENAME)
+
+
+# A successful usage payload is reused for the same token (keyed by digest, never
+# the token itself) across profiles: fresh for _ANTHROPIC_SHARED_TTL_S, and as a
+# last-known value for up to _ANTHROPIC_SHARED_STALE_MAX_S while a 429 cooldown
+# is active, so the card keeps its numbers instead of going blank.
+_ANTHROPIC_SHARED_TTL_S = 300
+_ANTHROPIC_SHARED_STALE_MAX_S = 60 * 60
+_ANTHROPIC_SHARED_FILENAME = "quota_anthropic_shared.json"
+
+
+def _shared_payload_path() -> str:
+    # Lives beside the backoff state, so whatever relocates that file relocates
+    # this one too.
+    return os.path.join(os.path.dirname(_backoff_state_path()) or ".", _ANTHROPIC_SHARED_FILENAME)
+
+
+def _load_shared_payload(token: str, max_age: float = _ANTHROPIC_SHARED_TTL_S) -> Optional[dict[str, Any]]:
+    import time
+
+    try:
+        with open(_shared_payload_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        entry = data.get(_backoff_key(token)) if isinstance(data, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        at = entry.get("at")
+        payload = entry.get("payload")
+        if isinstance(at, bool) or not isinstance(at, (int, float)) or not isinstance(payload, dict):
+            return None
+        age = time.time() - float(at)
+        if math.isfinite(age) and 0 <= age <= max_age:
+            return payload
+    except Exception:  # noqa: BLE001 - missing/corrupt state means no shared payload
+        pass
+    return None
+
+
+def _store_shared_payload(token: str, payload: dict[str, Any]) -> None:
+    import tempfile
+    import time
+
+    tmp = None
+    try:
+        path = _shared_payload_path()
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        now = time.time()
+        kept: dict[str, Any] = {}
+        for key, entry in data.items():
+            at = entry.get("at") if isinstance(entry, dict) else None
+            if isinstance(at, (int, float)) and not isinstance(at, bool) and 0 <= now - at <= _ANTHROPIC_SHARED_STALE_MAX_S:
+                kept[str(key)] = entry
+        kept[_backoff_key(token)] = {"at": now, "payload": payload}
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(path) or ".", prefix=".anthropic_shared.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(kept, fh)
+        os.replace(tmp, path)
+        tmp = None
+    except Exception:  # noqa: BLE001 - failing to persist must not break a read
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def _backoff_key(token: str) -> str:
@@ -304,7 +389,13 @@ def _request_anthropic_usage(
     ``token`` is passed in, never resolved here, so the same request path
     serves the core-resolved account and every configured extra account.
     """
+    shared = _load_shared_payload(token)
+    if shared is not None:
+        return shared, None
     if _anthropic_cooling_down(token):
+        stale = _load_shared_payload(token, _ANTHROPIC_SHARED_STALE_MAX_S)
+        if stale is not None:
+            return stale, None
         return None, "rate-limited"
     request = urllib.request.Request(
         _ANTHROPIC_USAGE_URL,
@@ -328,11 +419,15 @@ def _request_anthropic_usage(
             return None, "auth-failed"
         if exc.code == 429:
             _open_anthropic_cooldown(token)
+            stale = _load_shared_payload(token, _ANTHROPIC_SHARED_STALE_MAX_S)
+            if stale is not None:
+                return stale, None
         return None, f"http-{exc.code}"
     except Exception as exc:  # noqa: BLE001 - fail-open by contract
         return None, f"fetch-error:{type(exc).__name__}"
     if not isinstance(payload, dict):
         return None, "bad-json"
+    _store_shared_payload(token, payload)
     return payload, None
 
 

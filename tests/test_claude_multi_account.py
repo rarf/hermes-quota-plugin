@@ -68,6 +68,29 @@ def _payload(percent: float, reset: str = "2026-09-30T07:59:59+00:00") -> dict:
     return {"five_hour": {"utilization": percent, "resets_at": reset}}
 
 
+
+# The cross-profile payload share is covered by test_anthropic_shared_payload.py.
+# Here it is switched off so one test's successful read cannot satisfy the next
+# test's request (every test in this module reuses the same synthetic token).
+_SHARE_PATCHES = []
+
+
+def setUpModule():  # noqa: N802 - unittest hook
+    from quota_providers import builtin as _b
+
+    for patch in (
+        mock.patch.object(_b, "_load_shared_payload", return_value=None),
+        mock.patch.object(_b, "_store_shared_payload", return_value=None),
+    ):
+        patch.start()
+        _SHARE_PATCHES.append(patch)
+
+
+def tearDownModule():  # noqa: N802 - unittest hook
+    while _SHARE_PATCHES:
+        _SHARE_PATCHES.pop().stop()
+
+
 class _Resp:
     def __init__(self, body: bytes) -> None:
         self._body = body
