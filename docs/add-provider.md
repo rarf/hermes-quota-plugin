@@ -71,7 +71,8 @@ Contract rules (all enforced in review):
 
 - **Fail-open, never raise.** Wrap the whole body; every failure path returns
   `build_unavailable("<provider>", "<machine-readable-reason>")`. Reasons use
-  kebab-case: `no-credentials`, `auth-failed`, `http-429`, `parse-pending`.
+  kebab-case: `no-credentials`, `auth-failed`, `http-429`, `rate-limited`, `parse-pending`.
+  `rate-limited` means a cooldown after an earlier HTTP 429 on the same credential; no request was sent.
 - **`unavailable_reason` must be truthful.** `no-data` (asked, got nothing),
   `no-credentials` (nothing to auth with), `opt-in-disabled` (user turned it
   off) mean different things to users staring at the muted card.

@@ -17,7 +17,7 @@
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Read-only credential use; Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details. If the session expires, run `cursor-agent login`; the plugin never exchanges refresh tokens or writes to Cursor's credential store. |
 | `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
 | `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/usage` (spend, per-model request counts) and `POST /api/me` (plan label, signup date). The **Monthly** bar is the server-reported usage fraction. The reset is the next monthly anniversary of `CreatedAt`, matching Ollama's documented "resets monthly on the same day of the month your plan started"; the day is derived because no endpoint returns a reset timestamp. **No balance value** — Ollama exposes none; see below. |
-| `grok` | browser cookies | **Opt-in**, disabled by default |
+| `grok` | browser cookies | **Opt-in**, disabled by default. The xAI API exposes no plan or account name, so the card shows neither. |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
@@ -139,6 +139,10 @@ wall-clock deadline, below the cache sweep budget.
 
 The cache keeps saved accounts nested under `providers["openai-codex"].accounts`; the pane and CLI render each separately, and the status bar selects one representative account rather than summing percentages. This is display-only and does not change inference routing. Polling is read-only: it does not refresh tokens, rotate credentials, modify auth files or redeem resets. Expired tokens require normal Hermes sign-in. Unknown or stale account data is not treated as exhaustion. See the Codex sections in the upstream history for provider-specific handling; labels are local display text, so choose screenshot-safe names.
 
+Account names: a saved alias is shown as-is. A generic login-method label such as `device_code` is replaced by the account email stored in the token's OpenAI profile claim. That email is decoded locally from the token already in your `auth.json`; it is not sent anywhere else, but it will appear on screen, so use an alias if you capture screenshots. A row with no label at all shows as `Account N`.
+
+Plan names follow OpenAI's public tiers: the API value `prolite` is shown as **Pro 100** and `pro` as **Pro 200**. A **Pro 500** tier is not mapped yet because its raw API value has not been confirmed; unknown values are shown title-cased.
+
 ### OpenCode (Go)
 
 Reads `GET https://opencode.ai/zen/go/v1/usage`. The key is resolved from
@@ -147,6 +151,8 @@ chat provider uses in `~/.hermes/.env`), then OpenCode's CLI auth file
 `~/.local/share/opencode/auth.json`. That endpoint intermittently answers
 `503 Go usage is unavailable` for a large share of calls regardless of credential
 or User-Agent, so the fetcher retries before reporting the provider unavailable.
+
+With one key, the windows are labelled plainly (`5-hour`, `Weekly`, `Monthly`). With several keys, each window carries its slot as `key N` so the rows stay distinguishable; environment variables are not treated as account identities.
 
 ### Grok (opt-in)
 
