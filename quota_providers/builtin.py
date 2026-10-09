@@ -639,8 +639,8 @@ def _claude_subscription_type(config_dir: str) -> Optional[str]:
     try:
         path = Path(config_dir).expanduser() / _CLAUDE_CREDENTIALS_FILENAME
         with open(path, "rb") as fh:
-            raw = fh.read(_MAX_CLAUDE_CREDENTIALS_BYTES + 1)
-        if len(raw) > _MAX_CLAUDE_CREDENTIALS_BYTES:
+            raw = fh.read(_MAX_CREDENTIAL_BYTES + 1)
+        if len(raw) > _MAX_CREDENTIAL_BYTES:
             return None
         data = json.loads(raw)
     except Exception:  # noqa: BLE001 - a missing plan is not an error

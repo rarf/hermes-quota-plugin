@@ -42,6 +42,23 @@ class CodexAccountNameTests(unittest.TestCase):
         self.assertEqual(codex._explicit_display_label({"label": "device_code"}, {}), "")
 
 
+class ClaudePlanTests(unittest.TestCase):
+    def test_subscription_type_read_from_credentials_file(self):
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, ".credentials.json").write_text(
+                _json.dumps({"claudeAiOauth": {"subscriptionType": "team"}}))
+            self.assertEqual(builtin._claude_subscription_type(d), "Team")
+
+    def test_missing_or_non_string_plan_is_none(self):
+        import tempfile, json as _json
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(builtin._claude_subscription_type(d))
+            Path(d, ".credentials.json").write_text(
+                _json.dumps({"claudeAiOauth": {"subscriptionType": 5}}))
+            self.assertIsNone(builtin._claude_subscription_type(d))
+
+
 class OpencodeKeyLabelTests(unittest.TestCase):
     def test_env_slot_is_not_named_env(self):
         import os
