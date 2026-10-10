@@ -123,6 +123,28 @@ class CredentialTests(unittest.TestCase):
                 cred = mod._load_credential()
             self.assertEqual(cred["token"]["access_token"], "ya29.x", encoding)
 
+    def test_macos_go_keyring_wrapper_unwraps(self):
+        # agy stores the same JSON behind zalando/go-keyring's macOS prefix.
+        # Orca strips it before parse; a raw JSON blob must still parse.
+        import base64
+        payload = json.dumps({"token": {"access_token": "ya29.wrapped"}}).encode("utf-8")
+        wrapped = b"go-keyring-base64:" + base64.b64encode(payload)
+        legacy = b"go-keyring-encoded:" + payload.hex().encode("ascii")
+        for blob in (wrapped, legacy):
+            with mock.patch.object(mod, "_windows_blob", return_value=None), \
+                    mock.patch.object(mod, "_macos_blob", return_value=blob), \
+                    mock.patch.object(mod, "_linux_blob", return_value=None):
+                cred = mod._load_credential()
+            self.assertIsNotNone(cred)
+            assert cred is not None
+            self.assertEqual(cred["token"]["access_token"], "ya29.wrapped")
+
+    def test_broken_go_keyring_wrapper_is_no_credential(self):
+        with mock.patch.object(mod, "_windows_blob", return_value=None), \
+                mock.patch.object(mod, "_macos_blob", return_value=b"go-keyring-base64:!!!"), \
+                mock.patch.object(mod, "_linux_blob", return_value=None):
+            self.assertIsNone(mod._load_credential())
+
     def test_garbage_blob_is_no_credential(self):
         # Every reader must be stubbed: on Linux the real agy token file would
         # otherwise leak into this assertion.

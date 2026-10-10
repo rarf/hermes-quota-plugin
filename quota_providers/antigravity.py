@@ -12,7 +12,9 @@ used rather than being dropped. Buckets are matched by ``bucketId``, never by
 array position.
 
 Credential: Windows Credential Manager ``gemini:antigravity`` (CredReadW), else
-macOS Keychain service ``gemini`` account ``antigravity``, else the Antigravity CLI
+macOS Keychain service ``gemini`` account ``antigravity`` (agy wraps that password
+with ``go-keyring-base64:``; unwrap it before JSON parse, the same way Orca
+does), else the Antigravity CLI
 token file ``~/.gemini/antigravity-cli/antigravity-oauth-token`` (Linux). Antigravity 2.0 moved
 its Google OAuth out of ``state.vscdb`` into the OS secret store, so that is the
 live source; the vscdb decoders keyed on the old ``oauthTokenInfoSentinelKey``
@@ -35,6 +37,8 @@ transport -> ``fetch-error``; no usable bucket -> ``no-data``.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import subprocess
 import sys
@@ -165,6 +169,42 @@ def _linux_blob() -> Optional[bytes]:
         return None
 
 
+_GO_KEYRING_B64 = "go-keyring-base64:"
+_GO_KEYRING_HEX = "go-keyring-encoded:"
+
+
+def _unwrap_go_keyring(blob: bytes) -> bytes:
+    """Strip zalando/go-keyring's macOS wrapper, matching Orca's decoder.
+
+    ``agy`` stores the token through go-keyring, which prefixes the Keychain
+    password so ``security -w`` does not hex-encode it. The payload is the same
+    JSON. No prefix means the value is already the payload. A broken wrapper is
+    left unchanged so JSON parse fails open instead of raising.
+    """
+    try:
+        text = blob.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return blob
+    if text.startswith(_GO_KEYRING_B64):
+        payload = text[len(_GO_KEYRING_B64):]
+        try:
+            decoded = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error):
+            return blob
+        if not payload or base64.b64encode(decoded).decode("ascii") != payload:
+            return blob
+        return decoded
+    if text.startswith(_GO_KEYRING_HEX):
+        payload = text[len(_GO_KEYRING_HEX):]
+        if len(payload) % 2 or any(c not in "0123456789abcdefABCDEF" for c in payload):
+            return blob
+        try:
+            return bytes.fromhex(payload)
+        except ValueError:
+            return blob
+    return blob
+
+
 def _load_credential() -> Optional[dict[str, Any]]:
     """Antigravity's token dict, or None when not signed in.
 
@@ -175,6 +215,7 @@ def _load_credential() -> Optional[dict[str, Any]]:
             blob = reader()
             if not blob:
                 continue
+            blob = _unwrap_go_keyring(blob)
             # Windows writes UTF-8 JSON; other builds have used UTF-16LE.
             for encoding in ("utf-8", "utf-16-le"):
                 try:
