@@ -10,6 +10,8 @@ See provider quotas, reset times and account balances in Hermes Desktop and the 
 - Model-specific quota windows and reset times when the vendor supplies them.
 - Separate, configurable Claude account cards; no summed or invented allowances.
 - Honest unavailable states and opt-in access to sensitive credential sources.
+- A bundled `quota-check` skill (`quota:quota-check`) teaching agents to check
+  quota before long work and to ask before splitting tasks or switching models.
 
 ## Install
 
