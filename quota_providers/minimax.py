@@ -56,10 +56,11 @@ position — MiniMax is free to add/remove model entries):
   cards render only when the entry carries both 5-hour and weekly counts.
 * plan label is never invented — ``None`` unless the envelope carries one.
 
-Fail-open contract: HTTP 401/403 → ``auth-failed``; non-zero
-``base_resp.status_code`` → ``no-subscription`` when it indicates the key has
-no Token Plan; schema surprise / no usable windows → ``no-data``; never a
-fabricated zero and never an exception.
+Fail-open contract: HTTP 401/403 → ``auth-failed``; a key rejected as
+"invalid api key" (``base_resp`` 2049) by every host → ``auth-failed``;
+non-zero ``base_resp.status_code`` → ``no-subscription`` when it indicates the
+key has no Token Plan; schema surprise / no usable windows → ``no-data``;
+never a fabricated zero and never an exception.
 """
 
 from __future__ import annotations
@@ -80,9 +81,20 @@ PROVIDER_ID = "minimax"
 _QUOTA_PATH = "/v1/token_plan/remains"
 # Official FAQ host. The third-party ``api.minimax.io`` mirror is also known to
 # work — the plugin falls back to it when the canonical host 404s.
-_HOSTS = ("https://www.minimax.io", "https://api.minimax.io")
+#
+# MiniMax runs two platforms behind the same quota API: the international one
+# (the hosts above) and the CN one (``minimaxi.com``, below). A Subscription
+# Key belongs to one platform; the other platform's hosts answer it with HTTP
+# 200 and ``base_resp`` 2049 "invalid api key", so the fetcher falls through
+# to the remaining hosts before giving up.
+_HOSTS = (
+    "https://www.minimax.io",
+    "https://api.minimax.io",
+    "https://www.minimaxi.com",
+    "https://api.minimaxi.com",
+)
 # The whole provider must stay inside the cache sweep's budget (20 s), so the
-# two hosts share one deadline instead of timing out twice in sequence.
+# hosts share one deadline instead of timing out once per host.
 _DEADLINE_S = 10.0
 _REQUEST_TIMEOUT_S = 8.0
 _MAX_BYTES = 1024 * 1024
@@ -264,6 +276,29 @@ def _window_for(prefix: str, entry: dict, label: str) -> Optional[QuotaWindow]:
     return QuotaWindow(label=label, used_percent=round(used_percent, 2), reset_at=reset)
 
 
+def _key_not_recognized(payload: Any) -> bool:
+    """True when a host rejects the Bearer as a key of the other platform.
+
+    A Subscription Key belongs to exactly one platform. Queried against the
+    other platform's hosts the endpoint answers HTTP 200 with ``base_resp``
+    2049 "invalid api key" instead of an HTTP 401 — that is the signal to try
+    the remaining hosts, not a verdict on the key.
+    """
+    if not isinstance(payload, dict):
+        return False
+    base_resp = payload.get("base_resp")
+    if not isinstance(base_resp, dict):
+        return False
+    status_code = base_resp.get("status_code")
+    # A JSON string is as likely as an int, so normalise before comparing
+    # (same guard as ``parse_quota_payload``).
+    if isinstance(status_code, str) and status_code.strip().lstrip("-").isdigit():
+        status_code = int(status_code.strip())
+    if status_code == 2049:
+        return True
+    return "invalid api key" in str(base_resp.get("status_msg") or "").lower()
+
+
 def parse_quota_payload(payload: Any) -> QuotaResult:
     """Map the ``/v1/token_plan/remains`` envelope onto per-model Session/Weekly windows.
 
@@ -401,7 +436,6 @@ def fetch_minimax_quota() -> QuotaResult:
             return build_unavailable(PROVIDER_ID, "timeout")
         try:
             payload = _get_json(f"{host}{_QUOTA_PATH}", bearer, min(_REQUEST_TIMEOUT_S, remaining))
-            return parse_quota_payload(payload)
         except urllib.error.HTTPError as exc:
             # A 404 on the canonical host → try the mirror before giving up.
             if exc.code == 404 and index < len(_HOSTS) - 1:
@@ -410,5 +444,11 @@ def fetch_minimax_quota() -> QuotaResult:
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
         except Exception as exc:  # noqa: BLE001 - fail-open by contract
             return build_unavailable(PROVIDER_ID, _http_reason(exc))
+        if _key_not_recognized(payload):
+            # Wrong-platform key: try the next host (the other platform's).
+            # Every host rejecting it ends the loop as ``auth-failed``.
+            last_reason = "auth-failed"
+            continue
+        return parse_quota_payload(payload)
 
     return build_unavailable(PROVIDER_ID, last_reason)

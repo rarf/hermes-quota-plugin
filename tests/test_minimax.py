@@ -95,7 +95,7 @@ class MiniMaxParseTests(unittest.TestCase):
 
     def test_budget_stays_inside_the_sweep(self):
         # A provider slower than the sweep is recorded as `timeout` and loses
-        # its previous value, so the two hosts share one bounded deadline.
+        # its previous value, so the hosts share one bounded deadline.
         self.assertLess(minimax._DEADLINE_S, REFRESH_BUDGET_S)
         self.assertLessEqual(minimax._REQUEST_TIMEOUT_S, minimax._DEADLINE_S)
 
@@ -371,6 +371,67 @@ class MiniMaxCredentialTests(unittest.TestCase):
                         os.environ.pop(name, None)
                     self.assertEqual(minimax.resolve_bearer(), "SUB_KEY")
 
+
+
+class MiniMaxCnPlatformTests(unittest.TestCase):
+    """A Subscription Key belongs to one MiniMax platform: the other
+    platform's hosts answer base_resp 2049 "invalid api key", so the fetcher
+    must try the CN hosts (minimaxi.com) before reporting failure."""
+
+    _CN_CANONICAL = "https://www.minimaxi.com"
+    _CN_MIRROR = "https://api.minimaxi.com"
+    _INVALID_KEY = {"base_resp": {"status_code": 2049, "status_msg": "invalid api key"}}
+
+    def fetch(self, opener, *, bearer="SYNTHETIC_KEY"):
+        with mock.patch.object(minimax, "_urlopen", opener), \
+             mock.patch.object(minimax, "resolve_bearer", return_value=bearer):
+            return minimax.fetch_minimax_quota()
+
+    def _platform_routes(self, *, intl_answer=None, cn_answer=None):
+        """Answer per platform (defaults to a CN-key scenario: the intl hosts
+        reject the key, the CN hosts serve it)."""
+        intl = self._INVALID_KEY if intl_answer is None else intl_answer
+        cn = _HAPPY if cn_answer is None else cn_answer
+
+        def _urlopen(request, timeout=None):  # noqa: ANN001, ARG001
+            url = request.full_url
+            value = cn if url.startswith((self._CN_CANONICAL, self._CN_MIRROR)) else intl
+            if isinstance(value, Exception):
+                raise value
+            return _Resp(value)
+
+        return _urlopen
+
+    def test_the_wrong_platform_answer_is_recognized(self):
+        self.assertTrue(minimax._key_not_recognized(self._INVALID_KEY))
+        self.assertTrue(minimax._key_not_recognized(
+            {"base_resp": {"status_code": "2049", "status_msg": "Invalid Api Key"}}))
+        self.assertFalse(minimax._key_not_recognized(
+            {"base_resp": {"status_code": 0, "status_msg": "success"}}))
+        self.assertFalse(minimax._key_not_recognized(
+            {"base_resp": {"status_code": 1004, "status_msg": "plan not found"}}))
+        self.assertFalse(minimax._key_not_recognized("nope"))
+
+    def test_a_cn_key_falls_back_to_the_cn_platform_hosts(self):
+        opener = mock.Mock(side_effect=self._platform_routes())
+        result = self.fetch(opener)
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual([w.label for w in result.windows], ["Session", "Weekly"])
+        self.assertEqual(
+            [c.args[0].full_url.split("/v1/")[0] for c in opener.call_args_list],
+            [_CANONICAL, _MIRROR, self._CN_CANONICAL])
+
+    def test_a_key_no_host_recognizes_is_auth_failed(self):
+        opener = mock.Mock(side_effect=self._platform_routes(cn_answer=self._INVALID_KEY))
+        result = self.fetch(opener)
+        self.assertEqual(result.unavailable_reason, "auth-failed")
+        self.assertEqual(opener.call_count, 4)
+
+    def test_an_intl_key_never_reaches_the_cn_hosts(self):
+        opener = mock.Mock(side_effect=self._platform_routes(intl_answer=_HAPPY))
+        result = self.fetch(opener)
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(opener.call_count, 1)
 
 
 if __name__ == "__main__":
