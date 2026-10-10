@@ -59,7 +59,8 @@ hermes config set plugins.entries.quota.settings.antigravityEnabled true
 
 Alternatively, set `HERMES_QUOTA_ANTIGRAVITY_ENABLED=1`. If enabled, the plugin
 reads Antigravity's token from Windows Credential Manager (`gemini:antigravity`),
-macOS Keychain (service `gemini`, account `antigravity`), or Linux's
+macOS Keychain (service `gemini`, account `antigravity`; `agy`'s `go-keyring-base64:`
+wrapper is unwrapped before parse), or Linux's
 `~/.gemini/antigravity-cli/antigravity-oauth-token` file. It refreshes the token
 with Antigravity's installed-app OAuth client identity, then calls Google's
 quota service using the spoofed `User-Agent: antigravity/2.8.0 windows/amd64`.
