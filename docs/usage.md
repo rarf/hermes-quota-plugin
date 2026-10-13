@@ -58,6 +58,15 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | `hermes quota provider <name>` | One provider, e.g. `hermes quota provider anthropic` |
 | `hermes quota <provider-id>` | Shortcut, e.g. `hermes quota grok` |
 
+### Bundled skill
+
+The plugin registers a read-only `quota:quota-check` skill (via
+`register_skill`) when the Hermes runtime supports plugin skills; on older
+runtimes the skill is skipped and every other surface is unaffected. Agents
+running with the plugin enabled can load it with
+`skill_view(name='quota:quota-check')`. It documents cache-first quota
+checks and an ask-first protocol: never degrade work to save quota — propose
+splitting the task or switching models, and wait for the requester's call.
 
 ## How it works
 

@@ -14,6 +14,7 @@ DESKTOP_DIR="$HOME_DIR/desktop-plugins/quota"
 
 for required in \
   plugin.yaml __init__.py commands.py quota_cache.py quota_providers \
+  skills/quota-check/SKILL.md \
   desktop/plugin.js \
   scripts/hermes-home.sh scripts/hermes-config.sh; do
   [ -e "$REPO_ROOT/$required" ] || {
@@ -39,7 +40,7 @@ mkdir -p "$STAGE_PLUGIN" "$STAGE_DESKTOP"
 
 for item in \
   plugin.yaml __init__.py commands.py quota_cache.py quota_providers \
-  LICENSE scripts; do
+  LICENSE scripts skills; do
   [ -e "$REPO_ROOT/$item" ] && cp -R "$REPO_ROOT/$item" "$STAGE_PLUGIN/"
 done
 cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"

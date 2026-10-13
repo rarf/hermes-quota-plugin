@@ -7,7 +7,10 @@ Registers:
   * a ``usage_extra`` lifecycle hook that appends the same quota block to the
     /usage command output;
   * a ``/quota`` slash command for on-demand detail (triggers a refresh when
-    the cache is stale), plus a ``hermes quota`` CLI command.
+    the cache is stale), plus a ``hermes quota`` CLI command;
+  * the bundled ``quota:quota-check`` skill (read-only, via
+    ``api.register_skill``) so agents running with the plugin enabled can
+    look up quota-checking conduct via ``skill_view()``.
 
 The quota subsystem (fetchers + cache) lives entirely inside this plugin, so it
 survives ``hermes update`` — the only core change is the generic ``footer`` and
@@ -16,10 +19,14 @@ survives ``hermes update`` — the only core change is the generic ``footer`` an
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Optional
 
 from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, MAX_AGE_S
 from . import commands
+
+_SKILL_NAME = "quota-check"
+_SKILL_DIR = Path(__file__).resolve().parent / "skills" / _SKILL_NAME
 
 
 def _format_quota_block(quota_cache: dict[str, Any]) -> str:
@@ -103,8 +110,33 @@ def _supports_hook(ctx: Any, hook_name: str) -> bool:
         return False
 
 
+def _register_skill_if_supported(ctx: Any) -> bool:
+    """Register the bundled quota-check skill when the runtime supports it.
+
+    ``register_skill`` landed after some early plugin-API builds; on those the
+    skill simply does not load and every other surface is unaffected. Returns
+    True when the skill was registered.
+    """
+    if not hasattr(ctx, "register_skill"):
+        return False
+    skill_md = _SKILL_DIR / "SKILL.md"
+    if not skill_md.is_file():
+        return False
+    try:
+        ctx.register_skill(
+            _SKILL_NAME,
+            skill_md,
+            description="Before long tasks or 429s: check quota; ask, don't degrade.",
+        )
+        return True
+    except Exception:
+        # A skill must never take the plugin (or its other surfaces) down.
+        return False
+
+
 def register(ctx) -> None:
     """Register supported quota surfaces without breaking older Hermes builds."""
+    _register_skill_if_supported(ctx)
     if _supports_hook(ctx, "footer"):
         ctx.register_hook("footer", footer_segment)
     if _supports_hook(ctx, "usage_extra"):
