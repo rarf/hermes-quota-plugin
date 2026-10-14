@@ -14,7 +14,18 @@ the whole cache refresh.
 
 from __future__ import annotations
 
-from .base import AccountBalance, QuotaAccount, QuotaResult, QuotaWindow, build_unavailable, GENERATED_ACCOUNT_ID_PREFIX
+from .base import (
+    AccountBalance,
+    Provenance,
+    QuotaAccount,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    GENERATED_ACCOUNT_ID_PREFIX,
+    provenance_from_dict,
+    provenance_to_dict,
+    normalize_provenance_dict,
+)
 from .registry import PROVIDER_FETCHERS, register, get_fetcher
 
 from . import grok  # noqa: F401

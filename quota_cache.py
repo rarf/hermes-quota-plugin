@@ -46,7 +46,14 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from .quota_providers import PROVIDER_FETCHERS, QuotaAccount, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
+from .quota_providers import (
+    PROVIDER_FETCHERS,
+    GENERATED_ACCOUNT_ID_PREFIX,
+    QuotaAccount,
+    QuotaResult,
+    provenance_to_dict,
+    normalize_provenance_dict,
+)
 from .quota_providers.codex import display_label
 
 logger = logging.getLogger(__name__)
@@ -66,12 +73,33 @@ def _cache_path() -> str:
     return os.path.join(str(get_hermes_home()), _CACHE_FILENAME)
 
 
+def _normalize_record_provenance(record: Any) -> Any:
+    """Normalize a cached record's provenance (and nested accounts') in place.
+
+    The provenance vocabulary is closed and the identity must be email-free, so
+    a stale or hand-edited cache is normalized on read rather than trusted.
+    Unknown shapes are left untouched.
+    """
+    if not isinstance(record, dict):
+        return record
+    if "provenance" in record:
+        record["provenance"] = normalize_provenance_dict(record.get("provenance"))
+    accounts = record.get("accounts")
+    if isinstance(accounts, list):
+        for account in accounts:
+            if isinstance(account, dict) and "provenance" in account:
+                account["provenance"] = normalize_provenance_dict(account.get("provenance"))
+    return record
+
+
 def read_quota_cache() -> dict[str, Any]:
     """Return the parsed quota cache, or an empty shell if missing/unreadable."""
     try:
         with open(_cache_path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
         if isinstance(data, dict) and isinstance(data.get("providers"), dict):
+            for record in data["providers"].values():
+                _normalize_record_provenance(record)
             return data
     except FileNotFoundError:
         pass
@@ -123,6 +151,7 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
             for b in res.account_balances
         ],
         "api_calls_available": res.api_calls_available,
+        "provenance": provenance_to_dict(res.provenance),
         "windows": [
             {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
             for w in res.windows
@@ -138,6 +167,7 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
                 "plan": account.plan,
                 "unavailable_reason": account.unavailable_reason,
                 "details": list(account.details or []),
+                "provenance": provenance_to_dict(account.provenance),
                 "windows": [
                     {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
                     for w in account.windows
@@ -218,6 +248,7 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
             "windows": windows if isinstance(windows, list) else [],
             "account_balances": [],
             "api_calls_available": None,
+            "provenance": normalize_provenance_dict(account.get("provenance")),
         }
     return rows
 

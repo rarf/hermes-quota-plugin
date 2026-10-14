@@ -126,7 +126,11 @@ Platform notes — only what is proven:
   documented, so the plugin does **not** read the Keychain for extra accounts and
   never asks you to export credentials by hand. A macOS extra account needs a
   directory that contains a `.credentials.json`; otherwise its row reads
-  `unavailable (unsupported-platform)`. The default Hermes login is unaffected.
+  `unavailable (unsupported-platform)`. The default Hermes login is unaffected
+  *as an extra-account rule*: its **plan** is the one exception — when the
+  `.credentials.json` file yields no plan, the primary login's plan is read
+  read-only from that same fixed `Claude Code-credentials` item (bounded
+  `security` call, exact access-token match, no token returned or logged).
 - **Invalid / excess entries** surface as `unavailable (config-invalid)` or
   `unavailable (config-limit)` with the exact fix in the detail line — shown in
   `/quota`, the footer and the widget tooltip. Nothing is silently ignored and no

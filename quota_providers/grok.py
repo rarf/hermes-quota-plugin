@@ -9,7 +9,18 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, opt_in_flag, urlopen_no_redirect
+from .base import (
+    BILLING_UNKNOWN,
+    METER_CHAT_QUERIES,
+    METER_UNKNOWN,
+    PLAN_SOURCE_UNKNOWN,
+    Provenance,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    opt_in_flag,
+    urlopen_no_redirect,
+)
 from .browser_cookies import (
     ChromeCookieError,
     load_chrome_grok_cookies,
@@ -26,6 +37,48 @@ _BROWSER_UA = (
 
 _SESSION_PATH = os.path.join(os.path.expanduser("~"), "grok_session.json")
 _RAW_DEBUG_PATH = os.path.join(os.path.expanduser("~"), "grok_last_response.bin")
+
+# Provenance for the two Grok meters. They are two different meters read from
+# the signed-in grok.com browser session. What these figures share (or do not
+# share) with the Hermes ``xai-oauth`` provider is NOT establishable from a
+# browser session, so the notes say so instead of asserting a relationship.
+# Each record names its own source and scope so a consumer can never read one
+# meter as the other. No billing mode or plan is claimed: the browser session
+# cannot verify a subscription, so free/unknown accounts are not labelled.
+_GROK_BUILD_SOURCE = "grok.com GetGrokCreditsConfig (Build/weekly)"
+_GROK_BUILD_SCOPE = "grok.com signed-in session, Grok Build / Weekly Limit"
+_GROK_BUILD_NOTE = (
+    "Read from the grok.com browser session (opt-in cookies); whether it shares "
+    "the Hermes xai-oauth budget cannot be established here (may share; unverified)."
+)
+_GROK_REST_SOURCE = "grok.com /rest/rate-limits (fallback)"
+_GROK_REST_SCOPE = "grok.com chat, per model on a rolling 2h window"
+_GROK_REST_NOTE = (
+    "Fallback per-model chat meter, not the Build/weekly allowance; read from the "
+    "grok.com browser session. Its link to the Hermes xai-oauth budget is unverified."
+)
+
+
+def _grok_build_provenance() -> Provenance:
+    return Provenance(
+        source=_GROK_BUILD_SOURCE,
+        scope=_GROK_BUILD_SCOPE,
+        plan_source=PLAN_SOURCE_UNKNOWN,
+        billing_mode=BILLING_UNKNOWN,
+        meter=METER_UNKNOWN,
+        note=_GROK_BUILD_NOTE,
+    )
+
+
+def _grok_rest_provenance() -> Provenance:
+    return Provenance(
+        source=_GROK_REST_SOURCE,
+        scope=_GROK_REST_SCOPE,
+        plan_source=PLAN_SOURCE_UNKNOWN,
+        billing_mode=BILLING_UNKNOWN,
+        meter=METER_CHAT_QUERIES,
+        note=_GROK_REST_NOTE,
+    )
 
 
 def _write_private_debug(path: str, raw: bytes) -> None:
@@ -196,7 +249,8 @@ def _parse_grok_protobuf(raw: bytes) -> Optional[QuotaResult]:
 
     if not windows:
         return None
-    return QuotaResult(label="grok", windows=windows, details=[], unavailable_reason=None)
+    return QuotaResult(label="grok", windows=windows, details=[], unavailable_reason=None,
+                       provenance=_grok_build_provenance())
 
 
 def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
@@ -255,7 +309,8 @@ def _fetch_grok_rest(cookies: str) -> Optional[QuotaResult]:
 
     if not windows:
         return None
-    return QuotaResult(label="grok", windows=windows, plan=None, unavailable_reason=None)
+    return QuotaResult(label="grok", windows=windows, plan=None, unavailable_reason=None,
+                       provenance=_grok_rest_provenance())
 
 
 def fetch_grok_quota() -> QuotaResult:

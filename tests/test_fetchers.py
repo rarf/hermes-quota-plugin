@@ -33,6 +33,8 @@ def setUpModule():  # noqa: N802 - unittest hook
     for patch in (
         mock.patch.object(_b, "_load_shared_payload", return_value=None),
         mock.patch.object(_b, "_store_shared_payload", return_value=None),
+        # Synthetic usage tests must never access the real macOS login.
+        mock.patch.object(_b, "_read_macos_claude_keychain_payload", return_value=None),
     ):
         patch.start()
         _SHARE_PATCHES.append(patch)

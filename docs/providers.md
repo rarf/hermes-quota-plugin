@@ -17,10 +17,57 @@
 | `cursor` | `cursor-agent` login (macOS keychain or `auth.json`) | Read-only credential use; Included and API billing-cycle percents; personal on-demand cap as a window, personal/team pools as details. If the session expires, run `cursor-agent login`; the plugin never exchanges refresh tokens or writes to Cursor's credential store. |
 | `minimax` | Subscription Key **or** OAuth (`minimax-oauth`) | Token Plan 5h + Weekly windows per model; pay-as-you-go keys show `no-subscription`. Subscription Keys from both MiniMax platforms work: the CN hosts (`minimaxi.com`) are tried after the international ones when a host rejects the key as "invalid api key". The `video` model bucket is **opt-in** (default off — low tiers don't include video, so the entry reports a meaningless 100%). Enable with `hermes config set plugins.entries.quota.settings.minimaxVideoEnabled true` or `HERMES_QUOTA_MINIMAX_VIDEO_ENABLED=1`. |
 | `ollama` | `OLLAMA_API_KEY` (`sk-…`, from ollama.com/settings) | Ollama Cloud, from `GET /api/balance` (included allowance + balance, the reset period, purchased credit) and `GET /api/usage?range=30d` (spend, requests, tokens); `POST /api/me` supplies the plan label. The **Included credits** bar is the share drawn from the plan allowance, and the reset is the provider's own `period.until`. **Account balance** is the purchased wallet, which is separate money. See below. |
-| `grok` | browser cookies | **Opt-in**, disabled by default. The xAI API exposes no plan or account name, so the card shows neither. |
+| `grok` | browser cookies | **Opt-in**, disabled by default. The xAI API exposes no plan or account name, and the browser session cannot verify a subscription, so the card shows no plan and claims no billing mode (`unknown`). Two distinct meters are reported with explicit source/scope — see [Grok](#grok-opt-in) below. |
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Usage provenance
+
+Every record carries a normalized `provenance` object alongside its windows,
+serialized into `quota_cache.json` and rendered by `hermes quota` and the
+Desktop pane:
+
+```json
+"provenance": {
+  "source": "api.anthropic.com/api/oauth/usage",
+  "scope": "Claude OAuth subscription (this login only)",
+  "account": null,
+  "plan_source": "provider-response",
+  "billing_mode": "subscription",
+  "meter": "subscription allowance",
+  "note": null
+}
+```
+
+- `plan_source` is `provider-response` (a vendor field), `local-credential`
+  (e.g. Claude's `.credentials.json` `subscriptionType`), `user-label` (a
+  configured display label — never a verified plan) or `unknown`. A plan is
+  never inferred from an email address or a `.edu` domain. A configured extra
+  Claude account takes its plan from its own credential file. The **primary**
+  Claude login's plan is read from the local credential **only when its
+  `accessToken` is byte-identical to the resolved primary credential**: the
+  `.credentials.json` file is preferred, and on macOS the
+  `Claude Code-credentials` Keychain item (read-only, bounded, via `security`)
+  is consulted when the file yields no plan — that is where a macOS
+  enterprise/EDU login normally lives. Any other source, or a mismatch, leaves
+  the plan `unknown` rather than attaching one login's plan to another credential.
+- `billing_mode` separates a `subscription` allowance from `pay-as-you-go`
+  money; a record that provably shows both (Anthropic subscription windows plus
+  enabled `extra_usage`; Nous subscription credits plus a **positive**
+  `purchased_credits_remaining`) is `mixed`. A Codex `credits` balance does **not**
+  count: its presence is not proof of purchased/pay-as-you-go money (it may be an
+  included or promotional allowance), so it never turns a subscription record into
+  `mixed` or `pay-as-you-go`. `unknown` is used when the source does not say —
+  never guessed.
+- `meter` names what the numbers measure (`subscription allowance`,
+  `credits balance`, `chat queries`, `unknown`).
+- `account` is a display label at most; it is never a verified identity, and no
+  email, token or credential is written into provenance.
+
+All values are normalized (control characters stripped, bounded length) and an
+older cache without provenance renders exactly as before. Unknown fields are
+omitted by both the CLI and the pane rather than shown as status.
 
 ### Ollama
 
@@ -217,3 +264,17 @@ Browser notes:
   prefix is stripped after AES-CBC decrypt.
 - App-Bound `v20` cookies are not supported (`chrome-app-bound`).
 - Safari is not supported.
+
+**Two meters, each with its own source and scope.** The primary read is
+`grok.com GetGrokCreditsConfig` — the **Grok Build / Weekly Limit** allowance
+the grok.com panel shows — scoped to the signed-in grok.com session. Only when
+that parse fails does the fetcher fall back to `grok.com /rest/rate-limits`, the
+**per-model chat query** meter on a rolling 2h window; the record's `meter` is
+`chat queries` and its note says it is the fallback, not the Build/weekly
+allowance. Both records state that this is the grok.com browser session. What
+either meter shares with the Hermes `xai-oauth` provider **cannot be established
+from a browser session**, so the note says so (may share; unverified) instead of
+asserting a relationship. Because the session cannot verify a subscription or a
+plan, no billing mode or plan is claimed — a free or unknown Grok account is not
+labelled `subscription`. Nothing about either meter is inferred from the
+account's name or email.

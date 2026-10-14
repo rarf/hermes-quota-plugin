@@ -22,6 +22,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -30,8 +31,19 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .base import (
+    BILLING_MIXED,
+    BILLING_PAY_AS_YOU_GO,
+    BILLING_SUBSCRIPTION,
+    BILLING_UNKNOWN,
     GENERATED_ACCOUNT_ID_PREFIX,
+    METER_CREDITS_BALANCE,
+    METER_SUBSCRIPTION_ALLOWANCE,
+    METER_UNKNOWN,
+    PLAN_SOURCE_LOCAL_CREDENTIAL,
+    PLAN_SOURCE_PROVIDER_RESPONSE,
+    PLAN_SOURCE_UNKNOWN,
     Deadline,
+    Provenance,
     QuotaAccount,
     QuotaResult,
     QuotaWindow,
@@ -134,6 +146,16 @@ _CLAUDE_ACCOUNTS_SETTING = "claudeAccounts"
 _CLAUDE_ACCOUNT_ID_MAX = 64
 _MAX_CLAUDE_ACCOUNTS = 8
 _CLAUDE_CREDENTIALS_FILENAME = ".credentials.json"
+# Claude Code's macOS login lives in a single generic-password Keychain item
+# whose service is fixed (``Claude Code-credentials``). Claude Code's own reader
+# does NOT name the item per ``CLAUDE_CONFIG_DIR``, so there is no
+# directory-hashing scheme to mirror: the borrowed login is one item regardless
+# of the config dir. The item's access token and the plan's ``subscriptionType``
+# are read read-only here, through a bounded ``security`` call; nothing is ever
+# written, refreshed or logged.
+_CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+# Bound on the Keychain read, mirroring core's own ``security`` timeout.
+_KEYCHAIN_TIMEOUT_S = 5.0
 # Upper bound on a single ``.credentials.json`` read. The real file is a few
 # hundred bytes of JSON; anything larger is refused rather than slurped, and the
 # file is only ever read through a stat-verified regular-file descriptor.
@@ -602,9 +624,15 @@ def _request_anthropic_usage_locked(
     return payload, None
 
 
-def _anthropic_usage_payload() -> tuple[Optional[dict[str, Any]], Optional[str]]:
-    """Fetch the OAuth usage payload once for the core-resolved account."""
-    token = _core_anthropic_token()
+def _anthropic_usage_payload(token: Optional[str] = None) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """Fetch the OAuth usage payload once for the core-resolved account.
+
+    When *token* is supplied by the caller, that exact token is used for the
+    request instead of re-resolving it, so a plan lookup can be matched against
+    the *same* credential the request used.
+    """
+    if token is None:
+        token = _core_anthropic_token()
     if not token:
         return None, "no-credentials"
     if _core_anthropic_is_oauth(token) is False:
@@ -904,29 +932,172 @@ def _credential_details(reason: Optional[str]) -> list[str]:
     return []
 
 
-def _claude_subscription_type(config_dir: str) -> Optional[str]:
-    """Plan name from ``claudeAiOauth.subscriptionType``, read locally.
+def _read_claude_credentials_json(config_dir: str) -> Optional[dict[str, Any]]:
+    """Parsed ``.credentials.json`` object from a Claude config dir, or None.
 
-    Only this one string is taken from the credentials file; the token is never
-    read here. Missing, non-string or oversized values give no plan.
+    The same bounded, stat-verified, non-blocking-descriptor read as
+    :func:`_read_claude_account_token`, but returning the JSON *object* (a
+    missing/oversized/non-regular/malformed file yields None). Only the object is
+    returned; the caller decides which fields it is allowed to read, and the
+    access token is never printed, cached or logged here.
     """
+    path = Path(config_dir).expanduser() / _CLAUDE_CREDENTIALS_FILENAME
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
-        path = Path(config_dir).expanduser() / _CLAUDE_CREDENTIALS_FILENAME
-        with open(path, "rb") as fh:
-            raw = fh.read(_MAX_CREDENTIAL_BYTES + 1)
-        if len(raw) > _MAX_CREDENTIAL_BYTES:
-            return None
-        data = json.loads(raw)
-    except Exception:  # noqa: BLE001 - a missing plan is not an error
+        fd = os.open(str(path), flags)
+    except OSError:
         return None
-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
-    value = oauth.get("subscriptionType") if isinstance(oauth, dict) else None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_CREDENTIAL_BYTES:
+            return None
+        chunks: list[bytes] = []
+        remaining = _MAX_CREDENTIAL_BYTES
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks).decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _claude_plan_label(value: Any) -> Optional[str]:
+    """Title-case a ``subscriptionType`` string, bounding it; else None."""
     if not isinstance(value, str):
         return None
     text = value.strip()
     if not text or len(text) > 32:
         return None
     return text.title()
+
+
+def _provenance_account_label(value: Any) -> Optional[str]:
+    """The row's own display label for provenance, or None.
+
+    Only a user-typed label, and only when it is not email-shaped: the provenance
+    contract promises no email and no inferred identity ever reaches the cache or
+    the UI, so an ``@`` anywhere drops the value rather than risking a leak.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or "@" in text:
+        return None
+    return text
+
+
+def _claude_subscription_type(config_dir: str) -> Optional[str]:
+    """Plan name from ``claudeAiOauth.subscriptionType``, read locally.
+
+    Only this one string is taken from the credentials file; the token is never
+    read here. Missing, non-string or oversized values give no plan.
+    """
+    data = _read_claude_credentials_json(config_dir)
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    value = oauth.get("subscriptionType") if isinstance(oauth, dict) else None
+    return _claude_plan_label(value)
+
+
+def _macos_keychain_supported() -> bool:
+    """True only on macOS, where the borrowed Claude login lives in the Keychain."""
+    return sys.platform == "darwin"
+
+
+def _read_macos_claude_keychain_payload() -> Optional[dict[str, Any]]:
+    """Raw ``{"claudeAiOauth": {...}}`` payload from the macOS Keychain, or None.
+
+    One bounded, read-only ``security find-generic-password -s`` … ``-w`` call on
+    the exact service core's Claude reader addresses (``Claude Code-credentials``).
+    Core's *public* reader (``read_claude_code_credentials``) normalises through
+    ``_claude_oauth_record`` and drops ``subscriptionType``/``rateLimitTier``/
+    ``scopes``; its raw-payload reader is private, and this plugin also runs
+    standalone, so a small read-only helper is warranted rather than a second
+    credential *resolver* — no token is minted, refreshed or written here. The
+    whole call is bounded by ``_KEYCHAIN_TIMEOUT_S``: a missing entry, a non-zero
+    exit, a timeout, a missing ``security`` binary or non-JSON output all become
+    None (the plan stays unknown) instead of raising.
+    """
+    if not _macos_keychain_supported():
+        return None
+    try:
+        completed = subprocess.run(
+            ["security", "find-generic-password", "-s", _CLAUDE_CODE_KEYCHAIN_SERVICE, "-w"],
+            check=False, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=_KEYCHAIN_TIMEOUT_S, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError):  # noqa: BLE001 - a missing plan is not an error
+        return None
+    if completed.returncode != 0:
+        return None
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _claude_plan_from_payload(payload: Any, token: str) -> Optional[str]:
+    """Plan label from a credential payload whose access token matches *token*.
+
+    The match is an exact, in-memory string equality between the resolved
+    primary token and the payload's ``accessToken``; the token is never returned
+    or logged. A payload that is not a mapping, or whose token differs, yields
+    None so one login's plan is never attached to another credential.
+    """
+    oauth = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+    if not isinstance(oauth, dict):
+        return None
+    access = oauth.get("accessToken")
+    if not isinstance(access, str) or access.strip() != token:
+        return None
+    return _claude_plan_label(oauth.get("subscriptionType"))
+
+
+def _primary_claude_plan(token: Optional[str]) -> Optional[str]:
+    """Plan for the *primary* login, only from its exact matching credential.
+
+    The core Anthropic resolver may draw the primary token from an env var, an
+    API key, the credential pool, or a local login. This looks for the plan in
+    the same local sources core's Claude-Code reader uses — the
+    ``.credentials.json`` file and, on macOS, the ``Claude Code-credentials``
+    Keychain item — and returns a plan **only when that source's ``accessToken``
+    is byte-identical to the resolved primary token**: an exact credential
+    match. The file is preferred; the Keychain is consulted only when the file
+    yields no plan, because a macOS enterprise/EDU install keeps the borrowed
+    login there and the file alone would leave the plan unknown. Any other
+    source, or a mismatch, yields None (the plan stays unknown) rather than
+    attaching one login's plan to another credential. Identity is never inferred
+    (no email, org or account name); the token is compared in memory and never
+    returned or logged.
+    """
+    if not token or not isinstance(token, str) or not token.strip():
+        return None
+    wanted = token.strip()
+    try:
+        config_dir = str(_effective_claude_config_dir())
+    except Exception:  # noqa: BLE001 - a missing plan is not an error
+        config_dir = ""
+    if config_dir:
+        plan = _claude_plan_from_payload(_read_claude_credentials_json(config_dir), wanted)
+        if plan:
+            return plan
+    return _claude_plan_from_payload(_read_macos_claude_keychain_payload(), wanted)
 
 
 def _claude_account_results(
@@ -1002,9 +1173,15 @@ def _claude_account_results(
             accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
                                          unavailable_reason="no-data"))
             continue
+        plan = _claude_plan_from_payload(_read_claude_credentials_json(str(account_dir)), token)
         accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
-                                     plan=_claude_subscription_type(str(account_dir)),
-                                     windows=windows, details=details))
+                                     plan=plan,
+                                     windows=windows, details=details,
+                                     provenance=_anthropic_provenance(
+                                         payload,
+                                         account=_provenance_account_label(entry.get("label")),
+                                         plan_source=(PLAN_SOURCE_LOCAL_CREDENTIAL if plan
+                                                      else PLAN_SOURCE_UNKNOWN))))
     if overflow:
         accounts.append(QuotaAccount(
             id=f"{GENERATED_ACCOUNT_ID_PREFIX}limit",
@@ -1014,10 +1191,49 @@ def _claude_account_results(
     return accounts
 
 
+_ANTHROPIC_USAGE_SOURCE = "api.anthropic.com/api/oauth/usage"
+_ANTHROPIC_USAGE_SCOPE = "Claude OAuth subscription (this login only)"
+
+
+def _anthropic_extra_usage_enabled(payload: Any) -> bool:
+    extra = payload.get("extra_usage") if isinstance(payload, dict) else None
+    return isinstance(extra, dict) and bool(extra.get("is_enabled"))
+
+
+def _anthropic_provenance(payload: Any = None, *, plan_source: str = PLAN_SOURCE_UNKNOWN,
+                          account: Optional[str] = None) -> Provenance:
+    """Provenance for an Anthropic OAuth usage read.
+
+    The subscription windows are a plan allowance; an enabled ``extra_usage``
+    block on the same payload is billed pay-as-you-go, so the record honestly
+    reports ``mixed`` rather than a pure subscription. ``plan_source`` is only
+    ``local-credential`` when the plan came from a ``.credentials.json`` whose
+    access token matches the credential this read used — the configured account's
+    own file, or the primary's file only on an exact token match; otherwise the
+    plan stays unknown (never inferred). ``account`` is the row's own display
+    label where one exists — never an identity, and never inferred.
+    """
+    billing = BILLING_MIXED if _anthropic_extra_usage_enabled(payload) else BILLING_SUBSCRIPTION
+    return Provenance(
+        source=_ANTHROPIC_USAGE_SOURCE,
+        scope=_ANTHROPIC_USAGE_SCOPE,
+        account=account,
+        plan_source=plan_source,
+        billing_mode=billing,
+        meter=METER_SUBSCRIPTION_ALLOWANCE,
+    )
+
+
 def _fetch_anthropic_single() -> QuotaResult:
-    """Fetch and parse Anthropic's usage payload in one network request."""
+    """Fetch and parse Anthropic's usage payload in one network request.
+
+    The primary token is resolved **once** and the same value is used for both
+    the request and the plan lookup, so the plan can never be attached from a
+    credential the request did not use.
+    """
+    token = _core_anthropic_token()
     try:
-        payload, reason = _anthropic_usage_payload()
+        payload, reason = _anthropic_usage_payload(token)
     except ImportError:
         return build_unavailable("anthropic", "fetcher-unavailable")
     except Exception:
@@ -1028,12 +1244,16 @@ def _fetch_anthropic_single() -> QuotaResult:
     windows, details = _parse_anthropic_usage(payload)
     if not windows and not details:
         return build_unavailable("anthropic", "no-data")
+    plan = _primary_claude_plan(token)
     return QuotaResult(
         label="anthropic",
         windows=windows,
-        plan=None,
+        plan=plan,
         unavailable_reason=None,
         details=details,
+        provenance=_anthropic_provenance(
+            payload,
+            plan_source=(PLAN_SOURCE_LOCAL_CREDENTIAL if plan else PLAN_SOURCE_UNKNOWN)),
     )
 
 
@@ -1055,7 +1275,13 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
         else:
             windows, details = _parse_anthropic_usage(payload)
             if windows or details:
-                primary = QuotaResult(label="anthropic", windows=windows, details=details)
+                plan = _primary_claude_plan(token)
+                primary = QuotaResult(
+                    label="anthropic", windows=windows, details=details, plan=plan,
+                    provenance=_anthropic_provenance(
+                        payload,
+                        plan_source=(PLAN_SOURCE_LOCAL_CREDENTIAL if plan
+                                     else PLAN_SOURCE_UNKNOWN)))
             else:
                 primary_reason = "no-data"
 
@@ -1236,7 +1462,32 @@ def _fetch_nous_portal() -> QuotaResult:
     elif paid is False:
         details.append("Status: access depleted - top up to restore")
 
-    return QuotaResult(label="nous", windows=windows, plan=plan, details=details)
+    # Provenance: everything here comes from the Portal account response. A
+    # subscription-credit gauge is a plan allowance; a *positive*
+    # ``purchased_credits_remaining`` is the one field that evidences top-up
+    # money, so subscription + a positive top-up is ``mixed``. Generic detail
+    # lines (spend, "Total usable", rollover) do NOT prove pay-as-you-go or a
+    # credits balance, so a details-only record stays ``unknown``.
+    purchased = _finite_usd(getattr(access, "purchased_credits_remaining", None)) if access is not None else None
+    has_purchased = purchased is not None and purchased > 0
+    if windows and has_purchased:
+        nous_billing = BILLING_MIXED
+    elif windows:
+        nous_billing = BILLING_SUBSCRIPTION
+    elif has_purchased:
+        nous_billing = BILLING_PAY_AS_YOU_GO
+    else:
+        nous_billing = BILLING_UNKNOWN
+    provenance = Provenance(
+        source="Nous Portal account info",
+        scope="Nous Portal allowance and wallet for this account",
+        plan_source=(PLAN_SOURCE_PROVIDER_RESPONSE if plan else PLAN_SOURCE_UNKNOWN),
+        billing_mode=nous_billing,
+        meter=METER_SUBSCRIPTION_ALLOWANCE if windows else (
+            METER_CREDITS_BALANCE if has_purchased else METER_UNKNOWN),
+    )
+    return QuotaResult(label="nous", windows=windows, plan=plan, details=details,
+                       provenance=provenance)
 
 
 _register("nous")(_fetch_nous_portal)
@@ -1363,22 +1614,46 @@ def _parse_codex_payload(payload: dict) -> QuotaResult:
     credits = payload.get("credits")
     if not isinstance(credits, dict):
         credits = {}
+    credits_shown = False
     if credits.get("has_credits"):
         balance = _finite_number(credits.get("balance"))
         if balance is not None:
             details.append(f"Credits balance: ${float(balance):.2f}")
+            credits_shown = True
         elif credits.get("unlimited"):
             details.append("Credits balance: unlimited")
+            credits_shown = True
 
     plan = _codex_plan_label(payload.get("plan_type"))
     if not windows and not details:
         return build_unavailable("openai-codex", "no-data")
+    # Provenance: the plan comes straight from the backend ``plan_type`` field
+    # (verified) or is honestly unknown — never inferred from an account email
+    # or an OTP claim. A "credits balance" is NOT proof of purchased /
+    # pay-as-you-go money: it may be an included or promotional allowance, so
+    # its presence never changes the billing mode to pay-as-you-go or mixed.
+    # A window evidences an *allowance* meter, but only a backend-reported plan
+    # evidences a *paid subscription*: a free / plan-less account also has a
+    # window, so without a plan the billing mode stays unknown.
+    paid_plan = str(payload.get("plan_type") or "").strip().lower() in {
+        "go", "plus", "prolite", "pro", "business", "team", "enterprise", "education", "edu",
+    }
+    billing = BILLING_SUBSCRIPTION if (windows and paid_plan) else BILLING_UNKNOWN
+    provenance = Provenance(
+        source="chatgpt.com backend usage endpoint (codex identity)",
+        scope="ChatGPT plan allowance and credits balance for this account",
+        plan_source=(PLAN_SOURCE_PROVIDER_RESPONSE if plan else PLAN_SOURCE_UNKNOWN),
+        billing_mode=billing,
+        meter=((METER_SUBSCRIPTION_ALLOWANCE if paid_plan else METER_UNKNOWN) if windows else
+               (METER_CREDITS_BALANCE if credits_shown else METER_UNKNOWN)),
+    )
     return QuotaResult(
         label="openai-codex",
         windows=windows,
         plan=plan,
         unavailable_reason=None,
         details=details,
+        provenance=provenance,
     )
 
 

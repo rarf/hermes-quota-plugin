@@ -1390,6 +1390,24 @@ function QuotaBar({ value, tone }) {
 	});
 }
 
+// One-line usage provenance for the pane: where the numbers came from, how they
+// are billed, what they measure, whether a plan is verified metadata or only a
+// user label, and any budget-scoping caveat. Unknown/absent fields contribute
+// nothing, so an older cache (no provenance) renders exactly as before.
+function provenanceText(provider) {
+	const p = provider && provider.provenance;
+	if (!p || typeof p !== "object") return "";
+	const parts = [];
+	if (typeof p.source === "string" && p.source.trim()) parts.push(p.source.trim());
+	if (["subscription", "pay-as-you-go", "mixed"].includes(p.billing_mode)) parts.push(p.billing_mode);
+	if (["subscription allowance", "credits balance", "chat queries"].includes(p.meter)) parts.push(p.meter);
+	const plan = typeof provider.plan === "string" ? provider.plan.trim() : "";
+	const planSource = ["provider-response", "local-credential", "user-label"].includes(p.plan_source) ? p.plan_source : "";
+	if (plan && planSource && planSource !== "unknown") parts.push(`plan: ${plan} (${planSource})`);
+	if (typeof p.note === "string" && p.note.trim()) parts.push(p.note.trim());
+	return parts.join(" · ");
+}
+
 // One provider card: bordered box with label + plan, a thick tonal bar per
 // window, colored "% left", reset line, and provider detail lines (credits,
 // banked resets). Unavailable providers render as a muted card.
@@ -1499,6 +1517,12 @@ function ProviderRow({ id, provider }) {
 						: null,
 				],
 			}),
+			provenanceText(provider)
+				? jsx("div", {
+						className: "text-[0.6875rem] text-(--ui-text-quaternary)",
+						children: provenanceText(provider),
+					})
+				: null,
 			...facts.balances.map((b) => jsxs("div", {
 				key: `balance-${b.currency}`,
 				children: [

@@ -19,7 +19,18 @@ import time
 import urllib.error
 import urllib.request
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import (
+    BILLING_PAY_AS_YOU_GO,
+    BILLING_UNKNOWN,
+    METER_CREDITS_BALANCE,
+    METER_UNKNOWN,
+    PLAN_SOURCE_UNKNOWN,
+    Provenance,
+    QuotaResult,
+    QuotaWindow,
+    build_unavailable,
+    urlopen_no_redirect,
+)
 from .registry import register
 
 _BASE_URL = "https://openrouter.ai/api/v1"
@@ -215,6 +226,10 @@ def fetch_openrouter_quota() -> QuotaResult:
                 break
             results[index] = result
         has_data, wallet = results.get(-1, (False, f"Account credits unavailable via {primary_label} (timeout)"))
+        # The wallet endpoint is the only *financial* evidence here. Key caps and
+        # usage lines are spending limits/figures, not proof of money, and a
+        # free tier also reports usage — so they never imply pay-as-you-go.
+        wallet_evidence = bool(has_data)
         details.append(wallet)
         details.append("Account membership of other keys is unverified; wallet is not a total across accounts")
         windows = []
@@ -223,7 +238,20 @@ def fetch_openrouter_quota() -> QuotaResult:
             has_data = has_data or bool(ws) or any(not d.startswith(f"{label}: unavailable (") for d in ds)
             windows.extend(ws)
             details.extend(ds)
+        # Provenance: OpenRouter is a prepaid-credits wallet. The scoped figures
+        # are the locally configured keys' own caps and the one shared account
+        # wallet, never a sum across accounts. Only real wallet figures evidence
+        # pay-as-you-go; with caps/details alone (or no real figure), billing
+        # stays unknown rather than assumed.
+        provenance = Provenance(
+            source="openrouter.ai/api/v1 key and credits endpoints",
+            scope="Locally configured keys: per-key cap and the shared account wallet (not summed across keys)",
+            plan_source=PLAN_SOURCE_UNKNOWN,
+            billing_mode=(BILLING_PAY_AS_YOU_GO if wallet_evidence else BILLING_UNKNOWN),
+            meter=(METER_CREDITS_BALANCE if wallet_evidence else METER_UNKNOWN),
+        )
         return QuotaResult(label="openrouter", windows=windows, details=details,
-                           unavailable_reason=None if has_data else "no-data")
+                           unavailable_reason=None if has_data else "no-data",
+                           provenance=provenance)
     except Exception:
         return build_unavailable("openrouter", "fetch-error")

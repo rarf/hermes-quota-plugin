@@ -26,6 +26,7 @@ from typing import Any, Optional
 
 from .quota_cache import iter_account_records, read_quota_cache, quota_cache_age_seconds, refresh_quota_cache, MAX_AGE_S
 from .quota_providers import PROVIDER_FETCHERS
+from .quota_providers.base import normalize_provenance_dict
 
 _PROVIDER_IDS = tuple(PROVIDER_FETCHERS)
 
@@ -88,6 +89,43 @@ def _matches_filter(pf: str, name: str, rec: Any) -> bool:
     return pf in candidates
 
 
+def _provenance_line(rec: Any) -> str:
+    """One indented provenance line for a provider record, or ''.
+
+    Reports where the numbers came from, how they are billed, what they measure
+    and — when a plan is present — whether it is verified provider/credential
+    metadata or just a display label. A record without provenance (older cache)
+    renders nothing, so the CLI stays backward compatible.
+    """
+    if not isinstance(rec, dict):
+        return ""
+    prov = rec.get("provenance")
+    if not isinstance(prov, dict):
+        return ""
+    prov = normalize_provenance_dict(prov)
+    parts: list[str] = []
+    source = prov.get("source")
+    if isinstance(source, str) and source.strip():
+        parts.append(f"source: {source.strip()}")
+    billing = prov.get("billing_mode")
+    if isinstance(billing, str) and billing.strip() and billing != "unknown":
+        parts.append(f"billing: {billing.strip()}")
+    meter = prov.get("meter")
+    if isinstance(meter, str) and meter.strip() and meter != "unknown":
+        parts.append(f"meter: {meter.strip()}")
+    plan = rec.get("plan")
+    plan_source = prov.get("plan_source")
+    if isinstance(plan, str) and plan.strip() and isinstance(plan_source, str) and plan_source.strip():
+        if plan_source != "unknown":
+            parts.append(f"plan: {plan.strip()} ({plan_source.strip()})")
+    note = prov.get("note")
+    if isinstance(note, str) and note.strip():
+        parts.append(f"note: {note.strip()}")
+    if not parts:
+        return ""
+    return "  · " + " · ".join(parts)
+
+
 def _render_quota(provider_filter: Optional[str]) -> str:
     """Render the per-provider quota breakdown (optionally filtered)."""
     cache = read_quota_cache()
@@ -116,6 +154,9 @@ def _render_quota(provider_filter: Optional[str]) -> str:
             lines.append(f"• **{label}**: unavailable ({reason})")
             for detail in details:
                 lines.append(f"  · {detail}")
+            prov_line = _provenance_line(rec)
+            if prov_line:
+                lines.append(prov_line)
             continue
         windows = rec.get("windows") or []
         for detail in details:
@@ -123,21 +164,24 @@ def _render_quota(provider_filter: Optional[str]) -> str:
         if not windows:
             if not details:
                 lines.append(f"• **{label}**: no window data")
-            continue
-        for w in windows:
-            wlabel = w.get("label") or "window"
-            used = w.get("used_percent")
-            tail = _short_reset(w.get("reset_at"))
-            if used is None:
-                lines.append(f"• **{label}** · {wlabel}" + (f" (reset {tail})" if tail else ""))
-            else:
-                try:
-                    rem = max(0, min(100, round(100 - float(used))))
-                except (TypeError, ValueError):
-                    rem = "?"
-                lines.append(
-                    f"• **{label}** · {wlabel} {rem}%" + (f" (reset {tail})" if tail else "")
-                )
+        else:
+            for w in windows:
+                wlabel = w.get("label") or "window"
+                used = w.get("used_percent")
+                tail = _short_reset(w.get("reset_at"))
+                if used is None:
+                    lines.append(f"• **{label}** · {wlabel}" + (f" (reset {tail})" if tail else ""))
+                else:
+                    try:
+                        rem = max(0, min(100, round(100 - float(used))))
+                    except (TypeError, ValueError):
+                        rem = "?"
+                    lines.append(
+                        f"• **{label}** · {wlabel} {rem}%" + (f" (reset {tail})" if tail else "")
+                    )
+        prov_line = _provenance_line(rec)
+        if prov_line:
+            lines.append(prov_line)
 
     if pf and shown == 0:
         return f"📊 quota: no provider matching '{provider_filter}'."
