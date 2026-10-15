@@ -614,10 +614,17 @@ class CodexWidgetTests(unittest.TestCase):
             {"label": "Synthetic Amber", "windows": [{"label": "Session", "used_percent": 21}]},
             {"label": "Synthetic Blue", "windows": [{"label": "Weekly", "used_percent": 42}]}]}}}
         pane = render(data=data)
+        # CHANGED (multi-card feature): codex's saved accounts are sibling
+        # rows, so the pane now groups them like any multi-row provider —
+        # every account stays visible as its labelled button, and the card
+        # below shows the selected (first) account with the provider icon.
+        # The full button/click contract lives in tests/test_multicard_pane.py.
         self.assertIn("Synthetic Amber", text(pane))
         self.assertIn("Synthetic Blue", text(pane))
         self.assertIn("Synthetic Amber", json.dumps(pane))
-        self.assertGreaterEqual(len([n for n in nodes(pane) if n.get("type") == "svg"]), 2)
+        self.assertEqual(len([n for n in nodes(pane) if n.get("type") == "svg"]), 1)
+        self.assertIn("79% left", text(pane))     # the selected account's detail
+        self.assertNotIn("58% left", text(pane))  # the other account is a button
         worst = render(component="status", statusMode="worst", data=data)
         self.assertIn("Synthetic Amber", text(worst))
         self.assertIn("79%", text(worst))

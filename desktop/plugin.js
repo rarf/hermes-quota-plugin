@@ -678,6 +678,22 @@ function isConfigured(provider) {
 	return provider && !provider.unavailable_reason;
 }
 
+// A row whose fetch failed (or whose data went missing) still earns a slot:
+// the UI renders it as a muted card / grey light instead of dropping it.
+// Rows that were never configured (nothing to auth with, opt-in never
+// enabled, logged out) are the one state that stays hidden on both surfaces.
+const UNCONFIGURED_REASONS = new Set([
+	"no-credentials", "opt-in-disabled", "not-logged-in", "no-session-cookies",
+]);
+function isUnconfigured(provider) {
+	return Boolean(provider && provider.unavailable_reason
+		&& UNCONFIGURED_REASONS.has(provider.unavailable_reason));
+}
+function isNoData(provider) {
+	return Boolean(provider && provider.unavailable_reason
+		&& !UNCONFIGURED_REASONS.has(provider.unavailable_reason));
+}
+
 // Re-render on an interval so relative countdowns tick live.
 function useNow(intervalMs = 30_000) {
 	const [now, setNow] = useState(() => Date.now());
@@ -1229,7 +1245,7 @@ function useCodexStale(data, untrusted = false) {
 
 function statusEntries(providers, stale = false) {
 	return Object.entries(providers || {}).map(([pid, provider]) => {
-		const accounts = pid === "openai-codex" && provider && provider.unavailable_reason !== "no-credentials"
+		const accounts = pid === "openai-codex" && provider && !isUnconfigured(provider)
 			? providerEntries({ [pid]: provider }).map(([, p]) => p).filter(asProvider) : [];
 		if (!accounts.length) return [pid, provider];
 		// A lone account needs no distinguishing name in the compact status bar.
@@ -1239,6 +1255,24 @@ function statusEntries(providers, stale = false) {
 		// Preserve cached display selection without ranking stale quota as fresh.
 		return [pid, { ...selected, display_selected_index: accounts.indexOf(selected), display_accounts: accounts, display_stale: stale, display_cached_remaining: codexRemaining(selected), display_remaining: stale ? null : codexRemaining(selected) }];
 	});
+}
+
+// Sibling rows of one saved pool arrive as `<provider>:<account>` keys. The
+// status bar renders them as a single cell, so group them by base provider in
+// cache order — the same grouping the pane applies to its cards.
+function statusGroups(entries) {
+	const groups = [];
+	const byBase = new Map();
+	for (const entry of entries) {
+		const base = baseProviderId(entry[0]);
+		if (!byBase.has(base)) {
+			const group = { base, entries: [] };
+			byBase.set(base, group);
+			groups.push(group);
+		}
+		byBase.get(base).entries.push(entry);
+	}
+	return groups;
 }
 
 function codexAccountsTip(provider) {
@@ -1297,6 +1331,39 @@ function ProviderChip({ pid, provider }) {
 	return jsx(QuotaTip, { label: tip, children: button });
 }
 
+// One status-bar cell for a provider whose saved pool has several sibling
+// rows: one light per card, in row order, tinted by that card's remaining
+// quota, followed by the base provider name. No value text, and the cell
+// never wraps — it stays a single compact line.
+function ProviderGroupChip({ base, entries }) {
+	const name = providerMeta(base).name;
+	const tip = providerGroupTip(entries);
+	const button = jsxs(
+		"button",
+		{
+			type: "button",
+			"aria-label": `${name} · ${entries.length} cards · Open Quota pane`,
+			className: cn(
+				"inline-flex h-full items-center gap-1 whitespace-nowrap px-1.5 text-[0.6875rem]",
+				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
+			),
+			onClick: () => {
+				if (typeof host.navigate === "function") host.navigate("/quota");
+			},
+			children: [
+				...entries.map(([pid, provider], index) =>
+					jsx("span", {
+						className: "inline-block h-1.5 w-1.5 rounded-full",
+						style: { background: toneColor(providerTone(provider)) },
+					}, `${pid}-light-${index}`),
+				),
+				jsx("span", { children: name }),
+			],
+		},
+	);
+	return jsx(QuotaTip, { label: tip, children: button });
+}
+
 // Keep other providers' window details; Codex uses its compact account summary.
 function makeWorstTip(worstLabel, worst, providersObj, stale = false) {
 	if (!providersObj) return `Quota · lowest ${worst}% (${worstLabel})`;
@@ -1338,6 +1405,20 @@ function makeProviderTip(pid, provider) {
 	return lines.join("\n");
 }
 
+// One tooltip for a merged status cell: every card's own tip in row order,
+// with the shared trailing navigation hint kept exactly once.
+function providerGroupTip(entries) {
+	const hint = "Click to open Quota pane";
+	const lines = [];
+	for (const [pid, provider] of entries) {
+		const tip = makeProviderTip(pid, provider).split("\n");
+		if (tip[tip.length - 1] === hint) tip.pop();
+		lines.push(...tip);
+	}
+	lines.push(hint);
+	return lines.join("\n");
+}
+
 // Shared: turn a provider's windows into tooltip lines like
 // "  Session · 21% left · resets 5d 19h" / "  5.3 Codex Spark · 5h · 8% left · resets 3h 52m"
 function providerWindowLines(pid, provider) {
@@ -1363,15 +1444,29 @@ function StatusBar() {
 	if (!data || !data.providers)
 		return jsx(StatusDot, { tone: "muted" });
 	// Keep unavailable saved accounts visible alongside healthy siblings.
-	// Unconfigured providers remain hidden; visibility settings apply to all accounts.
+	// A failed fetch (no-data) keeps its own slot as a muted light; only
+	// unconfigured providers stay hidden; visibility settings apply to all accounts.
 	const entries = statusEntries(data.providers, stale)
 		.filter(([pid]) => (!isError || pid === "openai-codex") && isProviderEnabled(pid))
-		.filter(([, p]) => p?.display_accounts || isConfigured(p));
+		.filter(([, p]) => p?.display_accounts || isConfigured(p) || isNoData(p));
 	if (entries.length === 0) return jsx(StatusDot, { tone: "muted" });
+	// Sibling rows of one provider merge into a single cell (one light per
+	// card plus the base name); a lone row keeps the original chip unchanged.
+	const groups = statusGroups(entries);
 	return jsx("span", {
 		className: "inline-flex h-full items-center",
-		children: entries.map(([pid, p]) =>
-			jsx(ProviderChip, { pid, provider: p, key: pid }),
+		children: groups.map((group) =>
+			group.entries.length >= 2
+				? jsx(ProviderGroupChip, {
+						base: group.base,
+						entries: group.entries,
+						key: group.base,
+					})
+				: jsx(ProviderChip, {
+						pid: group.entries[0][0],
+						provider: group.entries[0][1],
+						key: group.entries[0][0],
+					}),
 		),
 	});
 }
@@ -1392,8 +1487,10 @@ function QuotaBar({ value, tone }) {
 
 // One provider card: bordered box with label + plan, a thick tonal bar per
 // window, colored "% left", reset line, and provider detail lines (credits,
-// banked resets). Unavailable providers render as a muted card.
-function ProviderRow({ id, provider }) {
+// banked resets). Unavailable providers render as a muted card. `headerExtra`
+// renders next to the provider name — card groups put their per-card buttons
+// there.
+function ProviderRow({ id, provider, headerExtra }) {
 	const t = usePluginI18n(ID);
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window, reset time and detail line; 'clean' = just the
@@ -1427,6 +1524,7 @@ function ProviderRow({ id, provider }) {
 							className: "font-medium text-(--ui-text-primary)",
 							children: displayName,
 						}),
+						headerExtra || null,
 					],
 				}),
 				jsx("div", {
@@ -1467,6 +1565,7 @@ function ProviderRow({ id, provider }) {
 					className: "text-xs text-(--ui-text-tertiary)",
 					children: t("noData"),
 				}),
+				headerExtra || null,
 			],
 		});
 	}
@@ -1488,6 +1587,7 @@ function ProviderRow({ id, provider }) {
 							jsx(StatusDot, {
 								tone: providerTone(provider),
 							}),
+							headerExtra || null,
 						],
 					}),
 					provider.plan
@@ -1556,6 +1656,51 @@ function ProviderRow({ id, provider }) {
 				),
 		],
 	});
+}
+
+// One group of rows that share a base provider (saved pool accounts): the
+// per-card buttons live inside the selected card's own header, right of the
+// provider name — the row's own label plus its status tone. The card below
+// is still rendered by the same ProviderRow as every single-card provider,
+// so the detail keeps the full single-card completeness. A lone row never
+// reaches this component; the pane keeps its plain card path as-is.
+function ProviderCardGroup({ entries }) {
+	const [selected, setSelected] = useState(0);
+	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
+	const index = Math.max(0, Math.min(selected, entries.length - 1));
+	const [selectedId, selectedProvider] = entries[index];
+	const headerExtra = jsx("div", {
+		className: "flex items-center gap-1.5",
+		style: { flexWrap: "wrap" },
+		children: entries.map(([pid, provider], i) => {
+			const account =
+				provider && typeof provider.account_label === "string"
+					? provider.account_label.trim()
+					: "";
+			return jsxs(
+				"button",
+				{
+					type: "button",
+					"aria-pressed": i === index,
+					className: cn(
+						"inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-0.5 font-normal",
+						"text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
+					),
+					style:
+						i === index
+							? { background: "var(--ui-control-hover-background)" }
+							: undefined,
+					onClick: () => setSelected(i),
+					children: [
+						jsx("span", { children: account || providerDisplayName(pid, provider) }),
+						jsx(StatusDot, { tone: providerTone(provider) }),
+					],
+				},
+				`${pid}-${i}`,
+			);
+		}),
+	});
+	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra }, selectedId);
 }
 
 function ResetFormatControl() {
@@ -1869,19 +2014,57 @@ function QuotaPane() {
 		});
 	} else {
 		const disabled = disabledProvidersAtom.get();
-		// Default view: only providers with real data. Providers without data
-		// (unconfigured / opt-in off) collapse into a muted "no data" section.
+		// Default view: only providers with real data. Never-configured rows
+		// (no-credentials / opt-in off / logged out) are dropped above. Rows
+		// that share a base provider (saved pool accounts) are grouped:
+		// two or more sibling rows become one card group with a per-card
+		// button, while a lone row keeps the plain card path unchanged.
 		const all = providerEntries(data.providers).filter(
-			([pid]) => !disabled.includes(pid),
+			([pid, p]) => !disabled.includes(pid) && !isUnconfigured(p),
 		);
-		const withData = all.filter(([, p]) => isConfigured(p));
-		const withoutData = all.filter(([, p]) => !isConfigured(p));
+		const groups = [];
+		const groupByBase = new Map();
+		for (const entry of all) {
+			const base = baseProviderId(entry[0]);
+			if (!groupByBase.has(base)) {
+				const group = { base, entries: [], hasData: false };
+				groupByBase.set(base, group);
+				groups.push(group);
+			}
+			const group = groupByBase.get(base);
+			group.entries.push(entry);
+			group.hasData = group.hasData || Boolean(isConfigured(entry[1]));
+		}
+		// Unconfigured rows never reach this point (filtered above), so a
+		// lone row here is either healthy or failed. A failure is not
+		// "unconfigured": it keeps a muted card in the main list instead of
+		// vanishing behind the fold; the fold below is kept for markup
+		// stability but no longer holds any row.
+		const visible = groups.filter(
+			(group) => group.entries.length >= 2 || group.hasData
+				|| group.entries.some(([, p]) => isNoData(p)),
+		);
+		const withoutData = groups.filter(
+			(group) => group.entries.length === 1 && !group.hasData
+				&& !isNoData(group.entries[0][1]),
+		);
 		body = jsxs("div", {
 			className: "flex flex-col gap-2",
 			children: [
-				...withData.map(([id, p], index) =>
-					jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
-				),
+				...visible.map((group, index) => {
+					if (group.entries.length >= 2) {
+						return jsx(ProviderCardGroup, {
+							entries: group.entries,
+							key: group.base,
+						});
+					}
+					const [id, p] = group.entries[0];
+					return jsx(ProviderRow, {
+						id,
+						provider: p,
+						key: id === "openai-codex" ? `${id}-${index}` : id,
+					});
+				}),
 				withoutData.length > 0
 					? jsxs("details", {
 							className: "mt-1",
@@ -1893,9 +2076,14 @@ function QuotaPane() {
 								}),
 								jsx("div", {
 									className: "mt-1.5 flex flex-col gap-2",
-									children: withoutData.map(([id, p], index) =>
-										jsx(ProviderRow, { id, provider: p, key: id === "openai-codex" ? `${id}-${index}` : id }),
-									),
+									children: withoutData.map((group, index) => {
+										const [id, p] = group.entries[0];
+										return jsx(ProviderRow, {
+											id,
+											provider: p,
+											key: id === "openai-codex" ? `${id}-${index}` : id,
+										});
+									}),
 								}),
 							],
 						})
