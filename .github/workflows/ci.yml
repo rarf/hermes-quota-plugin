@@ -21,7 +21,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Byte-compile all backend sources
-        run: python -m py_compile __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers/*.py
+        run: python -m py_compile __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers/*.py quota_monitor/*.py
 
       - name: Run offline unit tests
         run: |

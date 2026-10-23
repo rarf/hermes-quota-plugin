@@ -13,7 +13,7 @@ PLUGIN_DIR="$HOME_DIR/plugins/quota"
 DESKTOP_DIR="$HOME_DIR/desktop-plugins/quota"
 
 for required in \
-  plugin.yaml __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers \
+  plugin.yaml __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers quota_monitor \
   skills/quota-check/SKILL.md \
   desktop/plugin.js \
   scripts/hermes-home.sh scripts/hermes-config.sh; do
@@ -39,7 +39,7 @@ BACKUP_DESKTOP="$STAGE_DIR/backup-desktop"
 mkdir -p "$STAGE_PLUGIN" "$STAGE_DESKTOP"
 
 for item in \
-  plugin.yaml __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers \
+  plugin.yaml __init__.py commands.py quota_cache.py codex_special_reset.py quota_providers quota_monitor \
   LICENSE scripts skills; do
   [ -e "$REPO_ROOT/$item" ] && cp -R "$REPO_ROOT/$item" "$STAGE_PLUGIN/"
 done
@@ -49,11 +49,12 @@ cp "$REPO_ROOT/desktop/plugin.js" "$STAGE_DESKTOP/plugin.js"
   cd "$STAGE_PLUGIN"
   "$PYTHON_BIN" -m py_compile \
     __init__.py commands.py quota_cache.py codex_special_reset.py \
-    quota_providers/*.py
+    quota_providers/*.py quota_monitor/*.py
 )
 rm -rf \
   "$STAGE_PLUGIN/__pycache__" \
-  "$STAGE_PLUGIN/quota_providers/__pycache__"
+  "$STAGE_PLUGIN/quota_providers/__pycache__" \
+  "$STAGE_PLUGIN/quota_monitor/__pycache__"
 
 profiles=("")
 if [ -d "$HOME_DIR/profiles" ]; then

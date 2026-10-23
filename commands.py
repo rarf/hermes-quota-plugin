@@ -14,6 +14,9 @@ CLI:
     hermes quota              → status
     hermes quota refresh      → force re-fetch
     hermes quota provider X   → single provider
+    hermes quota monitor ...  → Agent Monitor views as JSON (snapshot, history,
+                                recommend, budget, set-budget, accounts,
+                                set-priority, set-strategy; see docs/monitor.md)
 """
 
 from __future__ import annotations
@@ -503,11 +506,80 @@ def setup_argparse(subparser):
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
     for provider_id in _PROVIDER_IDS:
         subs.add_parser(provider_id, help=f"Show quota for {provider_id}")
+    _setup_monitor_argparse(subs)
     subparser.set_defaults(func=_handle_cli)
+
+
+def _setup_monitor_argparse(subs) -> None:
+    """``hermes quota monitor <view>``: one JSON object per call (docs/monitor.md)."""
+    mon = subs.add_parser("monitor", help="Agent Monitor views as JSON (live, health, usage, kanban, history)")
+    msubs = mon.add_subparsers(dest="monitor_command")
+    snap = msubs.add_parser("snapshot", help="Everything the widget shows in one poll")
+    hist = msubs.add_parser("history", help="Quota history + burn rate")
+    hist.add_argument("--days", type=int, default=1, help="Days of history (1-31, default 1)")
+    rec = msubs.add_parser("recommend", help="Rank the models work can be routed to now")
+    rec.add_argument("--prefer-provider", dest="prefer_provider", default=None)
+    rec.add_argument("--exclude", dest="exclude", action="append", default=[],
+                     help="Provider to leave out (repeatable or comma separated)")
+    rec.add_argument("--min-left", dest="min_left", type=int, default=10,
+                     help="Minimum %% left in every quota window (default 10)")
+    rec.add_argument("--top", type=int, default=3)
+    bud = msubs.add_parser("budget", help="Spend today / month to date vs the stored budget")
+    setb = msubs.add_parser("set-budget", help="Store the daily / monthly budget (USD, 0 clears)")
+    setb.add_argument("--daily", type=float, default=None)
+    setb.add_argument("--monthly", type=float, default=None)
+    acc = msubs.add_parser("accounts", help="Credential pools, strategies, fallbacks and sign-in gaps (read-only)")
+    setp = msubs.add_parser("set-priority", help="Reorder one pooled credential via `hermes auth priority`")
+    setp.add_argument("--provider", required=True)
+    setp.add_argument("--target", required=True, help="Short pool id of the credential (see `accounts`)")
+    setp.add_argument("--priority", required=True, help="New zero-based position (0 = tried first)")
+    sets = msubs.add_parser("set-strategy", help="Set a profile's pool strategy via `hermes config set`")
+    sets.add_argument("--provider", required=True)
+    sets.add_argument("--strategy", required=True, help="fill_first | round_robin | least_used | random")
+    for p in (setp, sets):
+        # The pool owner / profile to change. `hermes --profile X ...` also selects X when this is omitted
+        # (Hermes consumes the first --profile flag as the process profile).
+        p.add_argument("--profile", "--target-profile", dest="target_profile", default=None)
+    for p in (mon, snap, hist, rec, bud, setb, acc, setp, sets):
+        p.add_argument("--json", action="store_true", help="Emit JSON (the only output format)")
+
+
+def _handle_monitor(args) -> int:
+    from . import quota_monitor as qm
+
+    cmd = getattr(args, "monitor_command", None) or "snapshot"
+    try:
+        if cmd == "snapshot":
+            payload = qm.snapshot()
+        elif cmd == "history":
+            payload = qm.history_payload(getattr(args, "days", 1) or 1)
+        elif cmd == "recommend":
+            exclude = [p.strip() for raw in (getattr(args, "exclude", None) or []) for p in raw.split(",") if p.strip()]
+            payload = qm.recommend_payload(getattr(args, "prefer_provider", None) or None, exclude,
+                                           getattr(args, "min_left", 10), getattr(args, "top", 3))
+        elif cmd == "budget":
+            payload = qm.budget_payload()
+        elif cmd == "set-budget":
+            payload = qm.set_budget(getattr(args, "daily", None), getattr(args, "monthly", None))
+        elif cmd == "accounts":
+            payload = qm.accounts_view()
+        elif cmd == "set-priority":
+            payload = qm.set_priority(args.provider, args.target, args.priority, getattr(args, "target_profile", None))
+        elif cmd == "set-strategy":
+            payload = qm.set_strategy(args.provider, args.strategy, getattr(args, "target_profile", None))
+        else:
+            payload = {"monitor_version": 1, "error": f"unknown monitor command: {cmd}"}
+    except Exception as e:  # the widget parses stdout: always answer with one JSON object
+        print(json.dumps({"monitor_version": 1, "error": f"{type(e).__name__}: {e}"[:300]}))
+        return 1
+    print(json.dumps(payload, default=str, separators=(",", ":")))
+    return 1 if "error" in payload else 0
 
 
 def _handle_cli(args):
     cmd = getattr(args, "quota_command", None) or "status"
+    if cmd == "monitor":
+        return _handle_monitor(args)
     if cmd == "refresh":
         refresh_quota_cache()
         print(_render_quota(None))

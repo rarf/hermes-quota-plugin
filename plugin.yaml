@@ -5,3 +5,11 @@ author: rarf
 kind: standalone
 provides_commands:
   - quota
+provides_tools:
+  - get_quota_status
+  - get_model_health
+  - get_fallback_chains
+  - get_budget
+  - get_running_counts
+  - get_agent_attention
+  - recommend_model

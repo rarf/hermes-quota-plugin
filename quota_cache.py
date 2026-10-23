@@ -502,7 +502,19 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
     except Exception:
         logger.debug("quota_cache ▸ write failed", exc_info=True)
 
+    _record_history(cache)
     return cache
+
+
+def _record_history(cache: dict[str, Any]) -> None:
+    """Append this sweep's readings to the monitor's quota history (docs/monitor.md). Fail-open: history is a
+    by-product of the refresh and must never break or slow it beyond one local sqlite write."""
+    try:
+        from .quota_monitor import quotas as monitor_quotas
+        # next to the cache file this sweep wrote, so the history follows the cache's home
+        monitor_quotas.record_from_cache(cache, home=os.path.dirname(_cache_path()))
+    except Exception:
+        logger.debug("quota_cache ▸ history record failed", exc_info=True)
 
 
 def is_fresh() -> bool:

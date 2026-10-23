@@ -156,6 +156,7 @@ else
 fi
 [ -d "$H1/plugins/quota" ] && ok "backend installed" || bad "backend missing"
 [ -f "$H1/plugins/quota/codex_special_reset.py" ] && ok "special reset collector installed" || bad "special reset collector missing"
+[ -f "$H1/plugins/quota/quota_monitor/__init__.py" ] && ok "monitor package installed" || bad "monitor package missing"
 [ -d "$H1/desktop-plugins/quota" ] && ok "widget installed" || bad "widget missing"
 L="$H1/profiles/alpha/plugins/quota"
 [ -L "$L" ] && [ -e "$L" ] && ok "alpha backend link resolves" || bad "alpha backend link broken: $L"
