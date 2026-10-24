@@ -2620,7 +2620,7 @@ function QuotaPane({ page = false } = {}) {
 		body = jsx(MonitorBody, { mon, view: activeTab, page });
 	} else if (isLoading) {
 		body = jsx(Empty, { children: t("loading") });
-	} else if (isError) {
+	} else if (isError && !data) {
 		body = jsx(Empty, { children: t("error") });
 	} else if (
 		!data ||
@@ -2683,6 +2683,21 @@ function QuotaPane({ page = false } = {}) {
 		body = jsxs("div", {
 			style: { ...UI.col, gap: 8 },
 			children: [
+				// The poll failed but a payload (last success or snapshot) is
+				// still on hand: show it, visibly stale, instead of wiping the
+				// pane with an error line. The footer keeps showing "Checked …"
+				// and the header dot turns "bad", so the state is never silent.
+				isError
+					? jsx(
+							"div",
+							{
+								className: "rounded-lg border border-dashed px-3 py-2",
+								style: { ...UI.meta, borderColor: "var(--ui-stroke-secondary)" },
+								children: t("errorStale"),
+							},
+							"stale-banner",
+						)
+					: null,
 				mon.snapshot ? jsx(AccountHints, { providers: data.providers }, "account-hints") : null,
 				...visible.map((group, index) => {
 					if (group.entries.length >= 2) {
@@ -7017,6 +7032,7 @@ const I18N_EN = {
 	backTip: "Back to quota",
 	loading: "Loading…",
 	error: "Quota backend unavailable",
+	errorStale: "Backend unreachable — showing the last good data.",
 	empty: "No quota data yet.",
 	emptyHint: "Quota data is being initialized automatically…",
 	unavailable: (reason) => `unavailable (${reason})`,
@@ -7449,6 +7465,7 @@ const I18N_TR = {
 	backTip: "Kotaya dön",
 	loading: "Yükleniyor…",
 	error: "Kota arka ucu kullanılamıyor",
+	errorStale: "Arka uç erişilemiyor — en son sağlamlı veriler gösteriliyor.",
 	empty: "Henüz kota verisi yok.",
 	emptyHint: "Kota verisi otomatik hazırlanıyor…",
 	unavailable: (reason) => `kullanılamıyor (${reason})`,
@@ -7902,6 +7919,7 @@ const I18N_DE = {
 	backTip: "Zurück zum Kontingent",
 	loading: "Wird geladen…",
 	error: "Kontingent-Backend nicht verfügbar",
+	errorStale: "Backend nicht erreichbar — die letzten guten Daten werden angezeigt.",
 	empty: "Noch keine Kontingentdaten.",
 	emptyHint: "Kontingentdaten werden automatisch vorbereitet…",
 	unavailable: (reason) => `nicht verfügbar (${reason})`,
@@ -8333,6 +8351,7 @@ const I18N_ES = {
 	backTip: "Volver a la cuota",
 	loading: "Cargando…",
 	error: "Backend de cuota no disponible",
+	errorStale: "Backend no disponible: se muestran los últimos datos buenos.",
 	empty: "Aún no hay datos de cuota.",
 	emptyHint: "Los datos de cuota se están preparando automáticamente…",
 	unavailable: (reason) => `no disponible (${reason})`,
@@ -8764,6 +8783,7 @@ const I18N_FR = {
 	backTip: "Retour au quota",
 	loading: "Chargement…",
 	error: "Backend de quota indisponible",
+	errorStale: "Backend injoignable — affichage des dernières bonnes données.",
 	empty: "Pas encore de données de quota.",
 	emptyHint: "Les données de quota sont préparées automatiquement…",
 	unavailable: (reason) => `indisponible (${reason})`,
@@ -9195,6 +9215,7 @@ const I18N_RU = {
 	backTip: "Назад к квотам",
 	loading: "Загрузка…",
 	error: "Бэкенд квот недоступен",
+	errorStale: "Бэкенд недоступен — показаны последние удачные данные.",
 	empty: "Данных о квотах пока нет.",
 	emptyHint: "Данные о квотах готовятся автоматически…",
 	unavailable: (reason) => `недоступно (${reason})`,
@@ -9626,6 +9647,7 @@ const I18N_JA = {
 	backTip: "クォータに戻る",
 	loading: "読み込み中…",
 	error: "クォータのバックエンドを利用できません",
+	errorStale: "バックエンドに接続できません — 最後の正常なデータを表示しています。",
 	empty: "クォータのデータはまだありません。",
 	emptyHint: "クォータのデータを自動で準備しています…",
 	unavailable: (reason) => `利用不可（${reason}）`,
@@ -10057,6 +10079,7 @@ const I18N_ZH = {
 	backTip: "返回额度",
 	loading: "加载中…",
 	error: "额度后端不可用",
+	errorStale: "后端不可用 — 显示最后一次成功的数据。",
 	empty: "暂无额度数据。",
 	emptyHint: "正在自动准备额度数据…",
 	unavailable: (reason) => `不可用（${reason}）`,
@@ -10488,6 +10511,7 @@ const I18N_ZH_HANT = {
 	backTip: "返回額度",
 	loading: "載入中…",
 	error: "額度後端不可用",
+	errorStale: "後端無法連線 — 顯示最後一次成功的資料。",
 	empty: "暫無額度資料。",
 	emptyHint: "正在自動準備額度資料…",
 	unavailable: (reason) => `不可用（${reason}）`,
@@ -10919,6 +10943,7 @@ const I18N_AR = {
 	backTip: "العودة إلى الحصة",
 	loading: "جارٍ التحميل…",
 	error: "خادم الحصة غير متاح",
+	errorStale: "الخادم غير متاح — يتم عرض آخر بيانات سليمة.",
 	empty: "لا توجد بيانات حصة بعد.",
 	emptyHint: "يجري تجهيز بيانات الحصة تلقائيًا…",
 	unavailable: (reason) => `غير متاح (${reason})`,
