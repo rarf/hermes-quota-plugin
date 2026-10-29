@@ -337,7 +337,7 @@ const STATUSBAR_MODE_DEFAULT = "all";
 const statusbarModeAtom = atom(STATUSBAR_MODE_DEFAULT);
 
 // paneDetail: 'dense' shows every window, reset time and detail line per
-// provider; 'clean' collapses to just the percentage bars (label + % left).
+// provider; 'clean' collapses to the rings (label, % left and reset time).
 const PANE_DETAIL_KEY = "paneDetail";
 const PANE_DETAIL_DEFAULT = "dense";
 
@@ -2025,7 +2025,7 @@ function QuotaBar({ value, tone }) {
 }
 
 /** One quota window as a ring tile: % left in the centre, label + reset under it. */
-function WindowTile({ w, size, dense, resetFormat }) {
+function WindowTile({ w, size, resetFormat }) {
 	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
@@ -2048,7 +2048,9 @@ function WindowTile({ w, size, dense, resetFormat }) {
 				],
 			}),
 			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflowWrap: "anywhere" }, children: label }),
-			dense && reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			// Shown in both pane-detail modes: "% left" is hard to act on
+			// without knowing when the window refills (#77).
+			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
 		],
 	});
 }
@@ -2059,8 +2061,8 @@ function WindowTile({ w, size, dense, resetFormat }) {
 function ProviderRow({ id, provider, monitor, page = false, headerExtra, special }) {
 	const t = useQT();
 	const resetFormat = useValue(resetFormatAtom);
-	// 'dense' = every window, reset time and detail line; 'clean' = just the
-	// rings, except OpenRouter's essential key/wallet scope details.
+	// 'dense' = every window and detail line; 'clean' = just the rings and
+	// their reset times, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider ? provider.unavailable_reason : "no-data";
@@ -2173,7 +2175,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				? jsx("div", {
 						"data-rings": true,
 						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, dense, resetFormat }, `${id}-w-${i}`)),
+						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
 					})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
@@ -7036,7 +7038,7 @@ const I18N_EN = {
 	statusbarModeWorst: "Worst only",
 	paneDetailLabel: "Pane detail",
 	paneDetailClean: "Clean",
-	paneDetailCleanHint: "Just the rings",
+	paneDetailCleanHint: "Rings and reset times",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Windows, resets and detail lines",
 	showStatusBarLabel: "Show status bar indicator",
@@ -7468,7 +7470,7 @@ const I18N_TR = {
 	statusbarModeWorst: "Yalnız en düşük",
 	paneDetailLabel: "Panel ayrıntısı",
 	paneDetailClean: "Sade",
-	paneDetailCleanHint: "Yalnızca halkalar",
+	paneDetailCleanHint: "Halkalar ve sıfırlanma zamanları",
 	paneDetailDense: "Ayrıntılı",
 	paneDetailDenseHint: "Pencereler, sıfırlanmalar ve ayrıntı satırları",
 	showStatusBarLabel: "Durum çubuğu göstergesini göster",
@@ -7921,7 +7923,7 @@ const I18N_DE = {
 	statusbarModeWorst: "Nur der niedrigste",
 	paneDetailLabel: "Detailgrad",
 	paneDetailClean: "Schlicht",
-	paneDetailCleanHint: "Nur die Ringe",
+	paneDetailCleanHint: "Ringe und Reset-Zeiten",
 	paneDetailDense: "Ausführlich",
 	paneDetailDenseHint: "Fenster, Resets und Detailzeilen",
 	showStatusBarLabel: "Anzeige in der Statusleiste",
@@ -8352,7 +8354,7 @@ const I18N_ES = {
 	statusbarModeWorst: "Solo el peor",
 	paneDetailLabel: "Detalle del panel",
 	paneDetailClean: "Limpio",
-	paneDetailCleanHint: "Solo los anillos",
+	paneDetailCleanHint: "Anillos y horas de reinicio",
 	paneDetailDense: "Denso",
 	paneDetailDenseHint: "Ventanas, restablecimientos y líneas de detalle",
 	showStatusBarLabel: "Mostrar indicador en la barra de estado",
@@ -8783,7 +8785,7 @@ const I18N_FR = {
 	statusbarModeWorst: "Le plus bas seulement",
 	paneDetailLabel: "Détail du panneau",
 	paneDetailClean: "Épuré",
-	paneDetailCleanHint: "Seulement les anneaux",
+	paneDetailCleanHint: "Anneaux et heures de réinitialisation",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Fenêtres, réinitialisations et lignes de détail",
 	showStatusBarLabel: "Afficher l'indicateur dans la barre d'état",
@@ -9214,7 +9216,7 @@ const I18N_RU = {
 	statusbarModeWorst: "Только худший",
 	paneDetailLabel: "Детализация панели",
 	paneDetailClean: "Просто",
-	paneDetailCleanHint: "Только кольца",
+	paneDetailCleanHint: "Кольца и время сброса",
 	paneDetailDense: "Подробно",
 	paneDetailDenseHint: "Окна, сбросы и строки с деталями",
 	showStatusBarLabel: "Показывать индикатор в статус-баре",
@@ -9645,7 +9647,7 @@ const I18N_JA = {
 	statusbarModeWorst: "最も低いものだけ",
 	paneDetailLabel: "パネルの詳細度",
 	paneDetailClean: "シンプル",
-	paneDetailCleanHint: "リングだけ",
+	paneDetailCleanHint: "リングとリセット時刻",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "ウィンドウ、リセット、詳細行",
 	showStatusBarLabel: "ステータスバーに表示",
@@ -10076,7 +10078,7 @@ const I18N_ZH = {
 	statusbarModeWorst: "仅最低的",
 	paneDetailLabel: "面板详细程度",
 	paneDetailClean: "简洁",
-	paneDetailCleanHint: "只显示圆环",
+	paneDetailCleanHint: "圆环和重置时间",
 	paneDetailDense: "详细",
 	paneDetailDenseHint: "窗口、重置时间和详情行",
 	showStatusBarLabel: "在状态栏中显示",
@@ -10507,7 +10509,7 @@ const I18N_ZH_HANT = {
 	statusbarModeWorst: "僅最低的",
 	paneDetailLabel: "面板詳細程度",
 	paneDetailClean: "簡潔",
-	paneDetailCleanHint: "只顯示圓環",
+	paneDetailCleanHint: "圓環和重置時間",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "視窗、重設時間和詳情行",
 	showStatusBarLabel: "在狀態列中顯示",
@@ -10938,7 +10940,7 @@ const I18N_AR = {
 	statusbarModeWorst: "الأدنى فقط",
 	paneDetailLabel: "تفاصيل اللوحة",
 	paneDetailClean: "بسيط",
-	paneDetailCleanHint: "الحلقات فقط",
+	paneDetailCleanHint: "الحلقات وأوقات إعادة الضبط",
 	paneDetailDense: "مفصّل",
 	paneDetailDenseHint: "النوافذ وأوقات الإعادة وأسطر التفاصيل",
 	showStatusBarLabel: "إظهار المؤشر في شريط الحالة",
