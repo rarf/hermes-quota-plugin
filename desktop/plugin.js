@@ -364,6 +364,20 @@ function setPaneDetail(mode) {
 	setStored(PANE_DETAIL_KEY, mode, paneDetailAtom);
 }
 
+// paneStyle: 'rings' shows the Agent Bar donut gauges per window;
+// 'bars' shows the classic horizontal bar rows.
+const PANE_STYLE_KEY = "paneStyle";
+const PANE_STYLE_DEFAULT = "rings";
+const paneStyleAtom = atom(PANE_STYLE_DEFAULT);
+
+function applyStoredPaneStyle() {
+	applyStored(PANE_STYLE_KEY, paneStyleAtom, ["rings", "bars"], PANE_STYLE_DEFAULT);
+}
+
+function setPaneStyle(mode) {
+	setStored(PANE_STYLE_KEY, mode, paneStyleAtom);
+}
+
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
 const REFRESH_INTERVAL_KEY = "refreshInterval";
 const REFRESH_INTERVAL_DEFAULT = 600;
@@ -405,6 +419,7 @@ function applyStoredAll() {
 	applyStoredSurfaceVisibility();
 	applyStoredStatusbarMode();
 	applyStoredPaneDetail();
+	applyStoredPaneStyle();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
 	applyStoredMonitor();
@@ -2055,6 +2070,32 @@ function WindowTile({ w, size, resetFormat }) {
 	});
 }
 
+/** One quota window as a bar row: label + % left, the bar, then the reset. */
+function WindowBarRow({ w, resetFormat }) {
+	const t = useQT();
+	const r = remainingPct(w);
+	const tone = toneForRemaining(r);
+	const label = w.label || "window";
+	const reset = w.reset_at ? (resetFormat === "absolute" ? absoluteReset(w.reset_at) : relativeCountdown(w.reset_at)) : "";
+	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
+	return jsxs("div", {
+		"data-window-bar": label,
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
+		style: { ...UI.col, gap: 3 },
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, justifyContent: "space-between", gap: 6 },
+				children: [
+					jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }),
+					jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: toneColor(tone) }, children: r == null ? "—" : `${fmtPct(r)} ${t("left")}` }),
+				],
+			}),
+			jsx(QuotaBar, { value: r, tone }),
+			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+		],
+	});
+}
+
 // One provider card: header (logo, name, health dot, plan pill), a row of ring
 // tiles — one per window — then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
@@ -2064,6 +2105,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	// 'dense' = every window and detail line; 'clean' = just the rings and
 	// their reset times, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
+	const paneStyle = useValue(paneStyleAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider ? provider.unavailable_reason : "no-data";
 	const details = asList(provider && provider.details);
@@ -2172,11 +2214,17 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				? jsx("div", { style: UI.secondary, children: t("apiCallsAvailable", facts.available) })
 				: null,
 			windows.length
-				? jsx("div", {
-						"data-rings": true,
-						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
-					})
+				? paneStyle === "bars"
+					? jsx("div", {
+							"data-bars": true,
+							style: { ...UI.col, gap: 9 },
+							children: windows.map((w, i) => jsx(WindowBarRow, { w, resetFormat }, `${id}-w-${i}`)),
+						})
+					: jsx("div", {
+							"data-rings": true,
+							style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
+							children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
+						})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
 			// the used-% history. Absent without a monitor payload.
@@ -2456,6 +2504,22 @@ function PaneDetailControl() {
 	});
 }
 
+function PaneStyleControl() {
+	const t = useQT();
+	const paneStyle = useValue(paneStyleAtom);
+	return jsx(SettingRow, {
+		label: t("paneStyleLabel"),
+		children: jsx(SegmentedControl, {
+			value: paneStyle,
+			onChange: (v) => setPaneStyle(v),
+			options: [
+				{ id: "rings", label: t("paneStyleRings") },
+				{ id: "bars", label: t("paneStyleBars") },
+			],
+		}),
+	});
+}
+
 function QuotaSettings() {
 	const t = useQT();
 	return jsxs("div", {
@@ -2484,6 +2548,7 @@ function QuotaSettings() {
 				children: [
 					jsx(ShowDockedPaneControl, {}, "docked"),
 					jsx(PaneDetailControl, {}, "detail"),
+					jsx(PaneStyleControl, {}, "style"),
 					jsx(ResetFormatControl, {}, "reset"),
 					jsx(RefreshIntervalControl, {}, "interval"),
 				],
@@ -7054,9 +7119,12 @@ const I18N_EN = {
 	statusbarModeWorst: "Worst only",
 	paneDetailLabel: "Pane detail",
 	paneDetailClean: "Clean",
-	paneDetailCleanHint: "Rings and reset times",
+	paneDetailCleanHint: "Gauges and reset times",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Windows, resets and detail lines",
+	paneStyleLabel: "Pane style",
+	paneStyleRings: "Rings",
+	paneStyleBars: "Bars",
 	showStatusBarLabel: "Show status bar indicator",
 	showStatusBarHint:
 		"The Hermes status bar must also be visible (⌘K → Toggle status bar).",
@@ -7487,9 +7555,12 @@ const I18N_TR = {
 	statusbarModeWorst: "Yalnız en düşük",
 	paneDetailLabel: "Panel ayrıntısı",
 	paneDetailClean: "Sade",
-	paneDetailCleanHint: "Halkalar ve sıfırlanma zamanları",
+	paneDetailCleanHint: "Gösterge ve sıfırlanma zamanları",
 	paneDetailDense: "Ayrıntılı",
 	paneDetailDenseHint: "Pencereler, sıfırlanmalar ve ayrıntı satırları",
+	paneStyleLabel: "Panel stili",
+	paneStyleRings: "Halkalar",
+	paneStyleBars: "Çubuklar",
 	showStatusBarLabel: "Durum çubuğu göstergesini göster",
 	showStatusBarHint:
 		"Hermes durum çubuğu da görünür olmalı (⌘K → Toggle status bar).",
@@ -7941,9 +8012,12 @@ const I18N_DE = {
 	statusbarModeWorst: "Nur der niedrigste",
 	paneDetailLabel: "Detailgrad",
 	paneDetailClean: "Schlicht",
-	paneDetailCleanHint: "Ringe und Reset-Zeiten",
+	paneDetailCleanHint: "Anzeigen und Reset-Zeiten",
 	paneDetailDense: "Ausführlich",
 	paneDetailDenseHint: "Fenster, Resets und Detailzeilen",
+	paneStyleLabel: "Panel-Stil",
+	paneStyleRings: "Ringe",
+	paneStyleBars: "Balken",
 	showStatusBarLabel: "Anzeige in der Statusleiste",
 	showStatusBarHint:
 		"Die Hermes-Statusleiste muss ebenfalls sichtbar sein (⌘K → Toggle status bar).",
@@ -8373,9 +8447,12 @@ const I18N_ES = {
 	statusbarModeWorst: "Solo el peor",
 	paneDetailLabel: "Detalle del panel",
 	paneDetailClean: "Limpio",
-	paneDetailCleanHint: "Anillos y horas de reinicio",
+	paneDetailCleanHint: "Indicadores y horas de reinicio",
 	paneDetailDense: "Denso",
 	paneDetailDenseHint: "Ventanas, restablecimientos y líneas de detalle",
+	paneStyleLabel: "Estilo del panel",
+	paneStyleRings: "Anillos",
+	paneStyleBars: "Barras",
 	showStatusBarLabel: "Mostrar indicador en la barra de estado",
 	showStatusBarHint:
 		"La barra de estado de Hermes también debe estar visible (⌘K → Toggle status bar).",
@@ -8805,9 +8882,12 @@ const I18N_FR = {
 	statusbarModeWorst: "Le plus bas seulement",
 	paneDetailLabel: "Détail du panneau",
 	paneDetailClean: "Épuré",
-	paneDetailCleanHint: "Anneaux et heures de réinitialisation",
+	paneDetailCleanHint: "Jauges et heures de réinitialisation",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Fenêtres, réinitialisations et lignes de détail",
+	paneStyleLabel: "Style du panneau",
+	paneStyleRings: "Anneaux",
+	paneStyleBars: "Barres",
 	showStatusBarLabel: "Afficher l'indicateur dans la barre d'état",
 	showStatusBarHint:
 		"La barre d'état de Hermes doit aussi être visible (⌘K → Toggle status bar).",
@@ -9237,9 +9317,12 @@ const I18N_RU = {
 	statusbarModeWorst: "Только худший",
 	paneDetailLabel: "Детализация панели",
 	paneDetailClean: "Просто",
-	paneDetailCleanHint: "Кольца и время сброса",
+	paneDetailCleanHint: "Индикаторы и время сброса",
 	paneDetailDense: "Подробно",
 	paneDetailDenseHint: "Окна, сбросы и строки с деталями",
+	paneStyleLabel: "Стиль панели",
+	paneStyleRings: "Кольца",
+	paneStyleBars: "Полосы",
 	showStatusBarLabel: "Показывать индикатор в статус-баре",
 	showStatusBarHint:
 		"Статус-бар Hermes тоже должен быть виден (⌘K → Toggle status bar).",
@@ -9669,9 +9752,12 @@ const I18N_JA = {
 	statusbarModeWorst: "最も低いものだけ",
 	paneDetailLabel: "パネルの詳細度",
 	paneDetailClean: "シンプル",
-	paneDetailCleanHint: "リングとリセット時刻",
+	paneDetailCleanHint: "ゲージとリセット時刻",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "ウィンドウ、リセット、詳細行",
+	paneStyleLabel: "パネルのスタイル",
+	paneStyleRings: "リング",
+	paneStyleBars: "バー",
 	showStatusBarLabel: "ステータスバーに表示",
 	showStatusBarHint:
 		"Hermes のステータスバーも表示されている必要があります（⌘K → Toggle status bar）。",
@@ -10101,9 +10187,12 @@ const I18N_ZH = {
 	statusbarModeWorst: "仅最低的",
 	paneDetailLabel: "面板详细程度",
 	paneDetailClean: "简洁",
-	paneDetailCleanHint: "圆环和重置时间",
+	paneDetailCleanHint: "仪表和重置时间",
 	paneDetailDense: "详细",
 	paneDetailDenseHint: "窗口、重置时间和详情行",
+	paneStyleLabel: "面板样式",
+	paneStyleRings: "圆环",
+	paneStyleBars: "条形",
 	showStatusBarLabel: "在状态栏中显示",
 	showStatusBarHint:
 		"Hermes 状态栏也需要可见（⌘K → Toggle status bar）。",
@@ -10533,9 +10622,12 @@ const I18N_ZH_HANT = {
 	statusbarModeWorst: "僅最低的",
 	paneDetailLabel: "面板詳細程度",
 	paneDetailClean: "簡潔",
-	paneDetailCleanHint: "圓環和重置時間",
+	paneDetailCleanHint: "儀表和重置時間",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "視窗、重設時間和詳情行",
+	paneStyleLabel: "面板樣式",
+	paneStyleRings: "圓環",
+	paneStyleBars: "條形",
 	showStatusBarLabel: "在狀態列中顯示",
 	showStatusBarHint:
 		"Hermes 狀態列也需要可見（⌘K → Toggle status bar）。",
@@ -10965,9 +11057,12 @@ const I18N_AR = {
 	statusbarModeWorst: "الأدنى فقط",
 	paneDetailLabel: "تفاصيل اللوحة",
 	paneDetailClean: "بسيط",
-	paneDetailCleanHint: "الحلقات وأوقات إعادة الضبط",
+	paneDetailCleanHint: "المقاييس وأوقات إعادة الضبط",
 	paneDetailDense: "مفصّل",
 	paneDetailDenseHint: "النوافذ وأوقات الإعادة وأسطر التفاصيل",
+	paneStyleLabel: "نمط اللوحة",
+	paneStyleRings: "حلقات",
+	paneStyleBars: "أشرطة",
 	showStatusBarLabel: "إظهار المؤشر في شريط الحالة",
 	showStatusBarHint:
 		"يجب أن يكون شريط حالة Hermes ظاهرًا أيضًا (⌘K ثم Toggle status bar).",
