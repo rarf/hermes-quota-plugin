@@ -378,6 +378,20 @@ function setPaneStyle(mode) {
 	setStored(PANE_STYLE_KEY, mode, paneStyleAtom);
 }
 
+// statusbarStyle: 'both' shows the ring gauge and the percentage/balance on
+// each quota chip; 'rings' shows only the gauge; 'values' only the number.
+const STATUSBAR_STYLE_KEY = "statusbarStyle";
+const STATUSBAR_STYLE_DEFAULT = "both";
+const statusbarStyleAtom = atom(STATUSBAR_STYLE_DEFAULT);
+
+function applyStoredStatusbarStyle() {
+	applyStored(STATUSBAR_STYLE_KEY, statusbarStyleAtom, ["both", "rings", "values"], STATUSBAR_STYLE_DEFAULT);
+}
+
+function setStatusbarStyle(mode) {
+	setStored(STATUSBAR_STYLE_KEY, mode, statusbarStyleAtom);
+}
+
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
 const REFRESH_INTERVAL_KEY = "refreshInterval";
 const REFRESH_INTERVAL_DEFAULT = 600;
@@ -420,6 +434,7 @@ function applyStoredAll() {
 	applyStoredStatusbarMode();
 	applyStoredPaneDetail();
 	applyStoredPaneStyle();
+	applyStoredStatusbarStyle();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
 	applyStoredMonitor();
@@ -1414,6 +1429,10 @@ function QuotaTip({ label, children }) {
 
 function QuotaChipWithBar() {
 	const { data, isError, isPlaceholderData } = useQuota();
+	// 'rings' keeps the gauge and drops the number; 'values' does the reverse.
+	const style = useValue(statusbarStyleAtom);
+	const showGauge = style !== "values";
+	const showValue = style !== "rings";
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
@@ -1457,10 +1476,24 @@ function QuotaChipWithBar() {
 			"qm-sb-chip inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		style: CHIP_NOWRAP,
 		children: [
-			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }),
+			showGauge ? jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }) : null,
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
-				children: valueText,
+				// 'both' keeps today's single text node; 'rings' and 'values' split
+				// the number into its own span so it can be hidden or tinted.
+				children: style === "both"
+					? valueText
+					: [
+						worstLabel,
+						showValue
+							? jsx("span", {
+								className: "tabular-nums",
+								"data-sb-value": true,
+								style: style === "values" ? { color: toneText(tone) } : undefined,
+								children: " " + (worstProvider?.display_accounts ? codexValue(worst) : fmtPct(worst)),
+							})
+							: null,
+					],
 			}),
 			jsx(ChipAlert, { alert }),
 		],
@@ -1564,6 +1597,10 @@ function codexAccountsTip(provider, special) {
 }
 
 function ProviderChip({ pid, provider, alert = null, special = null }) {
+	// 'rings' keeps the gauge and drops the number; 'values' does the reverse.
+	const style = useValue(statusbarStyleAtom);
+	const showGauge = style !== "values";
+	const showValue = style !== "rings";
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1585,14 +1622,26 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 			style: CHIP_NOWRAP,
 			children: [
 				// A percentage gets Agent Bar's mini ring; balance/availability-only
-				// providers keep the plain dot.
-				r != null
-					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
-					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
+				// providers keep the plain dot. Either one is the gauge slot.
+				...(showGauge
+					? [r != null
+						? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
+						: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot }, "data-sb-dot": true })]
+					: []),
 				jsx("span", { children: label }),
-				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
+				// Without the ring, the value carries the tone colour instead.
+				...(showValue
+					? [jsx("span", {
+						className: "tabular-nums",
+						"data-sb-value": true,
+						style: style === "values"
+							? { ...(staleValue ? { textDecoration: "line-through" } : null), color: toneText(tone) }
+							: staleValue ? { textDecoration: "line-through" } : undefined,
+						children: value,
+					})]
+					: []),
 				// No alert -> no child at all: a plain chip keeps exactly
-				// [dot/ring, name, value].
+				// [dot/ring, name, value] in the default 'both' style.
 				...(alert ? [jsx(ChipAlert, { alert })] : []),
 			],
 		},
@@ -2434,6 +2483,24 @@ function StatusbarModeControl() {
 	});
 }
 
+function StatusbarStyleControl() {
+	const t = useQT();
+	const style = useValue(statusbarStyleAtom);
+	return jsx(SettingRow, {
+		label: t("statusbarStyleLabel"),
+		hint: t("statusbarStyleHint"),
+		children: jsx(SegmentedControl, {
+			value: style,
+			onChange: (v) => setStatusbarStyle(v),
+			options: [
+				{ id: "both", label: t("statusbarStyleBoth") },
+				{ id: "rings", label: t("statusbarStyleRings") },
+				{ id: "values", label: t("statusbarStyleValues") },
+			],
+		}),
+	});
+}
+
 // Cherry-picker: toggle list of providers
 function DisabledProvidersControl() {
 	const t = useQT();
@@ -2532,6 +2599,7 @@ function QuotaSettings() {
 				children: [
 					jsx(ShowStatusBarControl, {}, "show"),
 					jsx(StatusbarModeControl, {}, "mode"),
+					jsx(StatusbarStyleControl, {}, "style"),
 					jsx(QuotaAlertsControl, {}, "quotaAlerts"),
 					jsx(AgentsChipControl, {}, "agents"),
 					jsx(ContextChipControl, {}, "context"),
@@ -7117,6 +7185,11 @@ const I18N_EN = {
 	statusbarModeLabel: "Status bar mode",
 	statusbarModeAll: "All providers",
 	statusbarModeWorst: "Worst only",
+	statusbarStyleLabel: "Status bar chip",
+	statusbarStyleBoth: "Both",
+	statusbarStyleRings: "Rings",
+	statusbarStyleValues: "Values",
+	statusbarStyleHint: "What each provider chip shows: the ring gauge, the percentage or balance, or both.",
 	paneDetailLabel: "Pane detail",
 	paneDetailClean: "Clean",
 	paneDetailCleanHint: "Gauges and reset times",
@@ -7553,6 +7626,11 @@ const I18N_TR = {
 	statusbarModeLabel: "Durum çubuğu",
 	statusbarModeAll: "Tüm sağlayıcılar",
 	statusbarModeWorst: "Yalnız en düşük",
+	statusbarStyleLabel: "Durum çubuğu çipi",
+	statusbarStyleBoth: "İkisi",
+	statusbarStyleRings: "Halkalar",
+	statusbarStyleValues: "Değerler",
+	statusbarStyleHint: "Her sağlayıcı çipinin ne gösterdiği: halka göstergesi, yüzde veya bakiye, ya da ikisi.",
 	paneDetailLabel: "Panel ayrıntısı",
 	paneDetailClean: "Sade",
 	paneDetailCleanHint: "Gösterge ve sıfırlanma zamanları",
@@ -8010,6 +8088,11 @@ const I18N_DE = {
 	statusbarModeLabel: "Statusleisten-Modus",
 	statusbarModeAll: "Alle Anbieter",
 	statusbarModeWorst: "Nur der niedrigste",
+	statusbarStyleLabel: "Statusleisten-Chip",
+	statusbarStyleBoth: "Beides",
+	statusbarStyleRings: "Ringe",
+	statusbarStyleValues: "Werte",
+	statusbarStyleHint: "Was jeder Anbieter-Chip zeigt: den Ringmesser, den Prozentwert oder das Guthaben – oder beides.",
 	paneDetailLabel: "Detailgrad",
 	paneDetailClean: "Schlicht",
 	paneDetailCleanHint: "Anzeigen und Reset-Zeiten",
@@ -8445,6 +8528,11 @@ const I18N_ES = {
 	statusbarModeLabel: "Modo de la barra de estado",
 	statusbarModeAll: "Todos los proveedores",
 	statusbarModeWorst: "Solo el peor",
+	statusbarStyleLabel: "Chip de la barra de estado",
+	statusbarStyleBoth: "Ambos",
+	statusbarStyleRings: "Anillos",
+	statusbarStyleValues: "Valores",
+	statusbarStyleHint: "Lo que muestra cada chip de proveedor: el medidor de anillo, el porcentaje o el saldo, o ambos.",
 	paneDetailLabel: "Detalle del panel",
 	paneDetailClean: "Limpio",
 	paneDetailCleanHint: "Indicadores y horas de reinicio",
@@ -8880,6 +8968,11 @@ const I18N_FR = {
 	statusbarModeLabel: "Mode de la barre d'état",
 	statusbarModeAll: "Tous les fournisseurs",
 	statusbarModeWorst: "Le plus bas seulement",
+	statusbarStyleLabel: "Puce de la barre d'état",
+	statusbarStyleBoth: "Les deux",
+	statusbarStyleRings: "Anneaux",
+	statusbarStyleValues: "Valeurs",
+	statusbarStyleHint: "Ce que montre chaque puce de fournisseur : la jauge circulaire, le pourcentage ou le solde, ou les deux.",
 	paneDetailLabel: "Détail du panneau",
 	paneDetailClean: "Épuré",
 	paneDetailCleanHint: "Jauges et heures de réinitialisation",
@@ -9315,6 +9408,11 @@ const I18N_RU = {
 	statusbarModeLabel: "Режим статус-бара",
 	statusbarModeAll: "Все провайдеры",
 	statusbarModeWorst: "Только худший",
+	statusbarStyleLabel: "Чип строки состояния",
+	statusbarStyleBoth: "Оба",
+	statusbarStyleRings: "Кольца",
+	statusbarStyleValues: "Значения",
+	statusbarStyleHint: "Что показывает каждый чип провайдера: кольцевой индикатор, процент или баланс — или и то, и другое.",
 	paneDetailLabel: "Детализация панели",
 	paneDetailClean: "Просто",
 	paneDetailCleanHint: "Индикаторы и время сброса",
@@ -9750,6 +9848,11 @@ const I18N_JA = {
 	statusbarModeLabel: "ステータスバーの表示",
 	statusbarModeAll: "すべてのプロバイダー",
 	statusbarModeWorst: "最も低いものだけ",
+	statusbarStyleLabel: "ステータスバーのチップ",
+	statusbarStyleBoth: "両方",
+	statusbarStyleRings: "リング",
+	statusbarStyleValues: "数値",
+	statusbarStyleHint: "各プロバイダーチップの表示内容: リングゲージ、パーセンテージまたは残高、またはその両方。",
 	paneDetailLabel: "パネルの詳細度",
 	paneDetailClean: "シンプル",
 	paneDetailCleanHint: "ゲージとリセット時刻",
@@ -10185,6 +10288,11 @@ const I18N_ZH = {
 	statusbarModeLabel: "状态栏模式",
 	statusbarModeAll: "全部提供方",
 	statusbarModeWorst: "仅最低的",
+	statusbarStyleLabel: "状态栏标签",
+	statusbarStyleBoth: "两者",
+	statusbarStyleRings: "圆环",
+	statusbarStyleValues: "数值",
+	statusbarStyleHint: "每个提供商标签显示的内容：圆环仪表、百分比或余额，或两者兼有。",
 	paneDetailLabel: "面板详细程度",
 	paneDetailClean: "简洁",
 	paneDetailCleanHint: "仪表和重置时间",
@@ -10620,6 +10728,11 @@ const I18N_ZH_HANT = {
 	statusbarModeLabel: "狀態列模式",
 	statusbarModeAll: "全部提供方",
 	statusbarModeWorst: "僅最低的",
+	statusbarStyleLabel: "狀態列標籤",
+	statusbarStyleBoth: "兩者",
+	statusbarStyleRings: "圓環",
+	statusbarStyleValues: "數值",
+	statusbarStyleHint: "每個供應商標籤顯示的內容：圓環儀表、百分比或餘額，或兩者兼有。",
 	paneDetailLabel: "面板詳細程度",
 	paneDetailClean: "簡潔",
 	paneDetailCleanHint: "儀表和重置時間",
@@ -11055,6 +11168,11 @@ const I18N_AR = {
 	statusbarModeLabel: "وضع شريط الحالة",
 	statusbarModeAll: "كل المزوّدين",
 	statusbarModeWorst: "الأدنى فقط",
+	statusbarStyleLabel: "شريحة شريط الحالة",
+	statusbarStyleBoth: "كلاهما",
+	statusbarStyleRings: "الحلقات",
+	statusbarStyleValues: "القيم",
+	statusbarStyleHint: "ما تعرضه كل شريحة مزود: مقياس الحلقة أو النسبة المئوية أو الرصيد، أو كليهما.",
 	paneDetailLabel: "تفاصيل اللوحة",
 	paneDetailClean: "بسيط",
 	paneDetailCleanHint: "المقاييس وأوقات إعادة الضبط",

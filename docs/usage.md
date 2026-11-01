@@ -106,6 +106,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | Show status bar indicator | on · off (the Hermes status bar must also be visible: ⌘K → Toggle status bar) | on |
 | Pane detail | `clean` — rings with their reset times · `dense` — adds forecasts, history and detail lines | `dense` |
 | Pane style | `rings` — donut gauges per window · `bars` — horizontal bars per window | `rings` |
+| Status bar chip | `both` — ring gauge and percentage · `rings` — gauge only · `values` — percentage or balance only | `both` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
 | Enabled providers | toggle any provider on/off (cherry-pick) | all on |

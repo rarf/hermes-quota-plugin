@@ -43,6 +43,9 @@ function renderWidget(options = {}) {
   // absent while the toggle is still landing, and that must not fail every other
   // widget test. Renderer tests for the style assert on the tree, not this call.
   vm.runInContext('try { paneStyleAtom.set(TEST_PANE_STYLE); } catch (e) {}', Object.assign(context, { TEST_PANE_STYLE: options.paneStyle || 'rings' }));
+  // Status-bar chip style ('both' default | 'rings' | 'values'). Swallowed for
+  // the same reason: a missing atom must not fail every other widget test.
+  vm.runInContext('try { statusbarStyleAtom.set(TEST_STATUSBAR_STYLE); } catch (e) {}', Object.assign(context, { TEST_STATUSBAR_STYLE: options.statusbarStyle || 'both' }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
   const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
