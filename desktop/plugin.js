@@ -762,13 +762,40 @@ function balanceText(balance, locale) {
 	return `${money} ${balance.currency}`;
 }
 
-function providerTone(provider) {
+// A single distinct OpenRouter key shows its account wallet as a balance, but
+// the wallet is a funded-account fact -- not a report that API calls are
+// available (`api_calls_available` stays null). A positive balance may tint
+// the dot only when the fetcher's structured evidence says exactly that: one
+// distinct credential whose /key read succeeded with an explicit null limit.
+// Detail text is never parsed here -- an absent cap line reads the same as an
+// uncapped key, so only the explicit `key_limit_state` can grant green. Scoped
+// records, key failures, absent/malformed/negative limits and zero or negative
+// wallets all carry no such evidence and stay muted.
+function fundedWalletTone(provider) {
+	if (!provider) return null;
+	if (provider.credential_scope !== "single") return null;
+	if (provider.key_limit_state !== "uncapped") return null;
+	const { balances } = accountFacts(provider);
+	if (!balances.length) return null;
+	return balances.every((b) => Number(b.total_balance) > 0) ? "good" : null;
+}
+
+function providerTone(provider, id) {
 	if (!provider) return "muted";
 	if (provider.unavailable_reason) return "muted";
 	const r = worstWindow(provider);
 	if (r != null) return toneForRemaining(r);
 	const { available } = accountFacts(provider);
-	return available === true ? "good" : available === false ? "bad" : "muted";
+	if (available === true) return "good";
+	if (available === false) return "bad";
+	// The cache's provider id is the reliable provider identity; the label is
+	// a fallback for callers that only hold the record (single-key OpenRouter
+	// records carry the literal label "openrouter").
+	if (baseProviderId(id || provider.label) === "openrouter") {
+		const funded = fundedWalletTone(provider);
+		if (funded) return funded;
+	}
+	return "muted";
 }
 
 function checkedDateTime(iso) {
@@ -1554,7 +1581,7 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
 	const facts = accountFacts(provider);
 	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? tr("valueUnavailable") : r != null ? fmtPct(r) : facts.balances.length ? facts.balances.map((b) => balanceText(b)).join(" · ") : facts.available === true ? tr("valueAvailable") : facts.available === false ? tr("valueUnavailable") : "—";
-	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider);
+	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider, pid);
 	const dot = toneColor(tone);
 	const label = providerDisplayName(pid, provider);
 	const tip = makeProviderTip(pid, provider, special);
@@ -1606,7 +1633,7 @@ function ProviderGroupChip({ base, entries, alert = null, special }) {
 				...entries.map(([pid, provider], index) =>
 					jsx("span", {
 						className: "inline-block h-1.5 w-1.5 rounded-full",
-						style: { background: toneColor(providerTone(provider)) },
+						style: { background: toneColor(providerTone(provider, pid)) },
 					}, `${pid}-light-${index}`),
 				),
 				jsx("span", { children: name }),
@@ -2121,7 +2148,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 		});
 	}
 
-	const tone = providerTone(provider);
+	const tone = providerTone(provider, id);
 	const ringSize = page ? 62 : 50;
 	const forecasts = monitor
 		? windows
@@ -2305,7 +2332,7 @@ function ProviderCardGroup({ entries, monitor, page = false, special }) {
 					onClick: () => setSelected(i),
 					children: [
 						jsx("span", { children: account || providerDisplayName(pid, provider) }),
-						jsx(StatusDot, { tone: providerTone(provider) }),
+						jsx(StatusDot, { tone: providerTone(provider, pid) }),
 					],
 				},
 				`${pid}-${i}`,

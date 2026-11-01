@@ -228,8 +228,12 @@ def _balance_line(row: Any) -> Optional[str]:
     if not amount.is_finite():
         return None
     # Bound the exponent before ``format(..., "f")`` expands it: a corrupt
-    # cache should not make the dashboard allocate gigabytes of zeros.
-    if amount.copy_abs() > Decimal("1e15") or (amount and amount.adjusted() < -15):
+    # cache should not make the dashboard allocate gigabytes of zeros. The
+    # exponent check must not depend on truthiness -- ``Decimal("0E-999999999")``
+    # is a valid zero whose "f" format is a billion characters.
+    exponent = amount.as_tuple().exponent
+    if (amount.copy_abs() > Decimal("1e15")
+            or not isinstance(exponent, int) or exponent < -15):
         return None
     rendered = format(amount, "f")
     negative = rendered.startswith("-")

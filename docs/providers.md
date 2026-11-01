@@ -137,13 +137,20 @@ account identity or the runtime pool's current selection.
   scope or distinguish. The `/credits` wallet is shown once as the large
   **Account balance** row (USD), like Ollama and DeepSeek; the CLI prints the
   same wallet as `Account balance: $X USD`, while the providers that already
-  state their balance in a detail line keep that line. A positive key cap
-  with a known remaining allowance remains as a plain **Key quota** window,
-  and its cap, remaining allowance and reset interval stay as label-free detail
-  lines. A zero cap is a real cap and stays visible as such, without a
-  fabricated percentage; when the API returns no cap at all, no cap line is
-  shown. Total/daily/weekly/monthly usage stays in the record — visible in the
-  Desktop's dense mode and always in the CLI and
+  state their balance in a detail line keep that line. A positive wallet is a
+  funded-account fact, not an `api_calls_available` claim: the Desktop dot turns
+  green only for a successful `/key` read that returned an **explicit null
+  limit** (the API's confirmed "no key cap") and a positive wallet. An absent,
+  malformed, negative or boolean limit is treated as unknown and stays muted —
+  "no cap line shown" is never read as "uncapped". A zero or negative wallet, a
+  valid cap (including a USD 0.00 cap), a key failure or a scoped multi-key card
+  keeps its existing percentage or muted tone. A **Key quota** window appears
+  only for a positive cap whose remaining allowance is known and lies between
+  zero and the cap; its cap, allowance and reset interval stay as label-free
+  detail lines in single-key mode. A zero cap is a real cap and stays visible
+  as such, without a fabricated percentage; when the API returns no cap at
+  all, no cap line is shown. Total/daily/weekly/monthly usage stays in the
+  record — visible in the Desktop's dense mode and always in the CLI and
   `hermes quota status --json` — while the Desktop's clean mode hides it. A
   failed key or wallet still reports its reason rather than disappearing.
 - **Two or more distinct credentials — scoped mode.** The full per-key
@@ -165,8 +172,9 @@ account identity or the runtime pool's current selection.
   single-key card's wallet, its optional cap line (including a zero cap) and
   any failure, but hides the usage totals; **dense** adds them. Scoped
   (multi-key) cards keep every detail in both modes. The CLI and
-  `hermes quota status --json` always carry the label-free cap, reset, usage
-  and failure lines.
+  `hermes quota status --json` always carry the cap, reset, usage and failure
+  lines; single-key mode omits the generated key label, while scoped records
+  keep their per-key `Key N (...)` prefixes.
 
 ### CommandCode
 

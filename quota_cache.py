@@ -40,6 +40,13 @@ Cache schema (``quota_cache.json``)::
       }
     }
 
+A provider record may also carry ``credential_scope`` (``"single"`` or
+``"scoped"``) and ``key_limit_state`` (``"uncapped"``, ``"capped"`` or
+``"unknown"``). They are structured evidence for tone decisions: consumers must
+not infer either from the free-form ``details`` text. Older records without
+them are treated as unknown: they cannot earn the funded-wallet tone and
+otherwise keep their existing window or availability tone.
+
 ``codex_special_reset`` is public announcement metadata for Codex. It is not
 account quota: it never changes a provider window or ``reset_at``.
 """
@@ -157,6 +164,13 @@ def iter_account_records(providers):
 
 
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
+    # Structured tone evidence is normalized here: a malformed fetcher value
+    # must not become a claim the Desktop trusts. Unknown/legacy records carry
+    # None and stay muted.
+    scope = res.credential_scope if res.credential_scope in ("single", "scoped") else None
+    limit_state = res.key_limit_state if res.key_limit_state in (
+        "uncapped", "capped", "unknown",
+    ) else None
     record: dict[str, Any] = {
         "label": res.label,
         "plan": res.plan,
@@ -168,6 +182,8 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
             for b in res.account_balances
         ],
         "api_calls_available": res.api_calls_available,
+        "credential_scope": scope,
+        "key_limit_state": limit_state,
         "windows": [
             {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
             for w in res.windows
@@ -263,6 +279,8 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
             "windows": windows if isinstance(windows, list) else [],
             "account_balances": [],
             "api_calls_available": None,
+            "credential_scope": None,
+            "key_limit_state": None,
         }
     return rows
 
@@ -454,6 +472,8 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
             carried["windows"] = []
             carried["account_balances"] = []
             carried["api_calls_available"] = None
+            carried["credential_scope"] = None
+            carried["key_limit_state"] = None
             note = "Not refreshed in this sweep: the provider registry was incomplete"
             details = [d for d in (carried.get("details") or []) if d != note]
             details.append(note)

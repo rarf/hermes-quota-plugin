@@ -10,8 +10,11 @@ either. Never sum wallets or query management /keys to inventory an account.
 With exactly one distinct local credential the card drops the generated key
 scope and shows the wallet as the large Account balance row; every key fact
 (cap, remaining, reset interval, usage, failure) stays, minus that prefix. With
-two or more credentials every key and the one scoped wallet stay explicit. All
-credential/HTTP helpers are provider-local to avoid coupling other fetchers.
+two or more credentials every key and the one scoped wallet stay explicit. The
+result also carries structured ``credential_scope`` / ``key_limit_state``
+evidence so the Desktop never has to infer a key's health from free-form
+``details`` text. All credential/HTTP helpers are provider-local to avoid
+coupling other fetchers.
 """
 from __future__ import annotations
 
@@ -136,15 +139,23 @@ def _amount(value):
 
 
 def _key_result(label, secret):
+    """Return (windows, details, limit_state) for one credential.
+
+    ``limit_state`` is the structured tone evidence: "uncapped" only when the
+    API explicitly returned ``limit: null``. An absent, malformed, negative or
+    boolean limit stays "unknown" -- showing no cap line is not proof of an
+    uncapped key.
+    """
     try:
         payload, error = _get_json(f"{_BASE_URL}/key", secret)
         if error:
-            return [], [f"{label}: unavailable ({error})"]
+            return [], [f"{label}: unavailable ({error})"], "unknown"
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
-            return [], [f"{label}: unavailable (parse-pending)"]
+            return [], [f"{label}: unavailable (parse-pending)"], "unknown"
         details, windows = [], []
         limit, left = _amount(data.get("limit")), _amount(data.get("limit_remaining"))
+        limit_state = "unknown"
         if limit is not None and limit >= 0:
             text = f"{label}: key cap USD {limit:.2f}"
             if left is not None:
@@ -159,8 +170,10 @@ def _key_result(label, secret):
             if reset in ("daily", "weekly", "monthly"):
                 text += f"; resets {reset}"
             details.append(text)
+            limit_state = "capped"
         elif "limit" in data and data["limit"] is None:
             details.append(f"{label}: no key-specific cap (account wallet still applies)")
+            limit_state = "uncapped"
         for field, name in (("usage", "total"), ("usage_daily", "today UTC"),
                             ("usage_weekly", "this week UTC"), ("usage_monthly", "this month UTC")):
             value = _amount(data.get(field))
@@ -168,9 +181,9 @@ def _key_result(label, secret):
                 details.append(f"{label}: usage {name} USD {value:.4f}")
         if not details:
             details.append(f"{label}: unavailable (parse-pending)")
-        return windows, details
+        return windows, details, limit_state
     except Exception:
-        return [], [f"{label}: unavailable (fetch-error)"]
+        return [], [f"{label}: unavailable (fetch-error)"], "unknown"
 
 
 def _balance_text(value):
@@ -304,8 +317,11 @@ def fetch_openrouter_quota() -> QuotaResult:
         if not single:
             details.append("Account membership of other keys is unverified; wallet is not a total across accounts")
         windows = []
+        limit_states = []
         for index, (label, _) in enumerate(credentials):
-            ws, ds = results.get(index, ([], [f"{label}: unavailable (timeout)"]))
+            ws, ds, limit_state = results.get(
+                index, ([], [f"{label}: unavailable (timeout)"], "unknown"))
+            limit_states.append(limit_state)
             if single:
                 # A single-key line that is not its own failure marker nor the
                 # omitted "no cap" placeholder is real data.
@@ -325,8 +341,14 @@ def fetch_openrouter_quota() -> QuotaResult:
             has_data = has_data or key_has_data
             windows.extend(ws)
             details.extend(ds)
-        return QuotaResult(label="openrouter", windows=windows, details=details,
-                           account_balances=account_balances,
-                           unavailable_reason=None if has_data else "no-data")
+        return QuotaResult(
+            label="openrouter", windows=windows, details=details,
+            account_balances=account_balances,
+            credential_scope="single" if single else "scoped",
+            # Only a single-key card can use this: with several keys the wallet
+            # is scoped and the key states are not one aggregate health claim.
+            key_limit_state=limit_states[0] if single else None,
+            unavailable_reason=None if has_data else "no-data",
+        )
     except Exception:
         return build_unavailable("openrouter", "fetch-error")

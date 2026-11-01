@@ -159,6 +159,8 @@ class OpenRouterTests(unittest.TestCase):
         ])
         self.assertEqual([(b.currency, b.total_balance) for b in result.account_balances],
                          [("USD", "8.00")])
+        self.assertEqual((result.credential_scope, result.key_limit_state),
+                         ("single", "capped"))
         self.assertEqual(len(calls.call_args_list), 2)
         rendered = json.dumps(dataclasses.asdict(result))
         for hidden in ("Locally configured credentials", "Management API key",
@@ -181,7 +183,14 @@ class OpenRouterTests(unittest.TestCase):
         self.assertNotIn("no key-specific cap", repr(result))
         self.assertEqual([(b.currency, b.total_balance) for b in result.account_balances],
                          [("USD", "8.25")])
+        self.assertEqual((result.credential_scope, result.key_limit_state),
+                         ("single", "uncapped"))
         self.assertNotIn("Key 1", repr(result))
+        # A wallet amount is not a provider-reported API-availability flag:
+        # the Desktop tones this funded, uncapped key from the balance without
+        # claiming "API calls available: yes" or adding another detail line.
+        self.assertIsNone(result.api_calls_available)
+        self.assertNotIn("API calls available", repr(result))
 
     def test_single_zero_cap_stays_visible_without_a_percentage(self):
         def get(url, key):
@@ -226,6 +235,8 @@ class OpenRouterTests(unittest.TestCase):
         self.assertIsNone(result.unavailable_reason)
         self.assertTrue(result.has_data())
         self.assertEqual(result.account_balances, [])
+        self.assertEqual((result.credential_scope, result.key_limit_state),
+                         ("scoped", None))
         for expected in (
             "Locally configured credentials: 2",
             "Account credits unavailable via Key 1 (native) (http-429)",
@@ -244,6 +255,8 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(result.unavailable_reason, "no-data")
         self.assertFalse(result.has_data())
         self.assertEqual(result.account_balances, [])
+        self.assertEqual((result.credential_scope, result.key_limit_state),
+                         ("single", "unknown"))
         self.assertEqual(result.details, [
             "Account credits unavailable (http-403)",
             "Unavailable (auth-failed)",
@@ -427,21 +440,45 @@ class OpenRouterTests(unittest.TestCase):
         for limit, left, expected in [(0, 0, []), (None, None, []), (5, 0, [100]), (5, -1, []), (5, 6, [])]:
             with self.subTest(limit=limit, left=left):
                 with mock.patch.object(mod, "_get_json", return_value=({"data": {"limit": limit, "limit_remaining": left, "usage": 0}}, None)):
-                    windows, details = mod._key_result("Key 1", "FAKE_A")
+                    windows, details, limit_state = mod._key_result("Key 1", "FAKE_A")
                 self.assertEqual([w.used_percent for w in windows], expected)
+                self.assertEqual(limit_state, "uncapped" if limit is None else "capped")
                 self.assertIn("Key 1: usage total USD 0.0000", details)
                 if left == 0:
                     self.assertIn("key cap exhausted; account wallet is separate", repr(details))
                 if limit is None:
                     self.assertIn("no key-specific cap (account wallet still applies)", repr(details))
 
+    def test_key_limit_state_only_calls_an_explicit_null_uncapped(self):
+        # "No cap line shown" is not proof of an uncapped key: absent, boolean,
+        # negative and unparseable limits must stay unknown so the Desktop
+        # cannot tint a funded wallet green from a malformed /key payload.
+        mod = self.module()
+        cases = [
+            ({"limit": None}, "uncapped"),
+            ({"limit": 0}, "capped"),
+            ({"limit": 5}, "capped"),
+            ({}, "unknown"),
+            ({"limit": True}, "unknown"),
+            ({"limit": False}, "unknown"),
+            ({"limit": -1}, "unknown"),
+            ({"limit": "not-a-number"}, "unknown"),
+            ({"limit": [5]}, "unknown"),
+        ]
+        for data, expected in cases:
+            with self.subTest(data=data), mock.patch.object(
+                    mod, "_get_json", return_value=({"data": data}, None)):
+                _, _, limit_state = mod._key_result("Key 1", "FAKE_A")
+            self.assertEqual(limit_state, expected)
+
     def test_malformed_payloads_are_safe(self):
         mod = self.module()
         for payload in (None, [], {}, {"data": []}, {"data": {"limit": True, "usage": "NaN"}}, {"data": {"label": "PRIVATE_SECRET"}}):
             with self.subTest(payload=payload), mock.patch.object(mod, "_get_json", return_value=(payload, None)):
-                windows, details = mod._key_result("Key 1", "FAKE_A")
+                windows, details, limit_state = mod._key_result("Key 1", "FAKE_A")
             self.assertEqual(windows, [])
             self.assertEqual(details, ["Key 1: unavailable (parse-pending)"])
+            self.assertEqual(limit_state, "unknown")
 
     def test_http_errors_are_safe_and_redirects_are_blocked(self):
         mod = self.module()
@@ -513,6 +550,8 @@ class OpenRouterWidgetTests(unittest.TestCase):
                 "Usage today UTC USD 1.0000",
             ],
             "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "capped",
         }
         clean_tree = render(component="row", mode="clean", id="openrouter",
                             provider=provider)
@@ -543,6 +582,8 @@ class OpenRouterWidgetTests(unittest.TestCase):
             "windows": [],
             "details": ["Usage total USD 2.0000"],
             "account_balances": [{"currency": "USD", "total_balance": "8.25"}],
+            "credential_scope": "single",
+            "key_limit_state": "uncapped",
         }
         clean = text(render(component="row", mode="clean", id="openrouter",
                             provider=provider))
@@ -561,6 +602,8 @@ class OpenRouterWidgetTests(unittest.TestCase):
                 "Usage total USD 4.0000",
             ],
             "account_balances": [{"currency": "USD", "total_balance": "0.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "capped",
         }
         clean = text(render(component="row", mode="clean", id="openrouter",
                             provider=provider))
@@ -582,12 +625,353 @@ class OpenRouterWidgetTests(unittest.TestCase):
                 "Key 1 (native): key cap USD 5.00; remaining USD 2.00; resets monthly",
                 "Key 1 (native): usage total USD 6.0000",
             ],
+            "credential_scope": "scoped",
         }
         clean = text(render(component="row", mode="clean", id="openrouter",
                             provider=provider))
         self.assertIn("Locally configured credentials: 2", clean)
         self.assertIn("Key 1 (native): key cap USD 5.00", clean)
         self.assertIn("Key 1 (native): usage total USD 6.0000", clean)
+
+    @staticmethod
+    def row_tones(provider, provider_id="openrouter", mode="clean"):
+        tree = render(component="row", mode=mode, id=provider_id, provider=provider)
+        return [node["props"].get("data-tone") for node in nodes(tree)
+                if "data-tone" in node.get("props", {})]
+
+    @staticmethod
+    def chip_dot_color(provider, provider_id="openrouter"):
+        tree = render(component="chip", id=provider_id, provider=provider)
+        dots = [node for node in nodes(tree)
+                if "rounded-full" in (node.get("props", {}).get("className") or "")]
+        return dots[0]["props"]["style"]["background"] if dots else None
+
+    def test_single_uncapped_positive_wallet_is_good_without_an_availability_claim(self):
+        # Regression: the card had no window and no api_calls_available, so a
+        # funded, uncapped single key rendered a muted dot and read as unknown.
+        provider = {
+            "windows": [],
+            "details": ["Usage total USD 2.0000"],
+            "account_balances": [{"currency": "USD", "total_balance": "8.25"}],
+            "credential_scope": "single",
+            "key_limit_state": "uncapped",
+        }
+        for mode in ("clean", "dense"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.row_tones(provider, mode=mode), ["good"])
+        self.assertEqual(self.chip_dot_color(provider), "var(--ui-green)")
+        rendered = text(render(component="row", mode="clean", id="openrouter",
+                               provider=provider))
+        self.assertIn("$8.25 USD", rendered)
+        self.assertNotIn("API calls available", rendered)
+
+    def test_wallet_only_uncapped_key_is_good_too(self):
+        # /key can return no cap and no usage; the wallet is the whole record.
+        provider = {
+            "windows": [],
+            "details": [],
+            "account_balances": [{"currency": "USD", "total_balance": "0.0040"}],
+            "credential_scope": "single",
+            "key_limit_state": "uncapped",
+        }
+        self.assertEqual(self.row_tones(provider), ["good"])
+
+    def test_zero_and_negative_wallets_do_not_become_good(self):
+        for value in ("0", "0.00", "-1.25"):
+            with self.subTest(balance=value):
+                provider = {
+                    "windows": [],
+                    "details": ["Usage total USD 2.0000"],
+                    "account_balances": [{"currency": "USD", "total_balance": value}],
+                    "credential_scope": "single",
+                    "key_limit_state": "uncapped",
+                }
+                self.assertEqual(self.row_tones(provider), ["muted"])
+                self.assertEqual(self.chip_dot_color(provider), "var(--ui-stroke-tertiary)")
+
+    def test_exhausted_zero_cap_stays_muted_despite_a_funded_wallet(self):
+        # A zero key cap blocks this key even though the account wallet has
+        # money: the cap line keeps its existing muted status and stays visible.
+        provider = {
+            "windows": [],
+            "details": [
+                "Key cap USD 0.00; remaining USD 0.00 (key cap exhausted; account wallet is separate)",
+                "Usage total USD 4.0000",
+            ],
+            "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "capped",
+        }
+        self.assertEqual(self.row_tones(provider), ["muted"])
+        self.assertEqual(self.chip_dot_color(provider), "var(--ui-stroke-tertiary)")
+        self.assertIn("Key cap USD 0.00", text(render(
+            component="row", mode="clean", id="openrouter", provider=provider)))
+
+    def test_capped_key_without_a_known_remaining_stays_muted(self):
+        provider = {
+            "windows": [],
+            "details": ["Key cap USD 5.00"],
+            "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "capped",
+        }
+        self.assertEqual(self.row_tones(provider), ["muted"])
+
+    def test_key_failure_beside_a_funded_wallet_stays_muted(self):
+        provider = {
+            "windows": [],
+            "details": ["Unavailable (timeout)"],
+            "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "unknown",
+        }
+        self.assertEqual(self.row_tones(provider), ["muted"])
+
+    def test_legacy_record_without_structured_evidence_stays_muted(self):
+        # An older cache has details and a balance but neither structured
+        # field. It must not be mistaken for a confirmed uncapped key.
+        provider = {
+            "windows": [],
+            "details": ["Usage total USD 2.0000"],
+            "account_balances": [{"currency": "USD", "total_balance": "8.25"}],
+        }
+        self.assertEqual(self.row_tones(provider), ["muted"])
+        self.assertEqual(self.chip_dot_color(provider), "var(--ui-stroke-tertiary)")
+
+    def test_scoped_record_without_its_scope_detail_stays_muted(self):
+        # The old fallback inferred "single-key" from the absence of the
+        # "Locally configured credentials" line. A scoped error/cap record that
+        # lost that line (old cache, truncation, hand edit) fell through to a
+        # green funded wallet. Structured scope must keep it muted.
+        provider = {
+            "windows": [],
+            "details": [
+                "Key 1 (native): key cap USD 5.00; remaining USD 2.00",
+                "Key 2 (saved): unavailable (timeout)",
+            ],
+            "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "scoped",
+        }
+        self.assertEqual(self.row_tones(provider), ["muted"])
+        self.assertEqual(self.chip_dot_color(provider), "var(--ui-stroke-tertiary)")
+
+    def test_error_and_multi_key_states_keep_their_muted_tone(self):
+        errored = {
+            "windows": [],
+            "details": ["Account credits unavailable (http-429)"],
+            "unavailable_reason": "no-data",
+            "account_balances": [],
+        }
+        self.assertEqual(self.row_tones(errored), [])
+        self.assertEqual(self.chip_dot_color(errored), "var(--ui-stroke-tertiary)")
+        multi = {
+            "windows": [{"label": "Key 1 (native) quota", "used_percent": 50}],
+            "details": [
+                "Locally configured credentials: 2 (deduplicated); not an inventory of all account keys",
+                "Account wallet via Key 1 (native): USD 8.00 remaining",
+                "Key 1 (native): key cap USD 5.00; remaining USD 2.00",
+                "Key 2 (saved): no key-specific cap (account wallet still applies)",
+            ],
+            "account_balances": [],
+            "credential_scope": "scoped",
+        }
+        # The one window still drives its normal percentage tone.
+        self.assertEqual(self.row_tones(multi), ["good"])
+        no_window_multi = dict(multi, windows=[])
+        self.assertEqual(self.row_tones(no_window_multi), ["muted"])
+        # Even a malformed cached record that pairs scoped details with a
+        # balance must not fall into the single-key funded-wallet tone.
+        mixed = dict(no_window_multi, account_balances=[
+            {"currency": "USD", "total_balance": "8.00"}])
+        self.assertEqual(self.row_tones(mixed), ["muted"])
+
+    def test_reported_api_unavailability_wins_over_a_funded_wallet(self):
+        # A provider-reported false is a stronger fact than any balance.
+        provider = {
+            "windows": [],
+            "details": [],
+            "account_balances": [{"currency": "USD", "total_balance": "8.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "uncapped",
+            "api_calls_available": False,
+        }
+        self.assertEqual(self.row_tones(provider), ["bad"])
+        self.assertEqual(self.chip_dot_color(provider), "var(--ui-red)")
+
+    def test_generic_balance_only_provider_stays_muted(self):
+        # The wallet fallback is OpenRouter-specific: a plain balance-only
+        # provider keeps the existing "unknown availability" muted dot.
+        provider = {
+            "windows": [],
+            "details": [],
+            "account_balances": [{"currency": "USD", "total_balance": "12.00"}],
+            "credential_scope": "single",
+            "key_limit_state": "uncapped",
+        }
+        self.assertEqual(self.row_tones(provider, provider_id="deepseek"), ["muted"])
+
+
+class OpenRouterCacheToWidgetToneTests(unittest.TestCase):
+    """Real fetcher -> real cache serializer -> real widget renderer.
+
+    The Desktop reads the cache record, not the in-memory ``QuotaResult``, so
+    the structured tone evidence must survive serialization. These tests patch
+    only the OpenRouter HTTP boundary and import the plugin as one package
+    instance, so the fetcher's ``QuotaResult`` is the same class the cache
+    serializes.
+    """
+
+    PACKAGE = "openrouter_cache_integration"
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("node") is None:
+            raise unittest.SkipTest("Node.js is required for widget render tests")
+        stub = types.ModuleType("hermes_constants")
+        setattr(stub, "get_hermes_home", lambda: ROOT)
+        pkg = types.ModuleType(cls.PACKAGE)
+        pkg.__path__ = [str(ROOT)]
+        with mock.patch.dict(sys.modules, {cls.PACKAGE: pkg, "hermes_constants": stub}):
+            cls.fetcher = importlib.import_module(cls.PACKAGE + ".quota_providers.openrouter")
+            cls.cache = importlib.import_module(cls.PACKAGE + ".quota_cache")
+
+    def fetch_and_cache(self, get, credentials):
+        with mock.patch.object(self.fetcher, "_resolve_credentials", return_value=credentials), \
+                mock.patch.object(self.fetcher, "_get_json", side_effect=get):
+            result = self.fetcher.fetch_openrouter_quota()
+        # The real fail-open cache boundary, not a test-local copy of the
+        # schema. The widget reads quota_cache.json, so round-trip the record
+        # through JSON too: no in-memory-only Python value can pass this.
+        record = self.cache._fetch_one("openrouter", lambda: result)
+        return result, json.loads(json.dumps(record))
+
+    @staticmethod
+    def record_tones(record, provider_id="openrouter"):
+        tree = render(component="row", mode="clean", id=provider_id, provider=record)
+        return [node["props"].get("data-tone") for node in nodes(tree)
+                if "data-tone" in node.get("props", {})]
+
+    @staticmethod
+    def record_chip_color(record, provider_id="openrouter"):
+        tree = render(component="chip", id=provider_id, provider=record)
+        dots = [node for node in nodes(tree)
+                if "rounded-full" in (node.get("props", {}).get("className") or "")]
+        return dots[0]["props"]["style"]["background"] if dots else None
+
+    @staticmethod
+    def wallet(total_credits, total_usage):
+        return {"data": {"total_credits": total_credits, "total_usage": total_usage}}
+
+    def test_valid_null_limit_reaches_the_widget_as_good(self):
+        def get(url, key):
+            if url.endswith("/credits"):
+                return self.wallet(20, 12), None
+            return {"data": {"limit": None, "usage": 2}}, None
+        _, record = self.fetch_and_cache(get, [("Key 1 (native)", "FAKE_A")])
+        self.assertEqual((record["credential_scope"], record["key_limit_state"]),
+                         ("single", "uncapped"))
+        self.assertEqual([(b["currency"], b["total_balance"])
+                          for b in record["account_balances"]], [("USD", "8.00")])
+        self.assertEqual(self.record_tones(record), ["good"])
+        self.assertEqual(self.record_chip_color(record), "var(--ui-green)")
+        rendered = text(render(component="row", mode="clean", id="openrouter",
+                               provider=record))
+        self.assertIn("$8.00 USD", rendered)
+        self.assertNotIn("API calls available", rendered)
+
+    def test_missing_or_malformed_limit_never_greens(self):
+        # The regression: any /key payload without a displayed cap line used to
+        # read as "uncapped". Only an explicit null limit may do that.
+        cases = (
+            ("absent", {"data": {"usage": 2}}),
+            ("boolean", {"data": {"limit": True, "usage": 2}}),
+            ("negative", {"data": {"limit": -5, "usage": 2}}),
+            ("unparseable", {"data": {"limit": "many", "usage": 2}}),
+        )
+        for what, key_payload in cases:
+            with self.subTest(case=what):
+                def get(url, key, payload=key_payload):
+                    if url.endswith("/credits"):
+                        return self.wallet(20, 12), None
+                    return payload, None
+                result, record = self.fetch_and_cache(
+                    get, [("Key 1 (native)", "FAKE_A")])
+                self.assertEqual(result.key_limit_state, "unknown")
+                self.assertEqual(record["key_limit_state"], "unknown")
+                self.assertEqual(record["credential_scope"], "single")
+                self.assertEqual(self.record_tones(record), ["muted"])
+                self.assertEqual(self.record_chip_color(record),
+                                 "var(--ui-stroke-tertiary)")
+
+    def test_zero_cap_reaches_the_widget_as_muted_with_the_cap_visible(self):
+        def get(url, key):
+            if url.endswith("/credits"):
+                return self.wallet(20, 12), None
+            return {"data": {"limit": 0, "limit_remaining": 0, "usage": 4}}, None
+        _, record = self.fetch_and_cache(get, [("Key 1 (saved)", "FAKE_B")])
+        self.assertEqual(record["key_limit_state"], "capped")
+        self.assertEqual(self.record_tones(record), ["muted"])
+        rendered = text(render(component="row", mode="clean", id="openrouter",
+                               provider=record))
+        self.assertIn("Key cap USD 0.00", rendered)
+        self.assertIn("$8.00 USD", rendered)
+        self.assertNotIn("Key quota", rendered)
+
+    def test_key_failure_with_a_funded_wallet_reaches_the_widget_as_muted(self):
+        def get(url, key):
+            if url.endswith("/credits"):
+                return self.wallet(20, 12), None
+            return None, "timeout"
+        _, record = self.fetch_and_cache(get, [("Key 1 (native)", "FAKE_A")])
+        self.assertEqual(record["key_limit_state"], "unknown")
+        self.assertEqual(record["details"], ["Unavailable (timeout)"])
+        self.assertEqual(self.record_tones(record), ["muted"])
+        self.assertEqual(self.record_chip_color(record),
+                         "var(--ui-stroke-tertiary)")
+
+    def test_wallet_failure_leaves_no_funded_tone(self):
+        # Confirmed uncapped key but no wallet amount: there is no balance to
+        # tint, and the failure line must keep the card muted.
+        def get(url, key):
+            if url.endswith("/credits"):
+                return None, "http-429"
+            return {"data": {"limit": None, "usage": 2}}, None
+        _, record = self.fetch_and_cache(get, [("Key 1 (native)", "FAKE_A")])
+        self.assertEqual((record["credential_scope"], record["key_limit_state"]),
+                         ("single", "uncapped"))
+        self.assertEqual(record["account_balances"], [])
+        self.assertEqual(self.record_tones(record), ["muted"])
+        self.assertIn("Account credits unavailable (http-429)", record["details"])
+
+    def test_scoped_malformed_key_stays_muted_without_the_scope_detail(self):
+        def get(url, key):
+            if url.endswith("/credits"):
+                return self.wallet(20, 12), None
+            if key == "FAKE_A":
+                # A scoped zero cap: a real cap with no percentage window.
+                return {"data": {"limit": 0, "limit_remaining": 0, "usage": 3}}, None
+            return {"data": {"limit": True, "usage": 3}}, None
+        _, record = self.fetch_and_cache(
+            get, [("Key 1 (native)", "FAKE_A"), ("Key 2 (saved)", "FAKE_B")])
+        self.assertEqual((record["credential_scope"], record["key_limit_state"]),
+                         ("scoped", None))
+        # A scoped cache record that lost its scope and wallet details (older
+        # cache, a hand edit, truncation) and was handed a balance must still
+        # stay muted.
+        mutated = dict(record)
+        mutated["details"] = [
+            d for d in record["details"]
+            if not d.startswith(("Locally configured credentials", "Account wallet"))
+        ]
+        mutated["account_balances"] = [
+            {"currency": "USD", "total_balance": "8.00"}]
+        self.assertEqual(self.record_tones(mutated), ["muted"])
+        # A pre-field cache record has neither structured key at all.
+        legacy = {k: v for k, v in mutated.items()
+                  if k not in ("credential_scope", "key_limit_state")}
+        self.assertEqual(self.record_tones(legacy), ["muted"])
+        self.assertEqual(self.record_chip_color(legacy),
+                         "var(--ui-stroke-tertiary)")
 
 
 if __name__ == "__main__":
