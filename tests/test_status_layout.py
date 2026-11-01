@@ -283,5 +283,41 @@ class QuotaLayoutTests(unittest.TestCase):
         self.assertIn("• anthropic: Session 90%", block)
 
 
+class BalanceLineGuardTests(unittest.TestCase):
+    """A corrupt cached amount must never be expanded by ``format(..., "f")``."""
+
+    def test_extreme_zero_exponents_are_rejected_not_expanded(self):
+        # Regression: the old truthiness check treated Decimal("0E-1000000")
+        # as a safe zero and formatted a million-character balance line. Keep
+        # the exponent large enough to prove the guard, but not so large that
+        # a reintroduced bug OOMs the test runner before the assertion.
+        cmd, _plugin = _modules()
+        for value in ("0E-1000000", "-0E-1000000"):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    cmd._balance_line({"currency": "USD", "total_balance": value}))
+
+    def test_zero_with_an_ordinary_precision_still_renders(self):
+        cmd, _plugin = _modules()
+        for value in ("0", "0.00"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    cmd._balance_line({"currency": "USD", "total_balance": value}),
+                    "Account balance: $0.00 USD")
+
+    def test_oversized_amounts_and_other_malformed_rows_stay_rejected(self):
+        cmd, _plugin = _modules()
+        for row in (
+            {"currency": "USD", "total_balance": "1E+20"},
+            {"currency": "USD", "total_balance": "0.0000000000000001"},
+            {"currency": "USD", "total_balance": "NaN"},
+            {"currency": "USD", "total_balance": "Infinity"},
+            {"currency": "usd", "total_balance": "1.00"},
+            {"currency": "USD", "total_balance": True},
+        ):
+            with self.subTest(row=row):
+                self.assertIsNone(cmd._balance_line(row))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -89,8 +89,9 @@ icon).
 - Detail lines where the API offers them: credits, banked resets, extra limits.
 - Providers without data collapse into a quiet **"No data (n)"** section — the
   default view shows only providers with live numbers.
-- **Pane detail**: `clean` (percentage windows and balance headlines) or `dense`
-  (every window, reset time and detail line). Dense is the default.
+- **Pane detail**: `clean` (percentage windows, balance headlines and a
+  single-key OpenRouter card's cap and failure lines) or `dense` (every window,
+  reset time and detail line). Dense is the default.
 - Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
   localized with the full date, seconds and timezone. Provider cards scroll
   separately so long balance details cannot overlap the footer.
@@ -104,7 +105,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | --- | --- | --- |
 | Status bar mode | `all providers` · `worst only` | `all providers` |
 | Show status bar indicator | on · off (the Hermes status bar must also be visible: ⌘K → Toggle status bar) | on |
-| Pane detail | `clean` — rings with their reset times · `dense` — adds forecasts, history and detail lines | `dense` |
+| Pane detail | `clean` — rings with their reset times, balance headlines and OpenRouter's single-key cap/failure lines · `dense` — adds forecasts, history and all detail lines | `dense` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
 | Enabled providers | toggle any provider on/off (cherry-pick) | all on |
@@ -168,5 +169,6 @@ plugin reload or a gateway switch paints immediately instead of waiting on a
 backend spawn.
 
 > Quota windows show remaining **%** and **time-to-reset** when the API exposes
-> a percentage or denominator. Account balances, such as DeepSeek, are separate
-> monetary facts, never converted into a quota percentage.
+> a percentage or denominator. Account balances, such as DeepSeek and a
+> single-key OpenRouter card, are separate monetary facts, never converted into
+> a quota percentage.

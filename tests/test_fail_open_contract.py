@@ -12,6 +12,7 @@ the generic "fetch-error" instead of a reason of its own -- which the next rule
 Offline; no network.
 """
 import ast
+import dataclasses
 import importlib
 import inspect
 import sys
@@ -257,6 +258,38 @@ class MalformedReturnTests(unittest.TestCase):
 
         self.assertEqual(cache["providers"]["probe"]["unavailable_reason"],
                          "fetch-error")
+
+
+class QuotaResultPositionalCompatibilityTests(unittest.TestCase):
+    """Appending optional fields must not shift pre-existing positional args."""
+
+    def test_legacy_positional_arguments_keep_their_meaning(self):
+        from quota_providers.base import QuotaAccount, QuotaWindow
+
+        account = QuotaAccount(id="work", label="Work")
+        result = QuotaResult(
+            "anthropic", [QuotaWindow("Session", 10.0)], "Max", None,
+            ["detail"], [], True, [account], "Work",
+        )
+        self.assertEqual(result.label, "anthropic")
+        self.assertEqual([w.label for w in result.windows], ["Session"])
+        self.assertEqual(result.plan, "Max")
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.details, ["detail"])
+        self.assertEqual(result.account_balances, [])
+        self.assertTrue(result.api_calls_available)
+        self.assertEqual(result.accounts, [account])
+        self.assertEqual(result.account_label, "Work")
+        self.assertEqual((result.credential_scope, result.key_limit_state),
+                         (None, None))
+
+    def test_new_evidence_fields_are_appended_after_the_legacy_shape(self):
+        names = [f.name for f in dataclasses.fields(QuotaResult)]
+        self.assertEqual(names[:9], [
+            "label", "windows", "plan", "unavailable_reason", "details",
+            "account_balances", "api_calls_available", "accounts", "account_label",
+        ])
+        self.assertEqual(names[-2:], ["credential_scope", "key_limit_state"])
 
 
 class FailOpenContractIsDocumentedTests(unittest.TestCase):

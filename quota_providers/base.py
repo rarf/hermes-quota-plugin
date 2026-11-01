@@ -105,6 +105,20 @@ class QuotaResult:
     accounts: list[Union[QuotaAccount, QuotaResult]] = field(default_factory=list)
     # Explicit label for legacy single-account provider records (Codex).
     account_label: Optional[str] = None
+    # Structured key evidence for the Desktop's funded-wallet tone. Free-form
+    # ``details`` must never be the source of truth: a missing or malformed
+    # field there is indistinguishable from a healthy one. ``credential_scope``
+    # is "single" when exactly one distinct local credential was resolved and
+    # "scoped" when several were. ``key_limit_state`` is "uncapped" only for an
+    # explicit null limit (the API's confirmed "no key cap"), "capped" for a
+    # valid non-negative cap, and "unknown" when the limit is absent, malformed,
+    # negative or the key read failed.
+    #
+    # These are appended after every pre-existing field: adding them earlier
+    # would shift ``accounts``/``account_label`` for callers constructing a
+    # QuotaResult positionally.
+    credential_scope: Optional[str] = None
+    key_limit_state: Optional[str] = None
 
     def has_data(self) -> bool:
         return (

@@ -25,6 +25,7 @@ import json
 import math
 import sys
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Optional
 
@@ -82,6 +83,13 @@ _PROVIDER_ALIASES = {
 # has no quota to read, so the dashboard hides it. Every other unavailable
 # reason means something IS configured and failing, which must stay visible.
 _HIDDEN_REASON = "no-credentials"
+
+# OpenRouter's single-key record is the one result whose wallet lives only in
+# ``account_balances``: its details are deliberately label-free key facts and
+# the Desktop renders the wallet as the card headline. Other fetchers already
+# spell their balances out in ``details`` (where the CLI has always shown
+# them), so rendering those again here would duplicate unrelated output.
+_HEADLINE_BALANCE_PROVIDERS = frozenset({"openrouter"})
 
 _BAR_WIDTH = 10
 _BAR_FILLED = "█"
@@ -190,6 +198,51 @@ def _provider_label(name: str, rec: Any) -> str:
     if not account and ":" in str(name):
         account = str(name).split(":", 1)[1].strip()
     return f"{pretty} · {account}" if account else pretty
+
+
+def _balance_line(row: Any) -> Optional[str]:
+    """One cached ``account_balances`` row as a CLI line, or None if malformed.
+
+    The cached amount is a decimal string, so it is echoed at the precision the
+    fetcher reported instead of passing through float (a sub-cent wallet must
+    never round to ``$0.00``). At least two fraction digits are shown, matching
+    the Desktop's balance row.
+    """
+    if not isinstance(row, dict):
+        return None
+    currency = row.get("currency")
+    total = row.get("total_balance")
+    if not isinstance(currency, str) or not (
+        len(currency) == 3 and currency.isascii() and currency.isalpha() and currency.isupper()
+    ):
+        return None
+    if isinstance(total, bool) or not isinstance(total, (str, int, float)):
+        return None
+    text = str(total).strip()
+    if not text or len(text) > 64:
+        return None
+    try:
+        amount = Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+    if not amount.is_finite():
+        return None
+    # Bound the exponent before ``format(..., "f")`` expands it: a corrupt
+    # cache should not make the dashboard allocate gigabytes of zeros. The
+    # exponent check must not depend on truthiness -- ``Decimal("0E-999999999")``
+    # is a valid zero whose "f" format is a billion characters.
+    exponent = amount.as_tuple().exponent
+    if (amount.copy_abs() > Decimal("1e15")
+            or not isinstance(exponent, int) or exponent < -15):
+        return None
+    rendered = format(amount, "f")
+    negative = rendered.startswith("-")
+    if negative:
+        rendered = rendered[1:]
+    whole, _dot, fraction = rendered.partition(".")
+    if len(fraction) < 2:
+        rendered = f"{whole}.{fraction.ljust(2, '0')}"
+    return f"Account balance: {'-' if negative else ''}${rendered} {currency}"
 
 
 def _matches_filter(pf: str, name: str, rec: Any) -> bool:
@@ -361,7 +414,14 @@ def _render_quota(provider_filter: Optional[str]) -> str:
             head = f"**{title}** — unavailable ({reason})"
         else:
             head = f"**{title}**"
+        balances: list[str] = []
+        raw_balances = rec.get("account_balances")
+        if (not reason and _base_provider(name) in _HEADLINE_BALANCE_PROVIDERS
+                and isinstance(raw_balances, list)):
+            balances = [line for line in (_balance_line(b) for b in raw_balances) if line]
         body = [head]
+        for line in balances:
+            body.append(f"  {line}")
         for window in windows:
             label = str(window.get("label") or "window")
             remaining = _remaining(window.get("used_percent"))
@@ -374,7 +434,7 @@ def _render_quota(provider_filter: Optional[str]) -> str:
                 )
         for line in details:
             body.append(f"  · {line}")
-        if not windows and not details and not reason:
+        if not windows and not details and not balances and not reason:
             body.append("  no usage data reported")
         blocks.append("\n".join(body))
 
