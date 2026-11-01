@@ -109,7 +109,7 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | Status bar mode | `all providers` · `worst only` | `all providers` |
 | Show status bar indicator | on · off (the Hermes status bar must also be visible: ⌘K → Toggle status bar) | on |
 | Pane detail | `clean` — gauges or bars per window, without the provider detail lines · `dense` — adds the provider detail lines | `dense` |
-| Pane style | `rings` — donut gauges per window · `bars` — horizontal bars per window | `rings` |
+| Pane style | `rings` — donut gauges per window · `bars` — horizontal bars per window (the status-bar chip popup follows the same style) | `rings` |
 | Status bar chip | `both` — ring gauge and percentage · `rings` — gauge only · `values` — percentage or balance only | `both` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |

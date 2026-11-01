@@ -5476,15 +5476,43 @@ function ContextChip() {
 
 // ---- quota card ----
 
+// One window in the quota card the status-bar chips open. The card has no
+// style switch of its own: it follows the persisted "Pane style" setting, so a
+// user who picked bars in the pane gets bars here too (and rings stay the
+// default). Rings are small 32 px gauges and sit side by side; a bar needs the
+// pane's full-width row, so the bars tile is laid out exactly like
+// `WindowBarRow` (label left, "% left" right, bar, reset) in a column.
 function QuotaCardWindow({ w, nowMs }) {
 	const t = useQT();
+	const paneStyle = useValue(paneStyleAtom);
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	const title = [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · ");
+	if (paneStyle === "bars") {
+		return jsxs("div", {
+			"data-card-window": label,
+			// Share the pane's bar marker: this tile is the same window as a bar.
+			"data-window-bar": label,
+			title,
+			style: { ...UI.col, gap: 3 },
+			children: [
+				jsxs("div", {
+					style: { ...UI.row, justifyContent: "space-between", gap: 6 },
+					children: [
+						jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }),
+						jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: toneColor(tone) }, children: r == null ? "—" : `${fmtPct(r)} ${t("left")}` }),
+					],
+				}),
+				jsx(QuotaBar, { value: r, tone }),
+				reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			],
+		});
+	}
 	return jsxs("div", {
 		"data-card-window": label,
-		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		title,
 		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
 		children: [
 			jsx(Ring, {
@@ -5508,6 +5536,7 @@ function QuotaCard({ close }) {
 	noteDataTimeZone(data);
 	const mon = useMonitor();
 	const forecastOn = useValue(quotaForecastAtom);
+	const paneStyle = useValue(paneStyleAtom);
 	const nowMs = useNow(30_000);
 	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
 	const entries = providerEntries(data && data.providers).filter(
@@ -5549,7 +5578,9 @@ function QuotaCard({ close }) {
 								],
 							}),
 							windows.length
-								? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								// Bars need the pane's full-width column, top to bottom;
+								// rings are 32 px gauges and read better side by side.
+								? jsx("div", { style: paneStyle === "bars" ? { ...UI.col, gap: 9 } : { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
 							...forecasts.map(({ w, f }, j) =>

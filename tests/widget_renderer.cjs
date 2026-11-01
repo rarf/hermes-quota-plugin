@@ -48,7 +48,9 @@ function renderWidget(options = {}) {
   vm.runInContext('try { statusbarStyleAtom.set(TEST_STATUSBAR_STYLE); } catch (e) {}', Object.assign(context, { TEST_STATUSBAR_STYLE: options.statusbarStyle || 'both' }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
-  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  // `card` renders the popup a status-bar quota chip opens (QuotaCard), so the
+  // card's own pane-style handling can be asserted without a real click.
+  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : options.component === 'card' ? 'QuotaCard({close: () => {}})' : 'QuotaPane()';
   const tree = vm.runInContext(expression, context);
   if (options.clickLinks) {
     const visit = node => {
