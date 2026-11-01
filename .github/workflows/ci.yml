@@ -8,11 +8,22 @@ on:
 jobs:
   python-tests:
     name: Python tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # 3.9 is the plugin's floor, but actions/setup-python publishes no 3.9
+        # build for the Ubuntu 26.04 image ubuntu-latest now points at, so 3.9
+        # is pinned to the last image that still has one. 3.10+ stay on latest.
+        include:
+          - python-version: "3.9"
+            image: ubuntu-22.04
+          - python-version: "3.10"
+            image: ubuntu-latest
+          - python-version: "3.11"
+            image: ubuntu-latest
+          - python-version: "3.12"
+            image: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
