@@ -2062,7 +2062,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	const t = useQT();
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window and detail line; 'clean' = just the rings and
-	// their reset times, except OpenRouter's essential key/wallet scope details.
+	// their reset times, except OpenRouter's essential scope/cap lines.
 	const paneDetail = useValue(paneDetailAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider ? provider.unavailable_reason : "no-data";
@@ -2135,9 +2135,17 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				points: historyFor(monitor.history, id, provider, w.label),
 			}))
 		: [];
-	const detailLines = details.filter(
-		(d) => (dense || id === "openrouter" || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d)),
-	);
+	// Clean mode keeps every scoped OpenRouter detail and a single-key card's
+	// optional key cap, but hides single-key usage totals: the wallet is the
+	// headline and dense/CLI/JSON still carry every usage fact. Scoped lines
+	// begin with their generated "Key N (…):" label, single-key lines do not,
+	// so this only drops the unprefixed single-key usage lines.
+	const detailLines = details.filter((d) => {
+		if (facts.available != null && /^API calls available: (yes|no)$/.test(d)) return false;
+		if (dense) return true;
+		if (id === "openrouter") return !/^Usage /.test(d);
+		return baseProviderId(id) === "anthropic" && /^Observed /.test(d);
+	});
 
 	return jsxs("div", {
 		className: "flex flex-col rounded-lg border px-3 py-2.5",

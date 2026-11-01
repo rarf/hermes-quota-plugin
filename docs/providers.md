@@ -9,7 +9,7 @@
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
 | `antigravity` | Reads `gemini:antigravity` from Windows Credential Manager; the `gemini` / `antigravity` item from macOS Keychain; or `~/.gemini/antigravity-cli/antigravity-oauth-token` on Linux | **Opt-in, disabled by default.** Google AI Pro pools — Gemini and Claude/GPT each with a 5-hour and a weekly window; plan from `loadCodeAssist` (`paidTier` wins over `currentTier`). When enabled, refreshes with Antigravity's installed-app OAuth client identity and impersonates its `User-Agent: antigravity/2.8.0 windows/amd64`. Credential stores are read-only. |
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
-| `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
+| `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; exactly one distinct key shows the wallet as **Account balance**, with an unlabelled cap line in clean mode and usage in dense/CLI/JSON; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
@@ -131,6 +131,24 @@ Saved/vendor labels, key suffixes, hashes, account IDs and emails are never
 included in display data. The ordinal follows discovery order, not a stable
 account identity or the runtime pool's current selection.
 
+- **Exactly one distinct credential — single-key mode.** The generated key
+  label, the credential-count line, the management-endpoint line and the
+  unverified-membership line are omitted, because there is no second key to
+  scope or distinguish. The `/credits` wallet is shown once as the large
+  **Account balance** row (USD), like Ollama and DeepSeek; the CLI prints the
+  same wallet as `Account balance: $X USD`, while the providers that already
+  state their balance in a detail line keep that line. A positive key cap
+  with a known remaining allowance remains as a plain **Key quota** window,
+  and its cap, remaining allowance and reset interval stay as label-free detail
+  lines. A zero cap is a real cap and stays visible as such, without a
+  fabricated percentage; when the API returns no cap at all, no cap line is
+  shown. Total/daily/weekly/monthly usage stays in the record — visible in the
+  Desktop's dense mode and always in the CLI and
+  `hermes quota status --json` — while the Desktop's clean mode hides it. A
+  failed key or wallet still reports its reason rather than disappearing.
+- **Two or more distinct credentials — scoped mode.** The full per-key
+  diagnostics remain, including the generated labels and the explicit note
+  that other keys' account membership is unverified.
 - Key-specific spending cap, remaining allowance and daily/weekly/monthly usage
   are shown when supplied by the API. A percentage requires a positive cap and
   remaining allowance within that cap. An uncapped key does not mean unlimited
@@ -143,9 +161,12 @@ account identity or the runtime pool's current selection.
 - Key and wallet requests run independently under one 10-second deadline. One
   failed or timed-out key does not hide successful keys or the wallet. If every
   request fails, the provider is unavailable rather than reporting false data.
-- The Desktop pane retains these details in **both clean and dense modes**, so
-  wallet scope, uncapped keys and per-key failures remain visible. They are also
-  present in `hermes quota status --json`.
+- OpenRouter's key details are mode-aware on the Desktop. **Clean** shows a
+  single-key card's wallet, its optional cap line (including a zero cap) and
+  any failure, but hides the usage totals; **dense** adds them. Scoped
+  (multi-key) cards keep every detail in both modes. The CLI and
+  `hermes quota status --json` always carry the label-free cap, reset, usage
+  and failure lines.
 
 ### CommandCode
 

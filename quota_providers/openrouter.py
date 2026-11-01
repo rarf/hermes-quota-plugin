@@ -7,7 +7,11 @@ GET /api/v1/credits: {"data": {"total_credits": number, "total_usage": number}}.
 
 /key cannot establish account identity; equal balances cannot establish it
 either. Never sum wallets or query management /keys to inventory an account.
-All credential/HTTP helpers are provider-local to avoid coupling other fetchers.
+With exactly one distinct local credential the card drops the generated key
+scope and shows the wallet as the large Account balance row; every key fact
+(cap, remaining, reset interval, usage, failure) stays, minus that prefix. With
+two or more credentials every key and the one scoped wallet stay explicit. All
+credential/HTTP helpers are provider-local to avoid coupling other fetchers.
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 
-from .base import QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
+from .base import AccountBalance, QuotaResult, QuotaWindow, build_unavailable, urlopen_no_redirect
 from .registry import register
 
 _BASE_URL = "https://openrouter.ai/api/v1"
@@ -169,20 +173,85 @@ def _key_result(label, secret):
         return [], [f"{label}: unavailable (fetch-error)"]
 
 
-def _wallet_result(label, secret):
+def _balance_text(value):
+    """Cents for the headline, but never round a nonzero wallet to USD 0.00."""
+    cents = f"{value:.2f}"
+    if Decimal(cents) == 0 and value != 0:
+        mills = f"{value:.4f}"
+        return mills if Decimal(mills) != 0 else f"{value:f}"
+    return cents
+
+
+def _wallet_unavailable(label, reason, scoped=True):
+    """A wallet failure that keeps its reason but never leaks the secret.
+
+    ``scoped`` names the credential that failed. A single-key card has no
+    other key to scope against, so it omits the generated label there too.
+    """
+    scope = f" via {label}" if scoped else ""
+    return f"Account credits unavailable{scope} ({reason})"
+
+
+def _wallet_result(label, secret, scoped=True):
+    """Return (available, detail, AccountBalance|None) for the scoped wallet.
+
+    The amount is carried separately so a single-key card can show it as the
+    large generic Account balance row. With several keys only the detail line
+    is used: the wallet belongs to one credential's account, and the other
+    keys' membership is unverified.
+    """
     try:
         payload, error = _get_json(f"{_BASE_URL}/credits", secret)
         data = payload.get("data") if isinstance(payload, dict) else None
         total = _amount(data.get("total_credits")) if isinstance(data, dict) else None
         used = _amount(data.get("total_usage")) if isinstance(data, dict) else None
         if error or total is None or used is None:
-            return False, f"Account credits unavailable via {label} ({error or 'parse-pending'})"
+            return False, _wallet_unavailable(label, error or "parse-pending", scoped), None
+        remaining = total - used
+        scope = f" via {label}" if scoped else ""
         return True, (
-            f"Account wallet via {label}: USD {total - used:.2f} remaining "
+            f"Account wallet{scope}: USD {remaining:.2f} remaining "
             "(shared account credits, shown once; not summed across keys)"
-        )
+        ), AccountBalance(currency="USD", total_balance=_balance_text(remaining))
     except Exception:
-        return False, f"Account credits unavailable via {label} (fetch-error)"
+        return False, _wallet_unavailable(label, "fetch-error", scoped), None
+
+
+def _single_key_windows(windows, label):
+    """Drop the generated per-key prefix when there is only one key."""
+    generated = f"{label} quota"
+    return [
+        QuotaWindow(
+            label="Key quota" if window.label == generated else window.label,
+            used_percent=window.used_percent,
+            reset_at=window.reset_at,
+        )
+        for window in windows
+    ]
+
+
+def _single_key_details(details, label):
+    """Drop the generated credential prefix, never the facts worth showing.
+
+    The label exists to tell several locally configured keys apart. With one
+    key it is noise, but a cap, remaining allowance, reset interval, usage
+    total or failure reason must survive verbatim — dropping the line would
+    make a capped or failing key look like it reported nothing. The "no cap"
+    placeholder is the one exception: with no cap returned there is no cap
+    fact, so it is omitted rather than displayed as an empty key cap.
+    """
+    prefix = f"{label}: "
+    uncapped = f"{label}: no key-specific cap (account wallet still applies)"
+    lines = []
+    for line in details:
+        if line == uncapped:
+            continue
+        if line.startswith(prefix):
+            line = line[len(prefix):]
+            if line[:1].islower():
+                line = line[:1].upper() + line[1:]
+        lines.append(line)
+    return lines
 
 
 @register("openrouter")
@@ -191,22 +260,27 @@ def fetch_openrouter_quota() -> QuotaResult:
         credentials = _resolve_credentials()
         if not credentials:
             return build_unavailable("openrouter", "no-credentials")
-        details = [
+        single = len(credentials) == 1
+        details = [] if single else [
             f"Locally configured credentials: {len(credentials)} (deduplicated); not an inventory of all account keys",
             "Management API key listing not queried; credentials from Hermes native auth and saved pool only",
         ]
         completed = queue.Queue()
         deadline = time.monotonic() + _FETCH_BUDGET_S
 
-        def worker(index, fetcher, label, secret):
-            completed.put((index, fetcher(label, secret)))
+        def worker(index, fetcher, *args):
+            completed.put((index, fetcher(*args)))
 
         # Key failures and wallet failures are independent, including a hung
         # wallet. Daemon workers never mutate returned results or the cache.
         for index, (label, secret) in enumerate(credentials):
             threading.Thread(target=worker, args=(index, _key_result, label, secret), daemon=True).start()
         primary_label, primary_secret = credentials[0]
-        threading.Thread(target=worker, args=(-1, _wallet_result, primary_label, primary_secret), daemon=True).start()
+        threading.Thread(
+            target=worker,
+            args=(-1, _wallet_result, primary_label, primary_secret, not single),
+            daemon=True,
+        ).start()
         results = {}
         while len(results) < len(credentials) + 1:
             try:
@@ -214,16 +288,45 @@ def fetch_openrouter_quota() -> QuotaResult:
             except queue.Empty:
                 break
             results[index] = result
-        has_data, wallet = results.get(-1, (False, f"Account credits unavailable via {primary_label} (timeout)"))
-        details.append(wallet)
-        details.append("Account membership of other keys is unverified; wallet is not a total across accounts")
+        has_data, wallet, balance = results.get(
+            -1,
+            (False, _wallet_unavailable(primary_label, "timeout", not single), None),
+        )
+        account_balances = []
+        if single and balance is not None:
+            # One credential means no second key to scope the wallet against:
+            # show the account money as the card's headline instead of a
+            # technical "via Key N" detail. With several keys the scoped detail
+            # remains the only honest representation.
+            account_balances.append(balance)
+        else:
+            details.append(wallet)
+        if not single:
+            details.append("Account membership of other keys is unverified; wallet is not a total across accounts")
         windows = []
         for index, (label, _) in enumerate(credentials):
             ws, ds = results.get(index, ([], [f"{label}: unavailable (timeout)"]))
-            has_data = has_data or bool(ws) or any(not d.startswith(f"{label}: unavailable (") for d in ds)
+            if single:
+                # A single-key line that is not its own failure marker nor the
+                # omitted "no cap" placeholder is real data.
+                uncapped = f"{label}: no key-specific cap (account wallet still applies)"
+                key_has_data = bool(ws) or any(
+                    not d.startswith(f"{label}: unavailable (") and d != uncapped
+                    for d in ds
+                )
+                ws = _single_key_windows(ws, label)
+                ds = _single_key_details(ds, label)
+            else:
+                # Scoped cards keep every key line, so their data test is
+                # unchanged: any line but that key's own failure marker.
+                key_has_data = bool(ws) or any(
+                    not d.startswith(f"{label}: unavailable (") for d in ds
+                )
+            has_data = has_data or key_has_data
             windows.extend(ws)
             details.extend(ds)
         return QuotaResult(label="openrouter", windows=windows, details=details,
+                           account_balances=account_balances,
                            unavailable_reason=None if has_data else "no-data")
     except Exception:
         return build_unavailable("openrouter", "fetch-error")
