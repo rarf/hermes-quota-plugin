@@ -39,9 +39,18 @@ function renderWidget(options = {}) {
     TEST_CTX: {storage: {get: () => undefined}, os: {openExternal: async url => { openedExternal.push(url); return true; }}, i18n: {register: v => {translations = v.en;}}, register: () => () => {}},
   }));
   vm.runInContext('statusbarModeAtom.set(TEST_STATUS_MODE); disabledProvidersAtom.set(TEST_DISABLED);', Object.assign(context, { TEST_STATUS_MODE: options.statusMode || 'all', TEST_DISABLED: options.disabled || [] }));
+  // Pane style ('rings' default | 'bars'). Swallowed on purpose: the atom can be
+  // absent while the toggle is still landing, and that must not fail every other
+  // widget test. Renderer tests for the style assert on the tree, not this call.
+  vm.runInContext('try { paneStyleAtom.set(TEST_PANE_STYLE); } catch (e) {}', Object.assign(context, { TEST_PANE_STYLE: options.paneStyle || 'rings' }));
+  // Status-bar chip style ('both' default | 'rings' | 'values'). Swallowed for
+  // the same reason: a missing atom must not fail every other widget test.
+  vm.runInContext('try { statusbarStyleAtom.set(TEST_STATUSBAR_STYLE); } catch (e) {}', Object.assign(context, { TEST_STATUSBAR_STYLE: options.statusbarStyle || 'both' }));
   context.PROVIDER = options.provider;
   context.WIDGET_ID = options.id || 'deepseek';
-  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : 'QuotaPane()';
+  // `card` renders the popup a status-bar quota chip opens (QuotaCard), so the
+  // card's own pane-style handling can be asserted without a real click.
+  const expression = options.component === 'status' ? 'StatusBar()' : options.component === 'chip' ? 'ProviderChip({pid:WIDGET_ID,provider:PROVIDER})' : options.component === 'row' ? 'ProviderRow({id:WIDGET_ID,provider:PROVIDER})' : options.component === 'worst' ? 'QuotaChipWithBar()' : options.component === 'card' ? 'QuotaCard({close: () => {}})' : 'QuotaPane()';
   const tree = vm.runInContext(expression, context);
   if (options.clickLinks) {
     const visit = node => {

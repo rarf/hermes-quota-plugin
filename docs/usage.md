@@ -52,6 +52,8 @@ Antigravity (Google AI Pro)
 
 - Compact chip with your **lowest remaining quota**, or every provider side by
   side (`Status bar mode`).
+- `Status bar chip` picks what each chip shows: both the gauge and the number,
+  the gauge only, or the number only.
 - Hover for the full breakdown: **every provider and every window** (Session,
   Spark 5h, Spark Weekly…) with `% left` and time-to-reset.
 
@@ -89,8 +91,10 @@ icon).
 - Detail lines where the API offers them: credits, banked resets, extra limits.
 - Providers without data collapse into a quiet **"No data (n)"** section — the
   default view shows only providers with live numbers.
-- **Pane detail**: `clean` (percentage windows and balance headlines) or `dense`
-  (every window, reset time and detail line). Dense is the default.
+- **Pane detail**: `clean` (the per-window visual with its reset time, no
+  provider detail lines) or `dense` (adds the provider detail lines). The
+  per-window visual — donut gauges or horizontal bars — is chosen by **Pane
+  style**. Dense is the default.
 - Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
   localized with the full date, seconds and timezone. Provider cards scroll
   separately so long balance details cannot overlap the footer.
@@ -104,7 +108,9 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | --- | --- | --- |
 | Status bar mode | `all providers` · `worst only` | `all providers` |
 | Show status bar indicator | on · off (the Hermes status bar must also be visible: ⌘K → Toggle status bar) | on |
-| Pane detail | `clean` — rings with their reset times · `dense` — adds forecasts, history and detail lines | `dense` |
+| Pane detail | `clean` — gauges or bars per window, without the provider detail lines · `dense` — adds the provider detail lines | `dense` |
+| Pane style | `rings` — donut gauges per window · `bars` — horizontal bars per window (the status-bar chip popup follows the same style) | `rings` |
+| Status bar chip | `both` — ring gauge and percentage · `rings` — gauge only · `values` — percentage or balance only | `both` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
 | Enabled providers | toggle any provider on/off (cherry-pick) | all on |

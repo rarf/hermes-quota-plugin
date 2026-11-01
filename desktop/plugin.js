@@ -364,6 +364,34 @@ function setPaneDetail(mode) {
 	setStored(PANE_DETAIL_KEY, mode, paneDetailAtom);
 }
 
+// paneStyle: 'rings' shows the Agent Bar donut gauges per window;
+// 'bars' shows the classic horizontal bar rows.
+const PANE_STYLE_KEY = "paneStyle";
+const PANE_STYLE_DEFAULT = "rings";
+const paneStyleAtom = atom(PANE_STYLE_DEFAULT);
+
+function applyStoredPaneStyle() {
+	applyStored(PANE_STYLE_KEY, paneStyleAtom, ["rings", "bars"], PANE_STYLE_DEFAULT);
+}
+
+function setPaneStyle(mode) {
+	setStored(PANE_STYLE_KEY, mode, paneStyleAtom);
+}
+
+// statusbarStyle: 'both' shows the ring gauge and the percentage/balance on
+// each quota chip; 'rings' shows only the gauge; 'values' only the number.
+const STATUSBAR_STYLE_KEY = "statusbarStyle";
+const STATUSBAR_STYLE_DEFAULT = "both";
+const statusbarStyleAtom = atom(STATUSBAR_STYLE_DEFAULT);
+
+function applyStoredStatusbarStyle() {
+	applyStored(STATUSBAR_STYLE_KEY, statusbarStyleAtom, ["both", "rings", "values"], STATUSBAR_STYLE_DEFAULT);
+}
+
+function setStatusbarStyle(mode) {
+	setStored(STATUSBAR_STYLE_KEY, mode, statusbarStyleAtom);
+}
+
 // refreshInterval: statusbar/pane poll cadence in seconds (persisted as number).
 const REFRESH_INTERVAL_KEY = "refreshInterval";
 const REFRESH_INTERVAL_DEFAULT = 600;
@@ -405,6 +433,8 @@ function applyStoredAll() {
 	applyStoredSurfaceVisibility();
 	applyStoredStatusbarMode();
 	applyStoredPaneDetail();
+	applyStoredPaneStyle();
+	applyStoredStatusbarStyle();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
 	applyStoredMonitor();
@@ -1399,6 +1429,10 @@ function QuotaTip({ label, children }) {
 
 function QuotaChipWithBar() {
 	const { data, isError, isPlaceholderData } = useQuota();
+	// 'rings' keeps the gauge and drops the number; 'values' does the reverse.
+	const style = useValue(statusbarStyleAtom);
+	const showGauge = style !== "values";
+	const showValue = style !== "rings";
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
@@ -1442,10 +1476,24 @@ function QuotaChipWithBar() {
 			"qm-sb-chip inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		style: CHIP_NOWRAP,
 		children: [
-			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }),
+			showGauge ? jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }) : null,
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
-				children: valueText,
+				// 'both' keeps today's single text node; 'rings' and 'values' split
+				// the number into its own span so it can be hidden or tinted.
+				children: style === "both"
+					? valueText
+					: [
+						worstLabel,
+						showValue
+							? jsx("span", {
+								className: "tabular-nums",
+								"data-sb-value": true,
+								style: style === "values" ? { color: toneText(tone) } : undefined,
+								children: " " + (worstProvider?.display_accounts ? codexValue(worst) : fmtPct(worst)),
+							})
+							: null,
+					],
 			}),
 			jsx(ChipAlert, { alert }),
 		],
@@ -1549,6 +1597,10 @@ function codexAccountsTip(provider, special) {
 }
 
 function ProviderChip({ pid, provider, alert = null, special = null }) {
+	// 'rings' keeps the gauge and drops the number; 'values' does the reverse.
+	const style = useValue(statusbarStyleAtom);
+	const showGauge = style !== "values";
+	const showValue = style !== "rings";
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1570,14 +1622,26 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 			style: CHIP_NOWRAP,
 			children: [
 				// A percentage gets Agent Bar's mini ring; balance/availability-only
-				// providers keep the plain dot.
-				r != null
-					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
-					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
+				// providers keep the plain dot. Either one is the gauge slot.
+				...(showGauge
+					? [r != null
+						? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
+						: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot }, "data-sb-dot": true })]
+					: []),
 				jsx("span", { children: label }),
-				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
+				// Without the ring, the value carries the tone colour instead.
+				...(showValue
+					? [jsx("span", {
+						className: "tabular-nums",
+						"data-sb-value": true,
+						style: style === "values"
+							? { ...(staleValue ? { textDecoration: "line-through" } : null), color: toneText(tone) }
+							: staleValue ? { textDecoration: "line-through" } : undefined,
+						children: value,
+					})]
+					: []),
 				// No alert -> no child at all: a plain chip keeps exactly
-				// [dot/ring, name, value].
+				// [dot/ring, name, value] in the default 'both' style.
 				...(alert ? [jsx(ChipAlert, { alert })] : []),
 			],
 		},
@@ -2055,6 +2119,32 @@ function WindowTile({ w, size, resetFormat }) {
 	});
 }
 
+/** One quota window as a bar row: label + % left, the bar, then the reset. */
+function WindowBarRow({ w, resetFormat }) {
+	const t = useQT();
+	const r = remainingPct(w);
+	const tone = toneForRemaining(r);
+	const label = w.label || "window";
+	const reset = w.reset_at ? (resetFormat === "absolute" ? absoluteReset(w.reset_at) : relativeCountdown(w.reset_at)) : "";
+	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
+	return jsxs("div", {
+		"data-window-bar": label,
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
+		style: { ...UI.col, gap: 3 },
+		children: [
+			jsxs("div", {
+				style: { ...UI.row, justifyContent: "space-between", gap: 6 },
+				children: [
+					jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }),
+					jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: toneColor(tone) }, children: r == null ? "—" : `${fmtPct(r)} ${t("left")}` }),
+				],
+			}),
+			jsx(QuotaBar, { value: r, tone }),
+			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+		],
+	});
+}
+
 // One provider card: header (logo, name, health dot, plan pill), a row of ring
 // tiles — one per window — then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
@@ -2064,6 +2154,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	// 'dense' = every window and detail line; 'clean' = just the rings and
 	// their reset times, except OpenRouter's essential key/wallet scope details.
 	const paneDetail = useValue(paneDetailAtom);
+	const paneStyle = useValue(paneStyleAtom);
 	const dense = paneDetail !== "clean";
 	const reason = provider ? provider.unavailable_reason : "no-data";
 	const details = asList(provider && provider.details);
@@ -2172,11 +2263,17 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				? jsx("div", { style: UI.secondary, children: t("apiCallsAvailable", facts.available) })
 				: null,
 			windows.length
-				? jsx("div", {
-						"data-rings": true,
-						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
-					})
+				? paneStyle === "bars"
+					? jsx("div", {
+							"data-bars": true,
+							style: { ...UI.col, gap: 9 },
+							children: windows.map((w, i) => jsx(WindowBarRow, { w, resetFormat }, `${id}-w-${i}`)),
+						})
+					: jsx("div", {
+							"data-rings": true,
+							style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
+							children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
+						})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
 			// the used-% history. Absent without a monitor payload.
@@ -2386,6 +2483,24 @@ function StatusbarModeControl() {
 	});
 }
 
+function StatusbarStyleControl() {
+	const t = useQT();
+	const style = useValue(statusbarStyleAtom);
+	return jsx(SettingRow, {
+		label: t("statusbarStyleLabel"),
+		hint: t("statusbarStyleHint"),
+		children: jsx(SegmentedControl, {
+			value: style,
+			onChange: (v) => setStatusbarStyle(v),
+			options: [
+				{ id: "both", label: t("statusbarStyleBoth") },
+				{ id: "rings", label: t("statusbarStyleRings") },
+				{ id: "values", label: t("statusbarStyleValues") },
+			],
+		}),
+	});
+}
+
 // Cherry-picker: toggle list of providers
 function DisabledProvidersControl() {
 	const t = useQT();
@@ -2442,15 +2557,36 @@ function DisabledProvidersControl() {
 function PaneDetailControl() {
 	const t = useQT();
 	const paneDetail = useValue(paneDetailAtom);
+	const paneStyle = useValue(paneStyleAtom);
+	// 'clean' shows the same windows and reset times in either pane style; the
+	// only visual difference is rings vs bars, so the hint has to name the one
+	// the user actually sees.
+	const cleanHint = paneStyle === "bars" ? t("paneDetailCleanHintBars") : t("paneDetailCleanHint");
 	return jsx(SettingRow, {
 		label: t("paneDetailLabel"),
-		hint: paneDetail === "clean" ? t("paneDetailCleanHint") : t("paneDetailDenseHint"),
+		hint: paneDetail === "clean" ? cleanHint : t("paneDetailDenseHint"),
 		children: jsx(SegmentedControl, {
 			value: paneDetail,
 			onChange: (v) => setPaneDetail(v),
 			options: [
 				{ id: "clean", label: t("paneDetailClean") },
 				{ id: "dense", label: t("paneDetailDense") },
+			],
+		}),
+	});
+}
+
+function PaneStyleControl() {
+	const t = useQT();
+	const paneStyle = useValue(paneStyleAtom);
+	return jsx(SettingRow, {
+		label: t("paneStyleLabel"),
+		children: jsx(SegmentedControl, {
+			value: paneStyle,
+			onChange: (v) => setPaneStyle(v),
+			options: [
+				{ id: "rings", label: t("paneStyleRings") },
+				{ id: "bars", label: t("paneStyleBars") },
 			],
 		}),
 	});
@@ -2468,6 +2604,7 @@ function QuotaSettings() {
 				children: [
 					jsx(ShowStatusBarControl, {}, "show"),
 					jsx(StatusbarModeControl, {}, "mode"),
+					jsx(StatusbarStyleControl, {}, "style"),
 					jsx(QuotaAlertsControl, {}, "quotaAlerts"),
 					jsx(AgentsChipControl, {}, "agents"),
 					jsx(ContextChipControl, {}, "context"),
@@ -2484,6 +2621,7 @@ function QuotaSettings() {
 				children: [
 					jsx(ShowDockedPaneControl, {}, "docked"),
 					jsx(PaneDetailControl, {}, "detail"),
+					jsx(PaneStyleControl, {}, "style"),
 					jsx(ResetFormatControl, {}, "reset"),
 					jsx(RefreshIntervalControl, {}, "interval"),
 				],
@@ -5338,15 +5476,43 @@ function ContextChip() {
 
 // ---- quota card ----
 
+// One window in the quota card the status-bar chips open. The card has no
+// style switch of its own: it follows the persisted "Pane style" setting, so a
+// user who picked bars in the pane gets bars here too (and rings stay the
+// default). Rings are small 32 px gauges and sit side by side; a bar needs the
+// pane's full-width row, so the bars tile is laid out exactly like
+// `WindowBarRow` (label left, "% left" right, bar, reset) in a column.
 function QuotaCardWindow({ w, nowMs }) {
 	const t = useQT();
+	const paneStyle = useValue(paneStyleAtom);
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	const title = [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · ");
+	if (paneStyle === "bars") {
+		return jsxs("div", {
+			"data-card-window": label,
+			// Share the pane's bar marker: this tile is the same window as a bar.
+			"data-window-bar": label,
+			title,
+			style: { ...UI.col, gap: 3 },
+			children: [
+				jsxs("div", {
+					style: { ...UI.row, justifyContent: "space-between", gap: 6 },
+					children: [
+						jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }),
+						jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: toneColor(tone) }, children: r == null ? "—" : `${fmtPct(r)} ${t("left")}` }),
+					],
+				}),
+				jsx(QuotaBar, { value: r, tone }),
+				reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			],
+		});
+	}
 	return jsxs("div", {
 		"data-card-window": label,
-		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		title,
 		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
 		children: [
 			jsx(Ring, {
@@ -5370,6 +5536,7 @@ function QuotaCard({ close }) {
 	noteDataTimeZone(data);
 	const mon = useMonitor();
 	const forecastOn = useValue(quotaForecastAtom);
+	const paneStyle = useValue(paneStyleAtom);
 	const nowMs = useNow(30_000);
 	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
 	const entries = providerEntries(data && data.providers).filter(
@@ -5411,7 +5578,9 @@ function QuotaCard({ close }) {
 								],
 							}),
 							windows.length
-								? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								// Bars need the pane's full-width column, top to bottom;
+								// rings are 32 px gauges and read better side by side.
+								? jsx("div", { style: paneStyle === "bars" ? { ...UI.col, gap: 9 } : { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
 							...forecasts.map(({ w, f }, j) =>
@@ -7052,11 +7221,20 @@ const I18N_EN = {
 	statusbarModeLabel: "Status bar mode",
 	statusbarModeAll: "All providers",
 	statusbarModeWorst: "Worst only",
+	statusbarStyleLabel: "Status bar chip",
+	statusbarStyleBoth: "Both",
+	statusbarStyleRings: "Rings",
+	statusbarStyleValues: "Values",
+	statusbarStyleHint: "What each provider chip shows: the ring gauge, the percentage or balance, or both.",
 	paneDetailLabel: "Pane detail",
 	paneDetailClean: "Clean",
-	paneDetailCleanHint: "Rings and reset times",
+	paneDetailCleanHint: "Gauges, windows and reset times",
+	paneDetailCleanHintBars: "Bars, windows and reset times",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Windows, resets and detail lines",
+	paneStyleLabel: "Pane style",
+	paneStyleRings: "Rings",
+	paneStyleBars: "Bars",
 	showStatusBarLabel: "Show status bar indicator",
 	showStatusBarHint:
 		"The Hermes status bar must also be visible (⌘K → Toggle status bar).",
@@ -7485,11 +7663,20 @@ const I18N_TR = {
 	statusbarModeLabel: "Durum çubuğu",
 	statusbarModeAll: "Tüm sağlayıcılar",
 	statusbarModeWorst: "Yalnız en düşük",
+	statusbarStyleLabel: "Durum çubuğu çipi",
+	statusbarStyleBoth: "İkisi",
+	statusbarStyleRings: "Halkalar",
+	statusbarStyleValues: "Değerler",
+	statusbarStyleHint: "Her sağlayıcı çipinin ne gösterdiği: halka göstergesi, yüzde veya bakiye, ya da ikisi.",
 	paneDetailLabel: "Panel ayrıntısı",
 	paneDetailClean: "Sade",
-	paneDetailCleanHint: "Halkalar ve sıfırlanma zamanları",
+	paneDetailCleanHint: "Göstergeler, pencereler ve sıfırlanma zamanları",
+	paneDetailCleanHintBars: "Çubuklar, pencereler ve sıfırlanma zamanları",
 	paneDetailDense: "Ayrıntılı",
 	paneDetailDenseHint: "Pencereler, sıfırlanmalar ve ayrıntı satırları",
+	paneStyleLabel: "Panel stili",
+	paneStyleRings: "Halkalar",
+	paneStyleBars: "Çubuklar",
 	showStatusBarLabel: "Durum çubuğu göstergesini göster",
 	showStatusBarHint:
 		"Hermes durum çubuğu da görünür olmalı (⌘K → Toggle status bar).",
@@ -7939,11 +8126,20 @@ const I18N_DE = {
 	statusbarModeLabel: "Statusleisten-Modus",
 	statusbarModeAll: "Alle Anbieter",
 	statusbarModeWorst: "Nur der niedrigste",
+	statusbarStyleLabel: "Statusleisten-Chip",
+	statusbarStyleBoth: "Beides",
+	statusbarStyleRings: "Ringe",
+	statusbarStyleValues: "Werte",
+	statusbarStyleHint: "Was jeder Anbieter-Chip zeigt: den Ringmesser, den Prozentwert oder das Guthaben – oder beides.",
 	paneDetailLabel: "Detailgrad",
 	paneDetailClean: "Schlicht",
-	paneDetailCleanHint: "Ringe und Reset-Zeiten",
+	paneDetailCleanHint: "Anzeigen, Fenster und Reset-Zeiten",
+	paneDetailCleanHintBars: "Balken, Fenster und Reset-Zeiten",
 	paneDetailDense: "Ausführlich",
 	paneDetailDenseHint: "Fenster, Resets und Detailzeilen",
+	paneStyleLabel: "Panel-Stil",
+	paneStyleRings: "Ringe",
+	paneStyleBars: "Balken",
 	showStatusBarLabel: "Anzeige in der Statusleiste",
 	showStatusBarHint:
 		"Die Hermes-Statusleiste muss ebenfalls sichtbar sein (⌘K → Toggle status bar).",
@@ -8371,11 +8567,20 @@ const I18N_ES = {
 	statusbarModeLabel: "Modo de la barra de estado",
 	statusbarModeAll: "Todos los proveedores",
 	statusbarModeWorst: "Solo el peor",
+	statusbarStyleLabel: "Chip de la barra de estado",
+	statusbarStyleBoth: "Ambos",
+	statusbarStyleRings: "Anillos",
+	statusbarStyleValues: "Valores",
+	statusbarStyleHint: "Lo que muestra cada chip de proveedor: el medidor de anillo, el porcentaje o el saldo, o ambos.",
 	paneDetailLabel: "Detalle del panel",
 	paneDetailClean: "Limpio",
-	paneDetailCleanHint: "Anillos y horas de reinicio",
+	paneDetailCleanHint: "Indicadores, ventanas y horas de reinicio",
+	paneDetailCleanHintBars: "Barras, ventanas y horas de reinicio",
 	paneDetailDense: "Denso",
 	paneDetailDenseHint: "Ventanas, restablecimientos y líneas de detalle",
+	paneStyleLabel: "Estilo del panel",
+	paneStyleRings: "Anillos",
+	paneStyleBars: "Barras",
 	showStatusBarLabel: "Mostrar indicador en la barra de estado",
 	showStatusBarHint:
 		"La barra de estado de Hermes también debe estar visible (⌘K → Toggle status bar).",
@@ -8803,11 +9008,20 @@ const I18N_FR = {
 	statusbarModeLabel: "Mode de la barre d'état",
 	statusbarModeAll: "Tous les fournisseurs",
 	statusbarModeWorst: "Le plus bas seulement",
+	statusbarStyleLabel: "Puce de la barre d'état",
+	statusbarStyleBoth: "Les deux",
+	statusbarStyleRings: "Anneaux",
+	statusbarStyleValues: "Valeurs",
+	statusbarStyleHint: "Ce que montre chaque puce de fournisseur : la jauge circulaire, le pourcentage ou le solde, ou les deux.",
 	paneDetailLabel: "Détail du panneau",
 	paneDetailClean: "Épuré",
-	paneDetailCleanHint: "Anneaux et heures de réinitialisation",
+	paneDetailCleanHint: "Jauges, fenêtres et heures de réinitialisation",
+	paneDetailCleanHintBars: "Barres, fenêtres et heures de réinitialisation",
 	paneDetailDense: "Dense",
 	paneDetailDenseHint: "Fenêtres, réinitialisations et lignes de détail",
+	paneStyleLabel: "Style du panneau",
+	paneStyleRings: "Anneaux",
+	paneStyleBars: "Barres",
 	showStatusBarLabel: "Afficher l'indicateur dans la barre d'état",
 	showStatusBarHint:
 		"La barre d'état de Hermes doit aussi être visible (⌘K → Toggle status bar).",
@@ -9235,11 +9449,20 @@ const I18N_RU = {
 	statusbarModeLabel: "Режим статус-бара",
 	statusbarModeAll: "Все провайдеры",
 	statusbarModeWorst: "Только худший",
+	statusbarStyleLabel: "Чип строки состояния",
+	statusbarStyleBoth: "Оба",
+	statusbarStyleRings: "Кольца",
+	statusbarStyleValues: "Значения",
+	statusbarStyleHint: "Что показывает каждый чип провайдера: кольцевой индикатор, процент или баланс — или и то, и другое.",
 	paneDetailLabel: "Детализация панели",
 	paneDetailClean: "Просто",
-	paneDetailCleanHint: "Кольца и время сброса",
+	paneDetailCleanHint: "Индикаторы, окна и время сброса",
+	paneDetailCleanHintBars: "Полосы, окна и время сброса",
 	paneDetailDense: "Подробно",
 	paneDetailDenseHint: "Окна, сбросы и строки с деталями",
+	paneStyleLabel: "Стиль панели",
+	paneStyleRings: "Кольца",
+	paneStyleBars: "Полосы",
 	showStatusBarLabel: "Показывать индикатор в статус-баре",
 	showStatusBarHint:
 		"Статус-бар Hermes тоже должен быть виден (⌘K → Toggle status bar).",
@@ -9667,11 +9890,20 @@ const I18N_JA = {
 	statusbarModeLabel: "ステータスバーの表示",
 	statusbarModeAll: "すべてのプロバイダー",
 	statusbarModeWorst: "最も低いものだけ",
+	statusbarStyleLabel: "ステータスバーのチップ",
+	statusbarStyleBoth: "両方",
+	statusbarStyleRings: "リング",
+	statusbarStyleValues: "数値",
+	statusbarStyleHint: "各プロバイダーチップの表示内容: リングゲージ、パーセンテージまたは残高、またはその両方。",
 	paneDetailLabel: "パネルの詳細度",
 	paneDetailClean: "シンプル",
-	paneDetailCleanHint: "リングとリセット時刻",
+	paneDetailCleanHint: "ゲージ、ウィンドウとリセット時刻",
+	paneDetailCleanHintBars: "バー、ウィンドウとリセット時刻",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "ウィンドウ、リセット、詳細行",
+	paneStyleLabel: "パネルのスタイル",
+	paneStyleRings: "リング",
+	paneStyleBars: "バー",
 	showStatusBarLabel: "ステータスバーに表示",
 	showStatusBarHint:
 		"Hermes のステータスバーも表示されている必要があります（⌘K → Toggle status bar）。",
@@ -10099,11 +10331,20 @@ const I18N_ZH = {
 	statusbarModeLabel: "状态栏模式",
 	statusbarModeAll: "全部提供方",
 	statusbarModeWorst: "仅最低的",
+	statusbarStyleLabel: "状态栏标签",
+	statusbarStyleBoth: "两者",
+	statusbarStyleRings: "圆环",
+	statusbarStyleValues: "数值",
+	statusbarStyleHint: "每个提供商标签显示的内容：圆环仪表、百分比或余额，或两者兼有。",
 	paneDetailLabel: "面板详细程度",
 	paneDetailClean: "简洁",
-	paneDetailCleanHint: "圆环和重置时间",
+	paneDetailCleanHint: "仪表、窗口和重置时间",
+	paneDetailCleanHintBars: "条形、窗口和重置时间",
 	paneDetailDense: "详细",
 	paneDetailDenseHint: "窗口、重置时间和详情行",
+	paneStyleLabel: "面板样式",
+	paneStyleRings: "圆环",
+	paneStyleBars: "条形",
 	showStatusBarLabel: "在状态栏中显示",
 	showStatusBarHint:
 		"Hermes 状态栏也需要可见（⌘K → Toggle status bar）。",
@@ -10531,11 +10772,20 @@ const I18N_ZH_HANT = {
 	statusbarModeLabel: "狀態列模式",
 	statusbarModeAll: "全部提供方",
 	statusbarModeWorst: "僅最低的",
+	statusbarStyleLabel: "狀態列標籤",
+	statusbarStyleBoth: "兩者",
+	statusbarStyleRings: "圓環",
+	statusbarStyleValues: "數值",
+	statusbarStyleHint: "每個供應商標籤顯示的內容：圓環儀表、百分比或餘額，或兩者兼有。",
 	paneDetailLabel: "面板詳細程度",
 	paneDetailClean: "簡潔",
-	paneDetailCleanHint: "圓環和重置時間",
+	paneDetailCleanHint: "儀表、視窗和重置時間",
+	paneDetailCleanHintBars: "長條、視窗和重置時間",
 	paneDetailDense: "詳細",
 	paneDetailDenseHint: "視窗、重設時間和詳情行",
+	paneStyleLabel: "面板樣式",
+	paneStyleRings: "圓環",
+	paneStyleBars: "條形",
 	showStatusBarLabel: "在狀態列中顯示",
 	showStatusBarHint:
 		"Hermes 狀態列也需要可見（⌘K → Toggle status bar）。",
@@ -10963,11 +11213,20 @@ const I18N_AR = {
 	statusbarModeLabel: "وضع شريط الحالة",
 	statusbarModeAll: "كل المزوّدين",
 	statusbarModeWorst: "الأدنى فقط",
+	statusbarStyleLabel: "شريحة شريط الحالة",
+	statusbarStyleBoth: "كلاهما",
+	statusbarStyleRings: "الحلقات",
+	statusbarStyleValues: "القيم",
+	statusbarStyleHint: "ما تعرضه كل شريحة مزود: مقياس الحلقة أو النسبة المئوية أو الرصيد، أو كليهما.",
 	paneDetailLabel: "تفاصيل اللوحة",
 	paneDetailClean: "بسيط",
-	paneDetailCleanHint: "الحلقات وأوقات إعادة الضبط",
+	paneDetailCleanHint: "المقاييس والنوافذ وأوقات إعادة الضبط",
+	paneDetailCleanHintBars: "أشرطة ونوافذ وأوقات إعادة الضبط",
 	paneDetailDense: "مفصّل",
 	paneDetailDenseHint: "النوافذ وأوقات الإعادة وأسطر التفاصيل",
+	paneStyleLabel: "نمط اللوحة",
+	paneStyleRings: "حلقات",
+	paneStyleBars: "أشرطة",
 	showStatusBarLabel: "إظهار المؤشر في شريط الحالة",
 	showStatusBarHint:
 		"يجب أن يكون شريط حالة Hermes ظاهرًا أيضًا (⌘K ثم Toggle status bar).",
