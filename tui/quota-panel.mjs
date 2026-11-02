@@ -16,7 +16,7 @@ export const PROVIDER_NAMES = {
   gemini: 'Google Gemini', kimi: 'Kimi / Moonshot', grok: 'xAI Grok',
   'opencode-go': 'OpenCode Go', copilot: 'Copilot', zai: 'Z.ai',
   commandcode: 'CommandCode', cursor: 'Cursor', antigravity: 'Antigravity',
-  minimax: 'MiniMax', ollama: 'Ollama',
+  minimax: 'MiniMax', ollama: 'Ollama', 'nano-gpt': 'NanoGPT',
 };
 
 function friendlyName(id, record, account) {

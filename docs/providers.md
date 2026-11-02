@@ -11,6 +11,7 @@
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
+| `nano-gpt` | `NANOGPT_API_KEY` via Hermes profile-aware credential lookup | Weekly/daily token and daily image quotas when configured, provider reset times, and separate prepaid USD balance |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
@@ -93,6 +94,34 @@ wrapper is unwrapped before parse), or Linux's
 with Antigravity's installed-app OAuth client identity, then calls Google's
 quota service using the spoofed `User-Agent: antigravity/2.8.0 windows/amd64`.
 Credential stores are read-only; refreshed tokens stay in memory.
+
+### NanoGPT
+
+Set `NANOGPT_API_KEY` through Hermes. The fetcher uses Hermes' profile-aware
+lookup; a separate NanoGPT model-provider plugin is not required. It reads
+[`GET /api/v1/subscription/usage`](https://docs.nano-gpt.com/api-reference/endpoint/subscription-usage)
+and [`POST /api/check-balance`](https://docs.nano-gpt.com/api-reference/endpoint/check-balance)
+at `https://api.nano-gpt.com`. No inference calls are made.
+
+The card shows configured daily/weekly input-token, daily image and trial quotas with
+their returned reset times. The reported `percentUsed` is a fraction and may
+exceed one. If that fraction is unavailable, the fetcher calculates usage from
+the reported count and allowance, or from `used + remaining` when that sum is
+positive. Negative `remaining` values do not turn exhausted quota into a full
+allowance. The cache preserves usage above 100%; the display shows zero remaining.
+Degraded counters display as unknown. A null quota or limit is not applicable.
+No plan name is inferred.
+
+The USD balance is separate from subscription quota. A zero balance does not
+mean included tokens are exhausted, and a paid-only account can show its balance
+without subscription windows. A failed balance request keeps valid quota windows.
+The plugin does not predict billing from `allowOverage` or infer PAYG spending
+from subscription usage above 100%. Credentials, subscription IDs and deposit
+addresses never enter display data.
+
+NanoGPT recommends a [usage-only management token](https://docs.nano-gpt.com/api-reference/management-api)
+for quota-only monitoring. This integration uses the inference API key because
+it also reads the cash balance; it does not support management-token credentials.
 
 ### DeepSeek
 

@@ -32,6 +32,7 @@ from . import deepseek  # noqa: F401
 from . import experientiallabs  # noqa: F401
 from . import minimax  # noqa: F401
 from . import ollama  # noqa: F401
+from . import nanogpt  # noqa: F401
 
 __all__ = [
     "PROVIDER_FETCHERS",
