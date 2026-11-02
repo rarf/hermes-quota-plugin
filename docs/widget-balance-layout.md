@@ -1,7 +1,9 @@
 # Balance widget and footer regression tests
 
 The pane has one bounded scroll region for provider cards and notices. The header
-and checked-time footer do not shrink. Card sizing and overflow rules are inline
+and checked-time footer do not shrink in the standard pane; the monitor compact
+layout (see `usage.md`) hides the summary row and footer on a very short pane
+instead of squeezing the cards. Card sizing and overflow rules are inline
 because plugin-only Tailwind classes may not exist in the host's compiled CSS.
 
 ## Offline rendering
