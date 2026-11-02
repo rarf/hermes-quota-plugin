@@ -93,7 +93,108 @@ icon).
   (every window, reset time and detail line). Dense is the default.
 - Footer: `Checked Jan 15, 2025, 12:34:56 PM UTC · 46s old · poll 60s`,
   localized with the full date, seconds and timezone. Provider cards scroll
-  separately so long balance details cannot overlap the footer.
+  separately so long balance details cannot overlap the footer. With the
+  Agent monitor on and a pane under 300px tall, the footer and the monitor
+  summary row (the agent/quota/spend pills) are hidden so the card bands keep
+  their space; both return when the pane is taller.
+- **Card layout**: the pencil icon at the top right of the Quota pane opens
+  edit mode. With a mouse or pen, every card can be dragged by its body — the
+  dotted handle is only a visual cue — while the pin toggle, up/down arrows and
+  account buttons stay ordinary click targets. Touch drags scroll the pane;
+  on a touch screen, use the pin toggle and the arrows instead. Drag a card
+  onto another to insert it there. Hold a dragged card near the top or bottom
+  of its band (or use the mouse wheel) to scroll that band, so cards beyond
+  the fold stay reachable; the pinned shelf and the unpinned list scroll
+  independently. Pinned cards
+  move to an opaque sticky band above the scrolling list — marked by a small
+  pin icon in each card's header, next to its plan label, in the normal view —
+  and stay visible while you scroll. Each band has its own native scrollbar,
+  confined to that band: the pinned bar sits inside the shelf (clear of the
+  resize edge), and the unpinned bar starts below the shelf. Both reserve the
+  same gutter, so pinned and unpinned cards keep identical widths and edges
+  even when only one band overflows. The band paints the pane's own surface,
+  so pinned cards keep the list's width and edges instead of looking like a
+  separate section.
+  Pinned and unpinned cards reorder independently. A pin/unpin cycle leaves
+  the unpinned band as it was, whatever order the cards are pinned and
+  unpinned in, and a hand move made while cards are pinned gives the same
+  final band whichever pin is released first. The arrows remain the keyboard
+  path and keep focus at a band edge; a grouped account keeps its selected
+  login across edit mode and pin moves. A-Z / Z-A sorts only the unpinned
+  band, and the chosen direction is remembered: unpinning a card later places
+  it in that sort even if a provider appeared in the meantime. Reordering the
+  band by hand returns it to a custom order.
+  The pinned band's height is resizable: drag its bottom edge, or focus the
+  edge and use ↑/↓ (Shift for larger steps, Home/End for the limits). The edge
+  accepts touch, pen and mouse; a 16px hit strip with a short visible grip
+  appears on hover or focus without adding a frame, border or gap, so the band
+  keeps the list's width and edges.
+  Until you choose a height, the band grows with the pins: it follows through
+  the bottom of the last pinned card plus the resize strip below it, and stops
+  at half the plugin window, whichever comes first — pinning a card never
+  requires a manual resize. A deliberate smaller height is remembered (and
+  re-clamped) as your preference across pin-set and pane changes, while
+  dragging back to the ceiling restores the automatic fit; a click that does
+  not actually move the edge leaves the preference untouched.
+  Double-click the edge to snap the band to a pinned card's bottom border:
+  the midpoint of the card under the edge is the tipping point, so the card's
+  upper half snaps to the previous card's bottom and its lower half snaps to
+  its own bottom. The snap uses the card positions in the scrolled shelf, and
+  the first-card floor and half-window ceiling still clamp it; when the
+  ceiling cuts through the last card, the cap wins.
+  The lower limit keeps the first pinned card fully visible above the resize
+  strip (the strip's overlapping 8px is included), and the upper limit is the
+  smaller of the last pinned card's bottom plus that strip and half the plugin
+  window (the band's padding is included, so its outer box never exceeds half
+  the window). The handle therefore sits below the card border at either limit
+  instead of painting over it. It is also never taller than the visible card
+  viewport. The chosen height is remembered and re-clamped when the pane,
+  window or pin set changes; it does not disappear when a narrower pane
+  temporarily forces a smaller value. A mixed pane prefers a 72px unpinned-list
+  slice; in a very short pane it keeps a usable pinned slice (about 40px, enough
+  for the first card's header) and shrinks the list to its own minimum, splitting
+  the remaining height when even those two minima cannot both fit. Neither band
+  is allowed to collapse to zero while the other takes a fixed budget. These
+  minima apply to the card region itself. With the Agent monitor on, a pane under
+  300px tall switches to a compact layout: the summary row and footer are
+  hidden and the monitor tabs stay on one horizontally scrollable row, so a
+  180px edit pane still leaves both bands a readable, scrollable slice. If even
+  that compact chrome leaves less than the two minima, both bands split what
+  remains proportionally instead of one taking a fixed budget.
+  If one pinned card is taller than half the window (or than a very short pane
+  can show together with the list and the strip), that geometry is impossible:
+  the cap wins, the resize handle reports itself unavailable, and the card
+  scrolls inside the shelf instead of the band taking over the pane. With only
+  one pinned card the floor and ceiling coincide, so there is no range and the
+  handle reports that the cards already fit. Several pinned cards that all fit
+  under the cap still leave a range: at the automatic height the band opens at
+  the full fit and can be dragged up to the first card's bottom. "Already fits"
+  therefore means a collapsed one-card range, not merely that the pins fit.
+  With no pins there is no shelf or handle; with every card pinned the same
+  half-window cap applies.
+  A wheel gesture anywhere in the pinned band belongs to that band: it
+  scrolls the pinned cards while they have room and is consumed at the top
+  and bottom instead of chaining into the unpinned list. Move the pointer
+  below the band to scroll the list; while the shelf itself scrolls, a small
+  chevron above or below the cards points to the ones outside the fold.
+- **Sorting and reset**: while editing, a toolbar under the header sorts the
+  unpinned cards A–Z or Z–A. Either sort asks first, warning that the custom
+  unpinned order will be replaced; cancelling changes nothing. Pinned cards,
+  their membership and their order are never touched by a sort. The reset
+  button also asks first, then clears every pin and the custom card order, so
+  both bands return to the default layout. Both bands remember their order
+  across restarts, and unpinning returns a card to its recorded place: between
+  the same neighbours when both are still visible in that order, even when the
+  card already holds a stored rank that a later move has made stale; at its
+  stored rank when they no longer bracket it; at its alphabetical rank when
+  the list is currently sorted; and to the older numeric slot for layouts
+  saved by a previous build. Cards pinned around a card that then moves keep
+  their pin-time order whichever pin is released first. Pinning remembers only
+  that place, not a copy of the list order: with no custom order,
+  providers discovered while a card is pinned keep their payload place, and a
+  pin followed by its unpin leaves Reset inert. This is
+  desktop-client-local (stored with the pane's other preferences, not in the
+  gateway quota cache), and it does not change the status bar or CLI order.
 - A **version-skew** notice when the backend reports a different plugin version.
 
 ### Settings

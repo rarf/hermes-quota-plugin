@@ -281,6 +281,196 @@ function setDisabledProviders(list) {
 	setStored(DISABLED_PROVIDERS_KEY, list, disabledProvidersAtom);
 }
 
+// Card layout: pinned provider groups plus an independent order per band.
+// Stored by the group's base provider id, so a multi-account pool stays one
+// card and a lone account keeps the same identity when a sibling appears.
+// Client-local like disabledProviders. Ids that are not in the current payload
+// (disabled or temporarily missing providers) are kept on purpose: restoring
+// the provider restores its place.
+const CARD_LAYOUT_KEY = "cardLayout";
+const CARD_LAYOUT_DEFAULT = { pinned: [], order: [] };
+const cardLayoutAtom = atom(CARD_LAYOUT_DEFAULT);
+
+// User-chosen height of the pinned shelf's scrollport, in CSS pixels. It is
+// only a preference: the rendered height is clamped to the measured range
+// (first pinned card + resize strip … half the plugin window), so a value
+// saved on a wide pane cannot make the shelf overflow a narrow one. `null`
+// means "fit the pinned cards up to that maximum" — the shelf grows naturally
+// as pins are added. Choosing the ceiling is stored as `null` for the same
+// reason.
+const PINNED_SHELF_HEIGHT_KEY = "pinnedShelfHeight";
+const pinnedShelfHeightAtom = atom(null);
+
+function cleanPinnedShelfHeight(value) {
+	const n = typeof value === "number" ? value : Number(value);
+	if (!Number.isFinite(n) || n <= 0) return null;
+	return Math.round(Math.min(4000, n));
+}
+
+function applyStoredPinnedShelfHeight() {
+	let value = null;
+	try {
+		value = CTX.storage.get(PINNED_SHELF_HEIGHT_KEY);
+	} catch {
+		value = null;
+	}
+	pinnedShelfHeightAtom.set(cleanPinnedShelfHeight(value));
+}
+
+function setPinnedShelfHeight(value) {
+	const clean = cleanPinnedShelfHeight(value);
+	// In-memory first, like the card layout: a failed storage write must not
+	// snap the shelf back while the user is looking at it.
+	pinnedShelfHeightAtom.set(clean);
+	try {
+		// `null` means automatic: remove the key instead of persisting a null
+		// sentinel, so an absent preference and a cleared one behave the same.
+		if (clean == null) CTX.storage.remove(PINNED_SHELF_HEIGHT_KEY);
+		else CTX.storage.set(PINNED_SHELF_HEIGHT_KEY, clean);
+	} catch {
+		/* noop */
+	}
+}
+
+// The sort/reset confirmation lives outside QuotaPane on purpose. As pane
+// state it rebuilt every card (the pane's whole JSX tree) just to open or
+// dismiss a dialog; the card list has no dependency on the question, so the
+// prompt is a module atom read by CardLayoutConfirm alone. `layout` is the
+// exact card layout the confirm applies: compute it when the question opens,
+// not when it is answered.
+const cardLayoutPromptAtom = atom(null);
+// Several quota surfaces can be mounted at once (route page + docked pane).
+// The prompt names the pane that opened it so the other instance renders no
+// dialog; the shared atom still keeps opening/cancelling out of the card tree.
+let _cardLayoutPaneSeq = 0;
+function setCardLayoutPrompt(prompt) {
+	cardLayoutPromptAtom.set(prompt || null);
+}
+
+// Selected account inside a grouped card, keyed by base provider and stored
+// as the provider id (<base>:<account>), not an index: a backend refresh may
+// reorder the account rows, and an index would then point at a different
+// login. It lives outside the card on purpose: entering edit mode replaces
+// the card with a drag shell, and pinning moves it between the shelf and the
+// list, so a local useState would jump back to the first account on remount.
+const cardAccountAtom = atom({});
+function setCardAccount(base, providerId) {
+	cardAccountAtom.set({ ...cardAccountAtom.get(), [base]: providerId });
+}
+
+// Implicit account shown before the user picks one, keyed by base provider.
+// Module scope, not a per-card useRef: entering edit mode or pinning rebuilds
+// the group component, and a fresh ref would re-read `entries[0]` — flipping
+// the card to whichever login the backend happened to list first after a
+// reorder. An explicit selection still lives in cardAccountAtom and wins.
+const implicitCardAccount = new Map();
+
+function cleanCardProviderId(value) {
+	const text = typeof value === "string" ? value.trim() : "";
+	return text ? baseProviderId(text) : "";
+}
+
+function cleanCardProviderIds(value) {
+	const out = [];
+	for (const item of asList(value)) {
+		const id = cleanCardProviderId(item);
+		if (id && !out.includes(id)) out.push(id);
+	}
+	return out;
+}
+
+// A pin remembers the card it sat next to in the unpinned band, not just an
+// index: a sort or a provider appearing/disappearing changes every index
+// after it, while the neighbour identities stay valid. `prev`/`next` are
+// optional on their own; at least one is required for the entry to mean
+// anything. Anchors are group base ids, so a pool account change cannot
+// invalidate them.
+function cleanPinAnchor(value, self) {
+	const id = cleanCardProviderId(value);
+	return id && id !== self ? id : "";
+}
+
+function sanitizePinAnchors(value, pinned) {
+	const raw =
+		value && typeof value === "object" && !Array.isArray(value) ? value : null;
+	if (!raw || !Array.isArray(pinned) || pinned.length === 0) return null;
+	const anchors = {};
+	for (const key of Object.keys(raw)) {
+		const id = cleanCardProviderId(key);
+		if (!id || !pinned.includes(id) || id in anchors) continue;
+		const entry = raw[key];
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const prev = cleanPinAnchor(entry.prev, id);
+		const next = cleanPinAnchor(entry.next, id);
+		if (!prev && !next) continue;
+		anchors[id] = { prev: prev || null, next: next || null };
+	}
+	return Object.keys(anchors).length > 0 ? anchors : null;
+}
+
+function sanitizeCardLayout(value) {
+	const source =
+		value && typeof value === "object" && !Array.isArray(value) ? value : {};
+	const pinned = cleanCardProviderIds(source.pinned);
+	const clean = {
+		pinned,
+		// A pinned card's old unpinned slot stays here: unpinning puts it back.
+		order: cleanCardProviderIds(source.order),
+	};
+	// The last explicit A-Z / Z-A sort of the unpinned band. This is the only
+	// evidence that the band is sorted: a custom order can look alphabetical
+	// by coincidence, and a provider appearing while the band is sorted makes
+	// the rendered order non-monotonic. Inferring the sort from the visible
+	// subset therefore put unpinned cards at the wrong end in both cases.
+	if (source.sort === "asc" || source.sort === "desc") clean.sort = source.sort;
+	// A pin records the index the card held in the unpinned band as a legacy
+	// fallback, plus its neighbours as the primary position. The index alone
+	// goes stale as soon as a sort moves the band or a provider is inserted or
+	// removed; the neighbours still describe where the card belonged. Slots
+	// only mean something while their card is pinned, so stale entries are
+	// dropped rather than resurrected after an unpin. The value must be a real
+	// number: `null`, `false`, `""` and `[]` all coerce to 0, which would put
+	// a corrupt entry at the top of the list instead of ignoring it.
+	const slots = {};
+	const rawSlots = source.pinSlots;
+	if (rawSlots && typeof rawSlots === "object" && !Array.isArray(rawSlots)) {
+		for (const key of Object.keys(rawSlots)) {
+			const id = cleanCardProviderId(key);
+			if (!id || !pinned.includes(id) || id in slots) continue;
+			const rawSlot = rawSlots[key];
+			if (typeof rawSlot !== "number" || !Number.isFinite(rawSlot)) continue;
+			const index = Math.floor(rawSlot);
+			if (index < 0 || index > 10000) continue;
+			slots[id] = index;
+		}
+	}
+	if (Object.keys(slots).length > 0) clean.pinSlots = slots;
+	const anchors = sanitizePinAnchors(source.pinAnchors, pinned);
+	if (anchors) clean.pinAnchors = anchors;
+	return clean;
+}
+
+function applyStoredCardLayout() {
+	let value = null;
+	try {
+		value = CTX.storage.get(CARD_LAYOUT_KEY);
+	} catch {
+		value = null;
+	}
+	cardLayoutAtom.set(sanitizeCardLayout(value));
+}
+
+function setCardLayout(layout) {
+	const clean = sanitizeCardLayout(layout);
+	// In-memory first: a failed storage write must not swallow the user's click.
+	cardLayoutAtom.set(clean);
+	try {
+		CTX.storage.set(CARD_LAYOUT_KEY, clean);
+	} catch {
+		/* noop */
+	}
+}
+
 function isProviderEnabled(pid) {
 	const disabled = disabledProvidersAtom.get();
 	return !disabled.includes(pid);
@@ -407,6 +597,8 @@ function applyStoredAll() {
 	applyStoredPaneDetail();
 	applyStoredRefreshInterval();
 	applyStoredDisabledProviders();
+	applyStoredCardLayout();
+	applyStoredPinnedShelfHeight();
 	applyStoredMonitor();
 }
 
@@ -544,6 +736,539 @@ function baseProviderId(pid) {
 	const text = String(pid || "");
 	const colon = text.indexOf(":");
 	return colon > 0 ? text.slice(0, colon) : text;
+}
+
+// Merge every currently visible id into a stored order that may also hold
+// entries for providers that are disabled or absent right now. New ids are
+// inserted next to their nearest visible neighbour, so an evolving payload
+// keeps a stable default order without dropping preferences for missing rows.
+function mergeVisibleCardOrder(order, visibleIds) {
+	const next = cleanCardProviderIds(order);
+	const seen = cleanCardProviderIds(visibleIds);
+	for (let index = 0; index < seen.length; index += 1) {
+		const id = seen[index];
+		if (next.includes(id)) continue;
+		let at = -1;
+		for (let i = index - 1; i >= 0; i -= 1) {
+			const found = next.indexOf(seen[i]);
+			if (found >= 0) {
+				at = found + 1;
+				break;
+			}
+		}
+		if (at < 0) {
+			for (let i = index + 1; i < seen.length; i += 1) {
+				const found = next.indexOf(seen[i]);
+				if (found >= 0) {
+					at = found;
+					break;
+				}
+			}
+		}
+		if (at < 0) at = next.length;
+		next.splice(at, 0, id);
+	}
+	return next;
+}
+
+// The stored order an unpinned-band move starts from. A pin no longer copies
+// the payload order into `order`, so a move from an empty (or partial) layout
+// would otherwise leave the pinned cards without any rank; unpinning them then
+// fell back to anchors/slots that the move had invalidated, and the final band
+// depended on which pin was released first. Materialising every drawn card
+// that has a restore record keeps those ranks inside the array the move
+// rewrites. A legacy pin with no rank, anchors or slot has no restore position
+// to protect: inventing one would make a move on the unpinned band rewrite the
+// pinned order.
+//
+// A sorted band is seeded from the sort's own sequence while cards are pinned:
+// `order` still holds the pre-sort ranks, and mapping the moved band into those
+// slots left the hidden pins at ranks that disagreed with the sort (an unpin
+// then restored them past an unrelated card). With no pins the caller keeps
+// the old mapping so hidden ranks stay in their array positions for when the
+// sort is cleared.
+function seedUnpinnedMoveOrder(layout, storedOrder, fullBandIds) {
+	const clean = sanitizeCardLayout(layout);
+	const pinned = new Set(clean.pinned);
+	const recorded = new Set([
+		...clean.order,
+		...Object.keys(clean.pinAnchors || {}),
+		...Object.keys(clean.pinSlots || {}),
+	]);
+	const ids = cleanCardProviderIds(fullBandIds).filter(
+		(id) => !pinned.has(id) || recorded.has(id),
+	);
+	// Under a sort the drawn sequence is the sorted one, so replace the full
+	// band's slots with that sequence. Hidden/disabled ranks outside the band
+	// keep their array positions, exactly like a plain sorted move.
+	if (clean.sort && clean.pinned.length > 0) {
+		return sortVisibleCardOrder(storedOrder, ids, ids);
+	}
+	return mergeVisibleCardOrder(storedOrder, ids);
+}
+
+// Move one card to its adjacent slot inside its own band. `visibleIds` is the
+// band as drawn, while `order` may include missing providers: merging first
+// keeps those entries (and their places) intact.
+//
+// An unavailable move returns `order` untouched instead of the merged layout.
+// The edge arrows are aria-disabled, not disabled, so a click still reaches
+// this helper; returning the merge there made a no-op click materialise an
+// order (and light up Reset) even though no card moved.
+function moveCardInBand(order, visibleIds, id, delta) {
+	const merged = mergeVisibleCardOrder(order, visibleIds);
+	const seen = cleanCardProviderIds(visibleIds);
+	const from = seen.indexOf(id);
+	const to = from + (Number(delta) < 0 ? -1 : 1);
+	if (from < 0 || to < 0 || to >= seen.length) return order;
+	const other = seen[to];
+	const a = merged.indexOf(id);
+	const b = merged.indexOf(other);
+	if (a < 0 || b < 0) return order;
+	const next = merged.slice();
+	next[a] = other;
+	next[b] = id;
+	return next;
+}
+
+// Drag inserts a card at the slot it was dropped on, inside its own band.
+// Remove the source first, then look the target up again: a card dragged
+// forward shifts every slot behind it, so a pre-removal index would land one
+// place too far. Missing providers keep the rank mergeVisibleCardOrder gave
+// them, exactly like an arrow move.
+function moveCardToSlot(order, visibleIds, id, targetId, before) {
+	const merged = mergeVisibleCardOrder(order, visibleIds);
+	if (id === targetId) return merged;
+	const seen = cleanCardProviderIds(visibleIds);
+	if (!seen.includes(id) || !seen.includes(targetId)) return merged;
+	const next = merged.slice();
+	const from = next.indexOf(id);
+	if (from < 0) return merged;
+	next.splice(from, 1);
+	let at = next.indexOf(targetId);
+	if (at < 0) return merged;
+	if (!before) at += 1;
+	next.splice(at, 0, id);
+	return next;
+}
+
+// The band a drag would produce, or null when the drop changes nothing.
+// The sequence is computed from the drawn ids, so the caller never derives a
+// destination from stored indices: a persisted sort can leave `order` in a
+// different sequence, and a no-op drop must not count as a custom order (or
+// clear the sort direction).
+function draggedCardBand(visibleIds, id, targetId, before) {
+	const seen = cleanCardProviderIds(visibleIds);
+	if (id === targetId || !seen.includes(id) || !seen.includes(targetId)) {
+		return null;
+	}
+	const moved = seen.filter((entry) => entry !== id);
+	let at = moved.indexOf(targetId);
+	if (at < 0) return null;
+	if (!before) at += 1;
+	moved.splice(at, 0, id);
+	if (moved.every((entry, index) => entry === seen[index])) return null;
+	return moved;
+}
+
+// Write a band that is already in its new drawn order into the stored order.
+// Moves normally operate on the stored array, whose visible subsequence is the
+// drawn band. An explicit A-Z / Z-A sort breaks that premise: the band is
+// alphabetical while `order` still holds the pre-sort sequence (including a
+// disabled provider's rank). Swapping stored positions there moved an unrelated
+// card to the front when the sort was cleared. This maps the sequence the user
+// saw into the stored slots instead, so the new custom order begins with the
+// band that was on screen and hidden ranks keep their array positions.
+function reorderVisibleCardOrder(order, visibleIds, movedIds) {
+	const clean = cleanCardProviderIds(order);
+	const visible = cleanCardProviderIds(visibleIds);
+	const moved = cleanCardProviderIds(movedIds);
+	if (moved.length !== visible.length) return clean;
+	const wanted = new Set(moved);
+	if (visible.some((id) => !wanted.has(id))) return clean;
+	if (visible.every((id, index) => id === moved[index])) return clean;
+	return sortVisibleCardOrder(clean, visible, moved);
+}
+
+// Insertion line drawn on the card a drag is hovering. A 4px inset edge plus
+// an accent ring around the target card: the old 2px line disappeared into
+// the card border on a 300px pane, while the ring makes the destination
+// obvious without moving the cards mid-drag (which would make dragover
+// targets jump under the pointer).
+function cardDropLine(before) {
+	return `inset 0 ${before ? 4 : -4}px 0 0 var(--ui-accent), 0 0 0 2px color-mix(in srgb, var(--ui-accent) 45%, transparent)`;
+}
+
+// Name a card group is sorted by: the base provider's name for a grouped
+// multi-account card, otherwise the single row's own display name.
+function cardGroupDisplayName(group) {
+	if (!group || !Array.isArray(group.entries) || group.entries.length === 0) return "";
+	return group.entries.length >= 2
+		? providerMeta(group.base).name
+		: providerDisplayName(group.entries[0][0], group.entries[0][1]);
+}
+
+// The order the A-Z / Z-A tools produce: locale collation, then the stable
+// base id as a tie-break. Shared by the sort action, unpinning and the
+// sorted render so all three write/show exactly the same sequence.
+function sortedCardGroupIds(bandGroups, direction) {
+	const groups = asList(bandGroups).filter(
+		(group) => group && typeof group.base === "string",
+	);
+	let collator = null;
+	try {
+		collator = new Intl.Collator(intlTag(), { numeric: true, sensitivity: "base" });
+	} catch {
+		collator = null;
+	}
+	const sign = direction === "desc" ? -1 : 1;
+	return groups
+		.slice()
+		.sort((left, right) => {
+			const leftName = cardGroupDisplayName(left);
+			const rightName = cardGroupDisplayName(right);
+			const byName = collator
+				? collator.compare(leftName || "", rightName || "")
+				: (leftName || "") < (rightName || "")
+					? -1
+					: (leftName || "") > (rightName || "")
+						? 1
+						: 0;
+			const byId =
+				left.base < right.base ? -1 : left.base > right.base ? 1 : 0;
+			return (byName || byId) * sign;
+		})
+		.map((group) => group.base);
+}
+
+// Apply an alphabetical order to the visible cards of one band while leaving
+// the slots of disabled/absent providers exactly where they were: restoring a
+// provider later keeps its old place. `sortedIds` is the order the caller wants
+// the visible cards to occupy.
+function sortVisibleCardOrder(order, visibleIds, sortedIds) {
+	const merged = mergeVisibleCardOrder(order, visibleIds);
+	const visible = cleanCardProviderIds(visibleIds);
+	const wanted = cleanCardProviderIds(sortedIds).filter((id) => visible.includes(id));
+	if (wanted.length !== visible.length) return merged;
+	let at = 0;
+	return merged.map((id) => (visible.includes(id) ? wanted[at++] : id));
+}
+
+// The position a stored neighbour pair resolves to in today's visible band,
+// or null when the pair no longer names a usable interval. A pair whose
+// providers are both gone is not this helper's business: the caller falls
+// back to the canonical band or the legacy slot. A pair that is still visible
+// but now points backwards has no stable between-position either.
+function pinnedAnchorRestoreIndex(visibleIds, key, anchors) {
+	const visible = cleanCardProviderIds(visibleIds).filter(
+		(entry) => entry !== key,
+	);
+	if (!anchors || typeof anchors !== "object") return null;
+	const prev = cleanPinAnchor(anchors.prev, key);
+	const next = cleanPinAnchor(anchors.next, key);
+	const prevAt = prev ? visible.indexOf(prev) : -1;
+	const nextAt = next ? visible.indexOf(next) : -1;
+	// Both anchors must still describe a forward interval. A band that
+	// was reversed (or a stale pair that now points backwards) has no
+	// stable between-position.
+	if (prevAt >= 0 && nextAt >= 0 && prevAt <= nextAt) return prevAt + 1;
+	if (prevAt >= 0 && nextAt < 0) return prevAt + 1;
+	if (nextAt >= 0 && prevAt < 0) return nextAt;
+	return null;
+}
+
+// Resolve where a returning card belongs among today's visible ids: the
+// neighbour anchors win when they still describe a forward interval; a band
+// that was reversed, or anchors whose providers are gone, falls back to the
+// legacy numeric slot. Shared with the virtual band used while pinning.
+function pinnedRestoreIndex(visibleIds, key, slot, anchors) {
+	const anchored = pinnedAnchorRestoreIndex(visibleIds, key, anchors);
+	if (anchored != null) return anchored;
+	const visible = cleanCardProviderIds(visibleIds).filter(
+		(entry) => entry !== key,
+	);
+	const raw =
+		typeof slot === "number" && Number.isFinite(slot) ? Math.floor(slot) : 0;
+	return Math.max(0, Math.min(visible.length, raw));
+}
+
+// Return a formerly pinned card to the slot it held when it was pinned.
+// `anchors` is the primary position; `slot` is the legacy numeric fallback
+// for older stored layouts or anchors whose providers are all gone.
+// `visibleIds` is the band as it is drawn now. The stored `order` may rank
+// providers that are currently missing or disabled: replacing only the visible
+// slots keeps those ranks exactly where they were. An empty order is the
+// payload's own order, so there is no preference to restore and the card keeps
+// its natural place (which also keeps Reset inert).
+function insertPinnedCardSlot(order, visibleIds, id, slot, anchors) {
+	const clean = cleanCardProviderIds(order);
+	const key = cleanCardProviderId(id);
+	if (!key || clean.includes(key)) return clean;
+	if (clean.length === 0) return clean;
+	const visible = cleanCardProviderIds(visibleIds).filter(
+		(entry) => entry !== key,
+	);
+	const index = pinnedRestoreIndex(visible, key, slot, anchors);
+	const target = visible.slice();
+	target.splice(index, 0, key);
+	return sortVisibleCardOrder(clean, target, target);
+}
+
+// Merge new visible ids into a stored order without stepping over a card that
+// is still pinned. Its rank is the only record of where it must return when it
+// is unpinned; inserting a sibling on the other side of that entry silently
+// rewrote the rank, and the next unpin put the pinned card at the wrong end.
+function mergeCardOrderHolding(order, ids, heldIds) {
+	const next = cleanCardProviderIds(order);
+	const seen = cleanCardProviderIds(ids);
+	const held = new Set(cleanCardProviderIds(heldIds));
+	for (let index = 0; index < seen.length; index += 1) {
+		const id = seen[index];
+		if (next.includes(id)) continue;
+		let at = -1;
+		for (let i = index - 1; i >= 0; i -= 1) {
+			const found = next.indexOf(seen[i]);
+			if (found >= 0) {
+				at = found + 1;
+				break;
+			}
+		}
+		if (at < 0) {
+			for (let i = index + 1; i < seen.length; i += 1) {
+				const found = next.indexOf(seen[i]);
+				if (found >= 0) {
+					at = found;
+					break;
+				}
+			}
+		}
+		if (at < 0) at = next.length;
+		while (at < next.length && held.has(next[at])) at += 1;
+		next.splice(at, 0, id);
+	}
+	return next;
+}
+
+// Replace only the slots occupied by visible ids, in drawn order. Missing or
+// disabled providers keep their array positions, so restoring a provider much
+// later still finds the rank the user left for it.
+function replaceVisibleCardSlots(merged, visibleIds) {
+	const wanted = cleanCardProviderIds(visibleIds);
+	const inBand = new Set(wanted);
+	const out = [];
+	let at = 0;
+	for (const id of merged) {
+		if (!inBand.has(id)) {
+			out.push(id);
+			continue;
+		}
+		out.push(at < wanted.length ? wanted[at] : id);
+		at += 1;
+	}
+	return out;
+}
+
+// Unpin one card into the band as drawn. `canonicalIds` is the full band order
+// with every card unpinned: ranks first, then payload (or the A-Z order when a
+// sort owns the band). It is the fallback when both anchors are themselves
+// pinned and therefore invisible, which a numeric slot cannot describe.
+//
+// The stored order is only rewritten when the card's return would change what
+// is drawn. Unpinning a card that already lands correctly would otherwise
+// materialise the partially ranked band around the still-pinned ranks and
+// push those ranks to the wrong side; keeping the array untouched is what makes
+// any pin/unpin order round-trip to the band the user started with.
+function restorePinnedCardSlot(order, visibleIds, canonicalIds, pinnedIds, id, slot, anchors) {
+	const clean = cleanCardProviderIds(order);
+	const key = cleanCardProviderId(id);
+	if (!key) return clean;
+	if (clean.length === 0) return clean;
+	const ranked = clean.includes(key);
+	const visible = cleanCardProviderIds(visibleIds).filter(
+		(entry) => entry !== key,
+	);
+	const others = cleanCardProviderIds(pinnedIds).filter(
+		(entry) => entry !== key,
+	);
+	const canonical = cleanCardProviderIds(canonicalIds);
+	const anchor = anchors && typeof anchors === "object" ? anchors : null;
+	const prev = anchor ? cleanPinAnchor(anchor.prev, key) : "";
+	const next = anchor ? cleanPinAnchor(anchor.next, key) : "";
+	const prevAt = prev ? visible.indexOf(prev) : -1;
+	const nextAt = next ? visible.indexOf(next) : -1;
+	// The neighbours are the record even when the card already owns a rank:
+	// a rank is a slot in an array that a later move rewrites, so it stops
+	// naming the providers the card sat between. Anchors only lose here when
+	// they no longer describe a forward interval in the drawn band.
+	const anchored = pinnedAnchorRestoreIndex(visible, key, anchor);
+	// Number of drawn cards the stored order ranks before this one. It is the
+	// rank's idea of where the card belongs in today's band.
+	const rankIndex = () => {
+		const rankAt = clean.indexOf(key);
+		return visible.filter((entry) => {
+			const at = clean.indexOf(entry);
+			return at >= 0 && at < rankAt;
+		}).length;
+	};
+	let index;
+	if (prevAt >= 0 && nextAt >= 0 && prevAt <= nextAt) {
+		// Both pin-time neighbours are visible: they delimit the interval the
+		// card must return to. Inside that interval the stored rank still
+		// orders it against cards that were pinned alongside it. Ignoring the
+		// rank there made two adjacent pins swap according to which one was
+		// unpinned first, because the first unpin rewrote the visible band
+		// under the second one's stale anchors.
+		index = ranked
+			? Math.max(prevAt + 1, Math.min(nextAt, rankIndex()))
+			: anchored;
+	} else if (ranked && canonical.includes(key)) {
+		// Only one anchor is still drawn (or the pair points backwards): the
+		// rank against the full band is the stable record. Using the drawn
+		// neighbour alone let a card leap over a sibling that had just
+		// returned, so the same pins produced a different band depending on
+		// the unpin order.
+		const withoutOthers = canonical.filter((entry) => !others.includes(entry));
+		index = withoutOthers.indexOf(key);
+	} else if (prevAt >= 0 || nextAt >= 0) {
+		// Both anchors are visible but the pair now points backwards (a hand
+		// reorder moved one past the other). A card that already has a rank
+		// keeps it; its numeric slot may belong to a band that no longer
+		// exists.
+		if (ranked) {
+			const rankAt = clean.indexOf(key);
+			index = visible.filter((entry) => {
+				const at = clean.indexOf(entry);
+				return at >= 0 && at < rankAt;
+			}).length;
+		} else {
+			index = pinnedRestoreIndex(visible, key, slot, anchor);
+		}
+	} else if (prev || next) {
+		// Both anchors are still on the shelf: resolve against the full band
+		// and drop the cards that stay pinned, instead of trusting a numeric
+		// slot measured before those cards were hidden.
+		const withoutOthers = canonical.filter((entry) => !others.includes(entry));
+		if (withoutOthers.includes(key)) index = withoutOthers.indexOf(key);
+		else if (ranked) return clean;
+		else index = pinnedRestoreIndex(visible, key, slot, anchor);
+	} else if (ranked) {
+		// A layout from before pinAnchors existed: the rank is the whole
+		// restore record.
+		return clean;
+	} else {
+		// A layout from before pinAnchors existed: the numeric slot is the
+		// whole restore record.
+		index = pinnedRestoreIndex(visible, key, slot, anchor);
+	}
+	index = Math.max(0, Math.min(visible.length, index));
+	const target = visible.slice();
+	target.splice(index, 0, key);
+	const natural = canonical.filter((entry) => !others.includes(entry));
+	const unchanged =
+		(others.length > 0 || ranked) &&
+		natural.length === target.length &&
+		natural.every((entry, position) => entry === target[position]);
+	if (unchanged) return clean;
+	const merged = mergeCardOrderHolding(clean, target, others);
+	return replaceVisibleCardSlots(merged, target);
+}
+
+// Split provider groups into the pinned shelf and the unpinned list. Pinned
+// membership and order come from `layout.pinned`. Unpinned groups follow the
+// explicit A-Z / Z-A direction when one is stored; otherwise they sort by
+// their stored rank and keep the payload order when they have none.
+function orderCardGroups(groups, layout) {
+	const clean = sanitizeCardLayout(layout);
+	const list = asList(groups).filter(
+		(group) => group && typeof group.base === "string",
+	);
+	const byBase = new Map(list.map((group) => [group.base, group]));
+	const pinned = [];
+	for (const id of clean.pinned) {
+		const group = byBase.get(id);
+		if (group) pinned.push(group);
+	}
+	const pinnedSet = new Set(clean.pinned);
+	const rank = new Map();
+	clean.order.forEach((id, index) => {
+		if (!rank.has(id)) rank.set(id, index);
+	});
+	const unpinned = list
+		.filter((group) => !pinnedSet.has(group.base))
+		.map((group, index) => ({
+			group,
+			index,
+			rank: rank.has(group.base) ? rank.get(group.base) : Infinity,
+		}))
+		.sort((a, b) => {
+			if (a.rank === b.rank) return a.index - b.index;
+			return a.rank < b.rank ? -1 : 1;
+		})
+		.map((row) => row.group);
+	// An explicit A-Z / Z-A sort owns the unpinned band. Keep it applied at
+	// render time too: a provider discovered after the sort is unranked, so
+	// the rank pass above would leave it at the end even though the band is
+	// sorted. A hand reorder clears `sort`, so this can never fight a custom
+	// order the user made after sorting.
+	if (clean.sort) {
+		const byId = new Map(unpinned.map((group) => [group.base, group]));
+		return {
+			pinned,
+			unpinned: sortedCardGroupIds(unpinned, clean.sort).map((id) =>
+				byId.get(id),
+			),
+		};
+	}
+	return { pinned, unpinned };
+}
+
+function toggleCardPin(layout, id) {
+	const clean = sanitizeCardLayout(layout);
+	const key = cleanCardProviderId(id);
+	if (!key) return clean;
+	if (clean.pinned.includes(key)) {
+		clean.pinned = clean.pinned.filter((entry) => entry !== key);
+	} else {
+		clean.pinned = clean.pinned.concat(key);
+	}
+	return clean;
+}
+
+// A pin records its slot separately (`pinSlots`), so pinning alone no longer
+// materialises an order. Other paths can still write the band's full default
+// order (a sort of an already-sorted list, a drop that lands in place, or a
+// legacy pin snapshot from an older build). When nothing is pinned and that
+// copy is byte-for-byte the payload's default order, keeping it would make
+// Reset claim a custom layout and offer a destructive confirmation for a
+// no-op. Collapse exactly that case to the default (empty) order.
+//
+// `visibleIds` is the band as drawn, and `naturalIds` is its payload order.
+// An order containing an id outside today's visible set is a deliberate rank
+// for a disabled or temporarily missing provider: keep it untouched, even when
+// the visible ids happen to line up with the payload. The same applies to a
+// partial order, which still carries rank information.
+function normalizeCardLayout(layout, visibleIds, naturalIds) {
+	const clean = sanitizeCardLayout(layout);
+	if (clean.pinned.length === 0 && clean.order.length > 0) {
+		const visible = cleanCardProviderIds(visibleIds);
+		const natural = cleanCardProviderIds(naturalIds).filter((id) =>
+			visible.includes(id),
+		);
+		const onlyVisible = clean.order.every((id) => visible.includes(id));
+		const complete = clean.order.length === visible.length;
+		const isDefault =
+			onlyVisible &&
+			complete &&
+			clean.order.every((id, index) => id === natural[index]);
+		if (isDefault) {
+			// The order array carries no preference once it repeats the
+			// payload, but the user's explicit sort direction still does.
+			return clean.sort
+				? { pinned: [], order: [], sort: clean.sort }
+				: { pinned: [], order: [] };
+		}
+	}
+	return clean;
 }
 
 function providerMeta(pid) {
@@ -1795,7 +2520,7 @@ function Dot({ color, size = 7, halo = false, tone }) {
 }
 
 /** Tinted pill: the coloured state / status badge. */
-function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, title, children, ...rest }) {
+function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, title, style, children, ...rest }) {
 	return jsxs("span", {
 		...rest,
 		title,
@@ -1813,6 +2538,7 @@ function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, ti
 			whiteSpace: "nowrap",
 			color,
 			background: tint(color, 14),
+			...style,
 		},
 		children: [dot ? jsx(Dot, { color, size: 5, halo }) : null, children],
 	});
@@ -2058,7 +2784,7 @@ function WindowTile({ w, size, resetFormat }) {
 // One provider card: header (logo, name, health dot, plan pill), a row of ring
 // tiles — one per window — then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
-function ProviderRow({ id, provider, monitor, page = false, headerExtra, special }) {
+function ProviderRow({ id, provider, monitor, page = false, headerExtra, headerExtraBelow, special, editControls, pinned = false }) {
 	const t = useQT();
 	const resetFormat = useValue(resetFormatAtom);
 	// 'dense' = every window and detail line; 'clean' = just the rings and
@@ -2082,16 +2808,25 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 		return jsxs("div", {
 			className: "flex flex-col gap-0.5 rounded-lg border px-3 py-2 opacity-60",
 			style: { ...cardStyle, background: "transparent" },
+			"data-provider": id,
 			children: [
 				jsxs("div", {
-					style: UI.row,
+					style: { ...UI.row, flexWrap: "wrap", gap: "4px 8px" },
 					children: [
 						jsx(ProviderBadge, { pid: id }),
 						jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: displayName }),
 						jsx("span", { style: { ...UI.faint, flexShrink: 0 }, children: t("unavailable", reason) }),
 						headerExtra || null,
+						// Edit mode already carries the pin toggle; a second
+						// pin glyph beside it reads as two controls for one
+						// action. The static badge is for the quiet view.
+						pinned && !editControls
+							? jsx(PinnedCardBadge, { id, name: displayName })
+							: null,
+						editControls || null,
 					],
 				}),
+				headerExtraBelow || null,
 				shown.length
 					? jsx("div", {
 							style: { ...UI.col, gap: 2, paddingInlineStart: 28, ...UI.faint },
@@ -2110,12 +2845,18 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null) {
 		return jsxs("div", {
 			className: "flex items-center gap-2 rounded-lg border px-3 py-2 opacity-60",
-			style: { ...cardStyle, background: "transparent" },
+			style: { ...cardStyle, background: "transparent", flexWrap: "wrap" },
+			"data-provider": id,
 			children: [
 				jsx(ProviderBadge, { pid: id }),
-				jsx("span", { style: { ...UI.text, fontWeight: 500 }, children: displayName }),
+				jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: displayName }),
 				jsx("span", { style: UI.faint, children: t("noData") }),
 				headerExtra || null,
+				pinned && !editControls
+					? jsx(PinnedCardBadge, { id, name: displayName })
+					: null,
+				editControls || null,
+				headerExtraBelow || null,
 				special ? jsx(SpecialResetNotice, { special, key: "codex-special-reset" }) : null,
 			],
 		});
@@ -2145,10 +2886,10 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 		"data-provider": id,
 		children: [
 			jsxs("div", {
-				style: { ...UI.row, justifyContent: "space-between" },
+				style: { ...UI.row, justifyContent: "space-between", flexWrap: "wrap", gap: "4px 8px" },
 				children: [
 					jsxs("span", {
-						style: { ...UI.row, gap: 6 },
+						style: { ...UI.row, gap: 6, minWidth: 0, flex: "1 1 auto" },
 						children: [
 							jsx(ProviderBadge, { pid: id }),
 							jsx("span", { style: { ...UI.title, ...UI.ellipsis }, children: displayName }),
@@ -2156,9 +2897,49 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 							headerExtra || null,
 						],
 					}),
-					provider.plan ? jsx(Pill, { color: "var(--ui-text-secondary)", children: provider.plan }) : null,
+					jsxs("span", {
+						"data-card-header-right": id,
+						style: {
+							...UI.row,
+							gap: 6,
+							flexShrink: 1,
+							minWidth: 0,
+							maxWidth: "100%",
+							marginInlineStart: "auto",
+							justifyContent: "flex-end",
+						},
+						children: [
+							// In the normal view the badge sits between the plan
+							// pill and where edit controls would be; edit mode
+							// replaces it with the pressed pin toggle, so one
+							// pin affordance is shown at a time.
+							editControls
+								? null
+								: provider.plan
+									? jsx(Pill, {
+											color: "var(--ui-text-secondary)",
+											"data-card-plan": true,
+											title: provider.plan,
+											// A long plan name must ellipsize inside the
+											// header instead of pushing the name/card wide.
+											style: { minWidth: 0, flexShrink: 1 },
+											children: jsx("span", {
+												style: { ...UI.ellipsis, display: "block", maxWidth: "100%" },
+												children: provider.plan,
+											}),
+										})
+									: null,
+							// One pin affordance at a time: edit mode's pressed
+							// toggle replaces the quiet-view badge.
+							pinned && !editControls
+								? jsx(PinnedCardBadge, { id, name: displayName })
+								: null,
+							editControls || null,
+						],
+					}),
 				],
 			}),
+			headerExtraBelow || null,
 			...facts.balances.map((b) =>
 				jsxs("div", {
 					key: `balance-${b.currency}`,
@@ -2264,18 +3045,70 @@ function SettingsCard({ icon, title, children, footer }) {
 
 // One group of rows that share a base provider (saved pool accounts): the
 // per-card buttons live inside the selected card's own header, right of the
-// provider name — the row's own label plus its status tone. The card below
-// is still rendered by the same ProviderRow as every single-card provider,
-// so the detail keeps the full single-card completeness. A lone row never
-// reaches this component; the pane keeps its plain card path as-is.
-function ProviderCardGroup({ entries, monitor, page = false, special }) {
-	const [selected, setSelected] = useState(0);
-	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
-	const index = Math.max(0, Math.min(selected, entries.length - 1));
+// provider name — the row's own label plus its status tone. In edit mode they
+// move to a full-width row under the header so the layout controls can use the
+// header's right slot. The card below is still rendered by the same
+// ProviderRow as every single-card provider, so the detail keeps the full
+// single-card completeness. A lone row never reaches this component; the pane
+// keeps its plain card path as-is.
+function ProviderCardGroup({
+	entries,
+	monitor,
+	page = false,
+	special,
+	editMode = false,
+	editControls,
+	pinned = false,
+}) {
+	const base = baseProviderId(entries[0][0]);
+	// Read the atom so a click re-renders this card; the selection survives the
+	// remount caused by edit mode or a pin moving the card between bands.
+	const accountSelection = useValue(cardAccountAtom);
+	const preferred = accountSelection[base];
+	// A backend refresh can reorder the account rows. Until the user picks an
+	// account explicitly, keep showing the same login: an index default would
+	// silently flip the card to whichever account arrived first. The module
+	// map, not a useRef, survives the remount caused by edit mode or a pin.
+	let defaultPid = implicitCardAccount.get(base);
+	if (!defaultPid || !entries.some(([pid]) => pid === defaultPid)) {
+		defaultPid = entries[0][0];
+		implicitCardAccount.set(base, defaultPid);
+	}
+	const groupRef = useRef(null);
+	// Keyboard activation of an account button is followed by a ProviderRow
+	// remount (the row is keyed by the selected login), which destroys the
+	// button that has focus. Remember the pid for that path only; a pointer
+	// click should not steal focus back from wherever the user goes next.
+	const pendingAccountFocus = useRef(null);
+	// Match the stored provider identity, so a backend that reorders the
+	// account rows keeps showing the login the user picked. A plain index is
+	// still accepted from an older in-memory selection. A vanished account
+	// falls back to the implicit default, not to `entries[0]`: the next poll
+	// may reorder the survivors, and picking the first row would then flip the
+	// card for no reason. The stale id stays stored, so the same login is
+	// selected again if it comes back.
+	let index = entries.findIndex(([pid]) => pid === preferred);
+	if (index < 0 && Number.isInteger(preferred)) {
+		index = Math.max(0, Math.min(preferred, entries.length - 1));
+	}
+	if (index < 0) index = entries.findIndex(([pid]) => pid === defaultPid);
+	if (index < 0) index = 0;
 	const [selectedId, selectedProvider] = entries[index];
-	const headerExtra = jsx("div", {
+	useEffect(() => {
+		const pid = pendingAccountFocus.current;
+		const root = groupRef.current;
+		if (!pid || !root) return;
+		pendingAccountFocus.current = null;
+		for (const node of root.querySelectorAll("[data-card-account]")) {
+			if (node.getAttribute("data-card-account") === pid && node.focus) {
+				node.focus();
+				break;
+			}
+		}
+	});
+	const accounts = jsx("div", {
 		className: "flex items-center gap-1.5",
-		style: { flexWrap: "wrap" },
+		style: { flexWrap: "wrap", minWidth: 0 },
 		children: entries.map(([pid, provider], i) => {
 			const account =
 				provider && typeof provider.account_label === "string"
@@ -2286,6 +3119,7 @@ function ProviderCardGroup({ entries, monitor, page = false, special }) {
 				{
 					type: "button",
 					"aria-pressed": i === index,
+					"data-card-account": pid,
 					className: cn(
 						"inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-0.5 font-normal",
 						"text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
@@ -2294,7 +3128,16 @@ function ProviderCardGroup({ entries, monitor, page = false, special }) {
 						i === index
 							? { background: "var(--ui-control-hover-background)" }
 							: undefined,
-					onClick: () => setSelected(i),
+					onClick: (event) => {
+						setCardAccount(base, pid);
+						// detail === 0 is a keyboard-generated click. A
+						// pointer user is still aiming at the control they
+						// clicked; a keyboard user's next Tab would otherwise
+						// restart from the top of the pane after the remount.
+						if (event && event.detail === 0) {
+							pendingAccountFocus.current = pid;
+						}
+					},
 					children: [
 						jsx("span", { children: account || providerDisplayName(pid, provider) }),
 						jsx(StatusDot, { tone: providerTone(provider) }),
@@ -2304,7 +3147,40 @@ function ProviderCardGroup({ entries, monitor, page = false, special }) {
 			);
 		}),
 	});
-	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra, monitor, page, special }, selectedId);
+	return jsx(
+		"div",
+		{
+			ref: groupRef,
+			// Stable measurement node for a grouped card. The account switch
+			// remounts ProviderRow (keyed by the selected login), so a
+			// ResizeObserver attached to that inner node would keep watching a
+			// detached element and the shelf could not follow a taller new
+			// account. This wrapper keeps one box per group: its height tracks
+			// whichever account is rendered, and it survives the quiet/edit
+			// remount as well as pin moves.
+			"data-card-node": base,
+			style: {
+				display: "flex",
+				flexDirection: "column",
+				flexShrink: 0,
+				minWidth: 0,
+				width: "100%",
+			},
+			children: jsx(ProviderRow, {
+				id: selectedId,
+				provider: selectedProvider,
+				headerExtra: editMode ? null : accounts,
+				// In edit mode the account buttons get their own full-width row
+				// under the header, so the edit controls can use the header's
+				// top-right slot without squeezing the account selector.
+				headerExtraBelow: editMode ? accounts : null,
+				editControls,
+				pinned,
+				monitor, page, special,
+			}, selectedId),
+		},
+		`group-${base}`,
+	);
 }
 
 function ResetFormatControl() {
@@ -2539,34 +3415,1052 @@ function SummaryStrip({ snapshot, providers }) {
 	});
 }
 
-function IconButton({ title, onClick, disabled, children }) {
+function IconButton({ title, hint, onClick, disabled, pressed, children, ...rest }) {
+	const tooltip = hint ? `${title}\n${hint}` : title;
 	return jsx("button", {
 		type: "button",
+		...rest,
 		className: "inline-flex items-center justify-center rounded text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
-		style: { width: 24, height: 24, flexShrink: 0 },
-		title,
+		style: {
+			width: 24,
+			height: 24,
+			flexShrink: 0,
+			...(pressed
+				? {
+						background: "var(--ui-control-hover-background)",
+						color: "var(--ui-text-primary)",
+					}
+				: null),
+		},
+		title: tooltip,
 		"aria-label": title,
+		"aria-description": hint || undefined,
+		"aria-pressed": typeof pressed === "boolean" ? pressed : undefined,
 		disabled,
 		onClick,
 		children,
 	});
 }
 
+// Inline card-layout glyphs (lucide icon paths, MIT), so edit/pin/reorder
+// controls never depend on an icon name the host SDK may not ship.
+const CARD_GLYPHS = {
+	edit: ["M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"],
+	check: ["M20 6 9 17l-5-5"],
+	pin: [
+		"M12 17v5",
+		"M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z",
+	],
+	pinOff: [
+		"M12 17v5",
+		"M15 9.34V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H7.89",
+		"m2 2 20 20",
+		"M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h11",
+	],
+	up: ["m18 15-6-6-6 6"],
+	down: ["m6 9 6 6 6-6"],
+	// Six round caps, i.e. the grip dots that tell a card can be dragged.
+	grip: ["M9 5h.01", "M9 12h.01", "M9 19h.01", "M15 5h.01", "M15 12h.01", "M15 19h.01"],
+	// A/Z with an arrow: sort ascending / descending. The pair reads as a set
+	// and stays recognizable at 14px without relying on a locale's alphabet.
+	sortAz: [
+		"m3 16 4 4 4-4",
+		"M7 20V4",
+		"M20 8h-5",
+		"M15 10V6.5a2.5 2.5 0 0 1 5 0V10",
+		"M15 14h5l-5 6h5",
+	],
+	sortZa: [
+		"m3 8 4-4 4 4",
+		"M7 4v16",
+		"M15 4h5l-5 6h5",
+		"M15 20v-3.5a2.5 2.5 0 0 1 5 0V20",
+		"M15 20h5",
+	],
+};
+
+function CardGlyph({ name, className = "h-3.5 w-3.5" }) {
+	const paths = CARD_GLYPHS[name] || [];
+	return jsx("svg", {
+		viewBox: "0 0 24 24",
+		width: "1em",
+		height: "1em",
+		fill: "none",
+		stroke: "currentColor",
+		strokeWidth: 2,
+		strokeLinecap: "round",
+		strokeLinejoin: "round",
+		className,
+		"aria-hidden": "true",
+		children: paths.map((d, index) => jsx("path", { d }, index)),
+	});
+}
+
+function CardLayoutButton({
+	control,
+	id,
+	label,
+	disabled = false,
+	unavailable = false,
+	pressed,
+	glyph,
+	onClick,
+}) {
+	const inert = disabled || unavailable;
+	return jsx("button", {
+		type: "button",
+		title: label,
+		"aria-label": label,
+		"aria-pressed": typeof pressed === "boolean" ? pressed : undefined,
+		"aria-disabled": unavailable ? true : undefined,
+		// An edge arrow stays focusable: a disabled button drops keyboard
+		// focus the moment it becomes disabled, so a keyboard reorder lost its
+		// place at the first/last card. aria-disabled + a no-op move keeps it.
+		disabled,
+		onClick,
+		"data-card-control": control,
+		"data-card-id": id,
+		className:
+			"inline-flex shrink-0 items-center justify-center rounded transition-colors",
+		style: {
+			width: 22,
+			height: 22,
+			flexShrink: 0,
+			border: "1px solid var(--ui-stroke-tertiary)",
+			background: pressed
+				? "var(--ui-control-hover-background)"
+				: "var(--ui-bg-elevated)",
+			color: pressed ? "var(--ui-accent)" : "var(--ui-text-secondary)",
+			cursor: inert ? "default" : "pointer",
+			opacity: inert ? 0.35 : 1,
+		},
+		children: jsx(CardGlyph, { name: glyph, className: "h-3 w-3" }),
+	});
+}
+
+// A pinned card carries its own marker in the header instead of a "Pinned"
+// section heading above the shelf: the header already names the card, and the
+// shelf stays compact with no label row to scroll away. Static (not a button);
+// the pin toggle in edit mode remains the control.
+function PinnedCardBadge({ id, name }) {
+	const t = useQT();
+	const label = t("pinnedCardTip", name);
+	// Pins are stored by the group's base provider. A grouped card renders the
+	// selected account id, so mark the badge with the same stable identity.
+	const base = baseProviderId(id);
+	return jsx("span", {
+		"data-card-pinned": base,
+		role: "img",
+		"aria-label": label,
+		title: label,
+		style: {
+			display: "inline-flex",
+			alignItems: "center",
+			justifyContent: "center",
+			flexShrink: 0,
+			color: "var(--ui-accent)",
+		},
+		children: jsx(CardGlyph, { name: "pin", className: "h-3 w-3" }),
+	});
+}
+
+// The shelf's own vertical padding (top 4 + bottom 8) is part of its painted
+// box. Height limits below are expressed for the inner scrollport, so the
+// outer shelf stays within the same budget once this padding is added.
+const PINNED_SHELF_PADDING_TOP = 4;
+const PINNED_SHELF_PADDING_BOTTOM = 8;
+const PINNED_SHELF_PADDING = PINNED_SHELF_PADDING_TOP + PINNED_SHELF_PADDING_BOTTOM;
+// A 16px hit strip: 8px of shelf bottom padding plus 8px of reserve below the
+// content. The measured floor and ceiling include that inner half, so the grip
+// never paints across a card's bottom border at either limit. When content
+// continues below the fold the strip naturally overlays the clipped card's
+// lower padding instead. It is still an overlay, so the band's layout height
+// and the last card's distance from the list do not change.
+const PINNED_SHELF_RESIZE_HEIGHT = 16;
+// Pointer jitter below this many pixels is a click, not a resize. Saving the
+// auto-fitted height on a stray click would turn the natural, pin-following
+// default into a fixed pixel preference, so later pins could no longer grow
+// the band.
+const PINNED_SHELF_RESIZE_SLOP = 3;
+// The 16px strip sits on the shelf's bottom edge: the shelf's 8px bottom
+// padding covers half of it and the other 8px overlay the scrollport. That
+// intruding half is not layout height, so a floor measured at the first
+// card's bottom would paint the grip across the card's own bottom border.
+// The floor reserves this slice below the first card instead.
+const PINNED_SHELF_RESIZE_INTRUSION =
+	PINNED_SHELF_RESIZE_HEIGHT - PINNED_SHELF_PADDING_BOTTOM;
+// A mixed pane keeps the unpinned list reachable, but a fixed list reserve
+// must never crush the pinned band to zero: in a 180px-tall pane the old 72px
+// list budget left the shelf with a 0px scrollport, hiding the pinned cards
+// behind their own band. Keep a usable slice of the first card (its header and
+// the resize strip's row) and guarantee the list a smaller minimum instead.
+// The list's reserve still prefers the old 72px whenever the pane has room.
+const PINNED_SHELF_MIN_USABLE = 40;
+const UNPINNED_LIST_MIN_USABLE = 24;
+const UNPINNED_LIST_PREFERRED = 72;
+// A monitor-enabled pane adds a tab row and a summary strip above the cards.
+// On a very short pane that fixed chrome can eat the whole card region, which
+// is physics, not a bug in the split. Below this height the pane switches to
+// its compact layout: the summary strip and footer step aside, the tab row
+// stays a single horizontally scrollable row, and the cards keep a usable
+// share of the pane. The docked pane is normally ~540px tall; the route page
+// is taller still.
+const COMPACT_PANE_HEIGHT = 300;
+// Edit mode adds the layout toolbar but no monitor chrome. Its squeeze only
+// becomes unusable below the old 180px short-pane case, so keep the compact
+// rule (and the footer) unchanged at 180px and above.
+const EDIT_COMPACT_PANE_HEIGHT = 180;
+
+const SHELF_STYLE_ID = "quota-plugin-pinned-shelf-css";
+// The sheet is global: every selector is scoped by the shelf's own data
+// attributes. The grip is invisible until the band is hovered, focused or
+// being dragged, so the band keeps its unframed, aligned look at rest.
+const SHELF_CSS = [
+	"[data-pinned-shelf-resize]{touch-action:none;-webkit-user-select:none;user-select:none}",
+	"[data-pinned-shelf-grip]{opacity:0;transition:opacity 120ms linear}",
+	"[data-pinned-shelf]:hover [data-pinned-shelf-grip],[data-pinned-shelf-resize]:hover [data-pinned-shelf-grip],[data-pinned-shelf-resize]:focus-visible [data-pinned-shelf-grip],[data-pinned-shelf-resize][data-resizing='true'] [data-pinned-shelf-grip]{opacity:1}",
+	"[data-pinned-shelf-resize][data-pinned-shelf-resize-disabled='true'] [data-pinned-shelf-grip]{opacity:0.25}",
+	"[data-pinned-shelf-resize]:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}",
+	// The host resets focus globally (`:focus,:focus-visible{outline:none}`),
+	// which left the card layout controls with no visible keyboard focus.
+	// An attribute plus :focus-visible outranks that reset without !important.
+	// These controls are plain <button>s, but the plugin supplies their chrome,
+	// so the focus ring has to be plugin-supplied too.
+	"[data-card-control]:focus-visible,[data-card-sort]:focus-visible,[data-card-reset]:focus-visible,[data-card-edit]:focus-visible,[data-card-account]:focus-visible,[data-tab]:focus-visible{outline:2px solid var(--ui-accent);outline-offset:1px}",
+	// Touch screens have no hover: keep a faint grip visible so the edge is
+	// discoverable. Pointer devices keep the unframed, grip-free resting look.
+	"@media (pointer: coarse){[data-pinned-shelf-grip]{opacity:0.55}}",
+	"@media (prefers-reduced-motion:reduce){[data-pinned-shelf-grip]{transition:none}}",
+].join("\n");
+
+/** Injects the shelf resize rules once (idempotent across reloads). */
+function ensureShelfStyles() {
+	try {
+		if (typeof document === "undefined" || !document.head) return null;
+		let el = document.getElementById(SHELF_STYLE_ID);
+		if (!el) {
+			el = document.createElement("style");
+			el.id = SHELF_STYLE_ID;
+			document.head.appendChild(el);
+		}
+		if (el.textContent !== SHELF_CSS) el.textContent = SHELF_CSS;
+		return el;
+	} catch {
+		return null;
+	}
+}
+
+// Pinned cards inside the shelf's own scrollport, in visual order. Shared by
+// the measurement effect and the double-click snap so both agree on what a
+// "card boundary" is.
+function pinnedShelfCards(node) {
+	if (!node || !node.children) return [];
+	return [...node.children].filter(
+		(el) =>
+			el.hasAttribute &&
+			(el.hasAttribute("data-card-shell") ||
+				el.hasAttribute("data-card-node") ||
+				el.hasAttribute("data-provider")),
+	);
+}
+
+// Height (shelf scrollport pixels) that puts the band's bottom edge on a
+// pinned card's bottom border. Cards are measured in the scrollport's content
+// coordinates, so a scrolled shelf decides by the card actually under the
+// pointer rather than by a viewport coordinate. A card's midpoint is the
+// tipping point: above it the previous card's bottom is the nearest boundary,
+// below it this card's own bottom. The resize strip overlays the scrollport's
+// last 8px, so that intrusion is added to keep the handle's top edge on the
+// border instead of across the card. The caller clamps the result to the
+// measured floor/ceiling (including the half-pane cap).
+function pinnedShelfSnapHeight(node, clientY) {
+	const cards = pinnedShelfCards(node).filter((el) => {
+		const box = el.getBoundingClientRect();
+		return box.height > 0;
+	});
+	if (!cards.length || !Number.isFinite(clientY)) return null;
+	const rect = node.getBoundingClientRect();
+	if (!rect.height) return null;
+	const y = clientY - rect.top + node.scrollTop;
+	let index = 0;
+	for (let i = 0; i < cards.length; i += 1) {
+		const box = cards[i].getBoundingClientRect();
+		const mid = (box.top + box.bottom) / 2 - rect.top + node.scrollTop;
+		if (y >= mid) index = i;
+	}
+	const target = cards[index].getBoundingClientRect();
+	return Math.ceil(
+		target.bottom - rect.top + node.scrollTop + PINNED_SHELF_RESIZE_INTRUSION,
+	);
+}
+
+// The draggable bottom edge of the pinned band. It is a 16px overlay anchored
+// to the shelf bottom, half in the painted padding and half over the scrolled
+// content; the measured floor and ceiling reserve the inner half, so at both
+// limits it sits below the card border. It adds no layout height, no border
+// and no gap: the last pinned card keeps the same offset from the unpinned
+// list. Pointer events cover mouse, pen and touch; ArrowUp/Down (and
+// PageUp/PageDown, Home/End) cover the keyboard. A double-click snaps the band
+// to the card boundary under the pointer. The parent owns the height value,
+// which lets a drag update the pane without writing storage per frame.
+function PinnedShelfResizer({ height, min, max, disabled = false, blocked = false, fits = false, onChange, onCommit, onCancel, onSnap }) {
+	const t = useQT();
+	const [resizing, setResizing] = useState(false);
+	const dragRef = useRef(null);
+	const statusText = blocked
+		? fits
+			? t("pinnedShelfResizeNotNeeded")
+			: t("pinnedShelfResizeBlocked")
+		: t("pinnedShelfResizeHint");
+	const clampHeight = (value) =>
+		Math.round(Math.min(max, Math.max(min, Number.isFinite(value) ? value : min)));
+	const stopDrag = () => {
+		const drag = dragRef.current;
+		if (!drag) return;
+		dragRef.current = null;
+		window.removeEventListener("pointermove", drag.move);
+		window.removeEventListener("pointerup", drag.up);
+		window.removeEventListener("pointercancel", drag.cancel);
+		if (typeof document !== "undefined" && document.body) {
+			document.body.style.cursor = "";
+		}
+		setResizing(false);
+	};
+	// Unmounting mid-drag (view switch, pane close) must not leave window
+	// listeners or a stale resize cursor behind.
+	useEffect(() => () => stopDrag(), []);
+	const onPointerDown = (event) => {
+		if (disabled || (event.button != null && event.button !== 0)) return;
+		if (dragRef.current) stopDrag();
+		const pointerId = event.pointerId;
+		const startY = event.clientY;
+		const startHeight = Number.isFinite(height) ? height : min;
+		const start = clampHeight(startHeight);
+		let last = start;
+		let moved = false;
+		if (event.cancelable) event.preventDefault();
+		// preventDefault keeps the drag from selecting text, but it also
+		// suppresses the browser's default focus-on-press for a focusable
+		// separator. Without an explicit focus the arrow keys keep going to
+		// whatever was focused before (usually <body>), so a click on the
+		// handle followed by ↓ would not resize it. Focusing here makes the
+		// visible affordance and the keyboard path the same target.
+		const handle = event.currentTarget;
+		if (handle && typeof handle.focus === "function") {
+			try {
+				handle.focus({ preventScroll: true });
+			} catch {
+				/* older hosts: focus without options */
+				handle.focus();
+			}
+		}
+		setResizing(true);
+		if (typeof document !== "undefined" && document.body) {
+			document.body.style.cursor = "ns-resize";
+		}
+		const onMove = (moveEvent) => {
+			const drag = dragRef.current;
+			if (!drag || moveEvent.pointerId !== pointerId) return;
+			const delta = moveEvent.clientY - startY;
+			// A click (and its usual 1–2px jitter) must not write a height.
+			if (!moved && Math.abs(delta) < PINNED_SHELF_RESIZE_SLOP) return;
+			moved = true;
+			last = clampHeight(startHeight + delta);
+			drag.last = last;
+			onChange(last);
+			if (moveEvent.cancelable) moveEvent.preventDefault();
+		};
+		const finish = (commit) => {
+			const drag = dragRef.current;
+			if (!drag || drag.pointerId !== pointerId) return;
+			const final = drag.last;
+			// Only a real, net change is a preference. A drag that ends where it
+			// started (or a plain click) leaves the automatic height untouched.
+			const changed = moved && final !== start;
+			stopDrag();
+			if (commit && changed) onCommit(final);
+			else onCancel?.();
+		};
+		const onUp = (upEvent) => {
+			if (upEvent.pointerId !== pointerId) return;
+			finish(true);
+		};
+		const onPointerCancel = (cancelEvent) => {
+			if (cancelEvent.pointerId !== pointerId) return;
+			finish(false);
+		};
+		dragRef.current = { pointerId, last, move: onMove, up: onUp, cancel: onPointerCancel };
+		window.addEventListener("pointermove", onMove, { passive: false });
+		window.addEventListener("pointerup", onUp);
+		window.addEventListener("pointercancel", onPointerCancel);
+		try {
+			event.currentTarget.setPointerCapture(pointerId);
+		} catch {
+			/* synthetic events and older hosts have no capture */
+		}
+	};
+	const onKeyDown = (event) => {
+		if (disabled) return;
+		const step = event.shiftKey ? 32 : 8;
+		let next = null;
+		if (event.key === "ArrowUp") next = height - step;
+		else if (event.key === "ArrowDown") next = height + step;
+		else if (event.key === "PageUp") next = height - step * 4;
+		else if (event.key === "PageDown") next = height + step * 4;
+		else if (event.key === "Home") next = min;
+		else if (event.key === "End") next = max;
+		if (next == null) return;
+		event.preventDefault();
+		const clamped = clampHeight(next);
+		onChange(clamped);
+		onCommit(clamped);
+	};
+	// Double-click is the snap gesture: the click's own Y decides which side of
+	// a card midpoint the band's bottom edge is on. The two pointerdown/up
+	// pairs of the double-click have already been treated as plain clicks
+	// (no height write), so this commit is the only state change.
+	const onDoubleClick = (event) => {
+		if (disabled || typeof onSnap !== "function") return;
+		if (event.cancelable) event.preventDefault();
+		onSnap(event.clientY);
+	};
+	return jsx("div", {
+		"data-pinned-shelf-resize": true,
+		"data-pinned-shelf-resize-disabled": blocked ? "true" : undefined,
+		"data-resizing": resizing ? "true" : undefined,
+		"data-no-card-drag": true,
+		role: "separator",
+		"aria-orientation": "horizontal",
+		"aria-label": t("pinnedShelfResizeLabel"),
+		"aria-description": statusText,
+		"aria-disabled": blocked ? true : undefined,
+		"aria-valuemin": Math.round(min),
+		"aria-valuemax": Math.round(max),
+		"aria-valuenow": height == null ? undefined : Math.round(height),
+		"aria-valuetext": height == null ? undefined : `${Math.round(height)} px`,
+		title: blocked ? statusText : t("pinnedShelfResizeTip"),
+		tabIndex: 0,
+		style: {
+			position: "absolute",
+			insetInlineStart: 0,
+			// Stop at the shelf's scrollbar gutter. The 16px strip still
+			// covers the card padding above the bottom edge, but never the
+			// scrollbar channel: dragging the band's bar must scroll, not
+			// resize (and the bar stays reachable at its very bottom).
+			insetInlineEnd: "var(--quota-pinned-scrollbar, 0px)",
+			// The hit strip stops before the scrollbar, but its content box is
+			// padded back by the same gutter so the grip stays centred on the
+			// whole band (the padding area remains part of the hit target).
+			paddingInlineStart: "var(--quota-pinned-scrollbar, 0px)",
+			bottom: 0,
+			height: PINNED_SHELF_RESIZE_HEIGHT,
+			zIndex: 4,
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "center",
+			cursor: disabled ? "default" : "ns-resize",
+			pointerEvents: "auto",
+			background: "transparent",
+		},
+		onPointerDown,
+		onKeyDown,
+		onDoubleClick,
+		children: jsx("span", {
+			"data-pinned-shelf-grip": true,
+			"aria-hidden": "true",
+			style: {
+				width: 30,
+				height: 3,
+				borderRadius: 999,
+				background: "var(--ui-text-quaternary)",
+				pointerEvents: "none",
+			},
+		}),
+	});
+}
+
+// Non-heading cue for a shelf whose own list continues above/below the fold.
+// An absolute overlay: it paints over the clipping edge without taking layout
+// space, so a cue appearing cannot resize the scroller or make the shelf jump.
+// Purely decorative: every pinned card stays in the accessibility tree, and
+// scrolling (or focusing a card after pinning) reveals the rest.
+function PinnedOverflowCue({ edge = "bottom", active = false }) {
+	const shelfSurface =
+		"var(--ui-bg-chrome, var(--ui-chat-bubble-opaque-background, var(--ui-bg-editor)))";
+	return jsx("div", {
+		"data-pinned-overflow-cue": active ? edge : undefined,
+		"data-pinned-overflow-rail": active ? undefined : edge,
+		"aria-hidden": "true",
+		style: {
+			// An overlay, not a sibling in the flex column: mounting it never
+			// changes the scroller's height, so the shelf cannot jiggle when
+			// the first/last card crosses the fold. The opaque end of the
+			// gradient sits exactly on the clipping edge, which separates a
+			// half-visible pinned card from the unpinned list below.
+			// The inline end stops at the shelf's scrollbar gutter: the cue
+			// must not paint over (or steal hits from) the band's own
+			// scrollbar. `--quota-pinned-scrollbar` is measured on the shelf
+			// (0 on overlay-scrollbar hosts).
+			position: "absolute",
+			[edge === "top" ? "top" : "bottom"]: 0,
+			insetInlineStart: 0,
+			insetInlineEnd: "var(--quota-pinned-scrollbar, 0px)",
+			height: 14,
+			zIndex: 3,
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "center",
+			pointerEvents: "none",
+			opacity: active ? 1 : 0,
+			transition: "opacity 120ms linear",
+			color: "var(--ui-text-secondary)",
+			// A soft darker lip at the clipping edge, opaque until it fades
+			// into the shelf surface: enough separation from the list without
+			// drawing a border around the band.
+			background: `linear-gradient(${edge === "top" ? "to bottom" : "to top"}, color-mix(in srgb, ${shelfSurface} 84%, black) 0%, ${shelfSurface} 42%, transparent 100%)`,
+		},
+		children: jsx(CardGlyph, {
+			name: edge === "top" ? "up" : "down",
+			className: "h-3 w-3",
+		}),
+	});
+}
+
+// One compact control strip per rendered card (single, grouped, failed and
+// no-data alike). Pin is a pressed toggle; the arrows move a card only inside
+// its own band, and are disabled at that band's edges.
+function CardLayoutControls({
+	id,
+	name,
+	pinned,
+	canUp,
+	canDown,
+	onPin,
+	onUp,
+	onDown,
+}) {
+	const t = useQT();
+	return jsxs("div", {
+		"data-card-controls": id,
+		style: {
+			...UI.row,
+			gap: 3,
+			justifyContent: "flex-end",
+			marginInlineStart: "auto",
+			flexShrink: 0,
+			minWidth: 0,
+		},
+		children: [
+			// A grip is still the visual invitation to drag, but the whole
+			// card shell is the drag source now; the arrows remain the keyboard
+			// path, and every button keeps its own click target.
+			jsx("span", {
+				"data-card-drag-handle": id,
+				"aria-hidden": "true",
+				style: {
+					display: "inline-flex",
+					alignItems: "center",
+					justifyContent: "center",
+					width: 18,
+					height: 24,
+					borderRadius: 4,
+					flexShrink: 0,
+					color: "var(--ui-text-quaternary)",
+					cursor: "grab",
+				},
+				children: jsx(CardGlyph, { name: "grip", className: "h-3 w-3" }),
+			}),
+			jsx(CardLayoutButton, {
+				control: "pin",
+				id,
+				label: pinned ? t("unpinCardTip", name) : t("pinCardTip", name),
+				pressed: pinned,
+				glyph: pinned ? "pin" : "pinOff",
+				onClick: onPin,
+			}),
+			jsx(CardLayoutButton, {
+				control: "up",
+				id,
+				label: t("moveCardUpTip", name),
+				unavailable: !canUp,
+				glyph: "up",
+				onClick: onUp,
+			}),
+			jsx(CardLayoutButton, {
+				control: "down",
+				id,
+				label: t("moveCardDownTip", name),
+				unavailable: !canDown,
+				glyph: "down",
+				onClick: onDown,
+			}),
+		],
+	});
+}
+
+// The host Button ramps every style change over 100 ms (`transition-all
+// duration-100`). On the confirmation's short footer buttons that ramp reads
+// as late hover feedback: the first visible tint lands a frame or two after
+// the pointer and the fill only settles ~130 ms later, while the rest of the
+// app answers on the next frame. Opt this dialog's buttons out of that
+// transition, scoped by a marker in the dialog body so every other host
+// dialog keeps its motion. The media query is unnecessary: a zero duration
+// has no motion to reduce.
+const CONFIRM_STYLE_ID = "quota-plugin-confirm-css";
+const CONFIRM_CSS =
+	'[data-slot="dialog-content"]:has([data-quota-confirm]) [data-slot="button"]{transition-duration:0s;transition-delay:0s}';
+
+/** Injects the confirmation hover rule once (idempotent across reloads). */
+function ensureConfirmStyles() {
+	try {
+		if (typeof document === "undefined" || !document.head) return null;
+		let el = document.getElementById(CONFIRM_STYLE_ID);
+		if (!el) {
+			el = document.createElement("style");
+			el.id = CONFIRM_STYLE_ID;
+			document.head.appendChild(el);
+		}
+		if (el.textContent !== CONFIRM_CSS) el.textContent = CONFIRM_CSS;
+		return el;
+	} catch {
+		return null;
+	}
+}
+
+// The marker lives in the dialog body: ConfirmDialog does not expose a
+// className for its footer buttons, and the only stable way to scope CSS to
+// this one dialog is an attribute it can :has().
+const CONFIRM_MARKER = jsx("span", {
+	"data-quota-confirm": true,
+	hidden: true,
+	"aria-hidden": "true",
+});
+
+// One confirmation at a time, owned by its own atom subscription so opening or
+// cancelling it never re-renders the card list. The host dialog's done beat is
+// skipped (`dismissOnConfirm`): applying a layout is synchronous and visible
+// immediately, so 600 ms of "saving" before closing only felt like lag.
+function CardLayoutConfirm({ owner }) {
+	const t = useQT();
+	const prompt = useValue(cardLayoutPromptAtom);
+	if (!prompt || prompt.owner !== owner) return null;
+	const reset = prompt.kind === "reset";
+	return jsx(ConfirmDialog, {
+		open: true,
+		dismissOnConfirm: true,
+		onClose: () => setCardLayoutPrompt(null),
+		onConfirm: () => {
+			const pending = cardLayoutPromptAtom.get();
+			// Close and apply in the same click so React batches them into one
+			// commit: the cards repaint once and the dialog leaves in that paint.
+			setCardLayoutPrompt(null);
+			if (pending && pending.owner === owner && pending.layout) {
+				setCardLayout(pending.layout);
+			}
+		},
+		title: reset
+			? t("resetCardLayoutConfirmTitle")
+			: t("sortCardsConfirmTitle"),
+		description: reset
+			? t("resetCardLayoutConfirmBody")
+			: t("sortCardsConfirmBody"),
+		children: CONFIRM_MARKER,
+		confirmLabel: reset
+			? t("resetCardLayoutShort")
+			: t("sortCardsConfirm"),
+		cancelLabel: t("accountsConfirmCancel"),
+		destructive: reset,
+	}, "card-layout-confirm");
+}
+
 function QuotaPane({ page = false } = {}) {
 	const t = useQT();
 	const qc = useQueryClient();
+	// Stable identity for this mounted surface's confirmation. Two quota
+	// panes (route page + docked pane) share the prompt atom but must never
+	// both paint the dialog.
+	const paneInstance = useRef(0);
+	if (!paneInstance.current) paneInstance.current = ++_cardLayoutPaneSeq;
 	const [view, setView] = useState("list"); // 'list' | 'settings'
+	// Drag state is transient: the source lives in a ref (pointermove fires
+	// many times and must not re-render), the drop target in state (it paints
+	// the insertion line). Both disappear when edit mode closes.
+	const dragSource = useRef(null);
+	const [cardDragOver, setCardDragOver] = useState(null);
+	// Pointer position during a drag, updated from pointermove (cards and the
+	// empty gaps around them), so the autoscroll loop can keep scrolling while
+	// the pointer is held still near an edge.
+	const dragPointer = useRef({ x: 0, y: 0 });
+	const dragAutoScrollRaf = useRef(0);
+	const dragWheelCleanup = useRef(null);
+	// Pointer drag: a press on a card body arms a candidate; crossing a few
+	// pixels turns it into a real drag. Nothing is native HTML5 drag anymore,
+	// because Chromium stops delivering drop events once a scroller is moved
+	// programmatically mid-drag — exactly what a drag beyond the fold needs.
+	const dragCandidate = useRef(null);
+	const dragGhost = useRef(null);
+	const dragGhostOffset = useRef({ x: 0, y: 0 });
+	const dragListeners = useRef(null);
+	const [draggingId, setDraggingId] = useState(null);
+	// The band lists as last rendered, for the pointerup drop: the root
+	// pointer handler lives outside the data branch where the groups are
+	// computed, and a drop must use the same membership the cards show.
+	const bandGroupsRef = useRef({ pinned: [], unpinned: [] });
+	// Root pointerdown dispatcher, present only while the card list is drawn.
+	const cardPointerDownRef = useRef(null);
+	// Pin/unpin moves a card between the shelf and the list, so React
+	// unmounts and remounts it: return keyboard focus to the moved card's pin
+	// toggle after the new tree paints.
+	const pendingCardFocus = useRef(null);
+	const shelfScrollRef = useRef(null);
+	const paneRootRef = useRef(null);
+	const [shelfEdges, setShelfEdges] = useState({ top: false, bottom: false });
+	// Width of the shelf's native scrollbar (0 on overlay-scrollbar hosts).
+	// The cues and the resize strip stop at this gutter so neither paints
+	// over the band's own scrollbar. Both bands reserve the same gutter
+	// (`scrollbar-gutter: stable`), which is what keeps pinned and unpinned
+	// cards the same width even while one band overflows and the other fits.
+	const [shelfScrollbar, setShelfScrollbar] = useState(0);
+	// Measured resize range for the pinned shelf's scrollport. `min` is the
+	// bottom of the first pinned card plus the resize strip, `max` is
+	// min(the last pinned card's bottom plus the strip, half the plugin
+	// window), capped by the visible pane so the band can never push the
+	// whole pane off-screen. `overflows` says whether the pinned content is
+	// taller than that ceiling (a blocked too-tall card) rather than simply
+	// fitting with no range to resize. `floorBlocked` says the ceiling is
+	// below the first card plus the strip even though the card itself may
+	// fit: the range collapses and the handle must not claim the cards
+	// "already fit" while the strip still overlaps the card border. Until the
+	// first measurement the shelf falls back to a CSS cap; the range is also
+	// what `aria-valuemin` and `aria-valuemax` expose.
+	const [shelfMetrics, setShelfMetrics] = useState({
+		ready: false, min: 0, max: 0, overflows: false, floorBlocked: false,
+	});
+	// Live drag preview, owned here so a pointer move repaints the shelf while
+	// only the pointerup writes the chosen height to storage.
+	const [shelfResizePreview, setShelfResizePreview] = useState(null);
+	const savedShelfHeight = useValue(pinnedShelfHeightAtom);
 	const { data, isError, isLoading } = useQuota();
+	// Edit mode is transient view state, not a preference, and it belongs to
+	// one mounted pane: the route page and the docked pane can be visible at
+	// the same time, and neither may put the other into edit mode. Pane state
+	// also resets on remount (route change, docked-pane toggle), so a later
+	// mount starts in the quiet card view.
+	const [editing, setEditing] = useState(false);
+	// Whether the pane is in its compact monitor layout. A measured value is
+	// needed because CSS media queries see the window, not a docked pane that
+	// is much shorter than it. The observer only flips the boolean when the
+	// threshold is crossed, so dragging a pane edge does not repaint the card
+	// tree on every pixel.
+	const [compactPane, setCompactPane] = useState(false);
+	const cardLayout = useValue(cardLayoutAtom);
+	// Restore focus to the pin toggle of the card that just moved bands.
+	useEffect(() => {
+		const id = pendingCardFocus.current;
+		const root = paneRootRef.current;
+		if (!id || !root) return;
+		pendingCardFocus.current = null;
+		const controls = root.querySelectorAll('[data-card-control="pin"]');
+		for (const node of controls) {
+			if (node.getAttribute("data-card-id") === id && typeof node.focus === "function") {
+				node.focus();
+				break;
+			}
+		}
+	}, [cardLayout]);
+	// A question belongs to this mounted pane: leaving the pane (route change,
+	// settings remount) must not leave a stale prompt that reopens later.
+	// The drag helpers are torn down too, so a pane unmounted mid-drag cannot
+	// leave a rAF or wheel listener running against a dead tree.
+	useEffect(() => () => {
+		const prompt = cardLayoutPromptAtom.get();
+		if (prompt && prompt.owner === paneInstance.current) setCardLayoutPrompt(null);
+		if (dragAutoScrollRaf.current) {
+			cancelAnimationFrame(dragAutoScrollRaf.current);
+			dragAutoScrollRaf.current = 0;
+		}
+		if (dragWheelCleanup.current) {
+			dragWheelCleanup.current();
+			dragWheelCleanup.current = null;
+		}
+		if (dragGhost.current) {
+			if (dragGhost.current.parentNode) {
+				dragGhost.current.parentNode.removeChild(dragGhost.current);
+			}
+			dragGhost.current = null;
+		}
+		if (typeof document !== "undefined" && document.body) {
+			document.body.style.cursor = "";
+		}
+		const listeners = dragListeners.current;
+		if (listeners && typeof window !== "undefined") {
+			window.removeEventListener("pointermove", listeners.move);
+			window.removeEventListener("pointerup", listeners.up);
+			window.removeEventListener("pointercancel", listeners.cancel);
+		}
+		dragListeners.current = null;
+	}, []);
+	// If a card leaves the shelf, the shelf's own scroll offset may still
+	// point past the new first card. Reset it on shrink only: reordering or
+	// pinning must not jump the user back to the top.
+	const previousPinned = useRef([]);
+	useEffect(() => {
+		const node = shelfScrollRef.current;
+		const now = sanitizeCardLayout(cardLayout).pinned;
+		const before = previousPinned.current;
+		previousPinned.current = now;
+		if (!node) return;
+		if (before.some((id) => !now.includes(id))) node.scrollTop = 0;
+	}, [cardLayout]);
+	// The shelf's padding, gaps and the resize strip are outside the inner
+	// scroll container, so a wheel gesture there used to fall through to the
+	// unpinned list. The pinned band owns the vertical wheel for its whole
+	// painted box: while it has room it scrolls itself, and at either boundary
+	// it still consumes the gesture instead of chaining into the list. That is
+	// the requested containment: the pointer must leave the pinned band before
+	// the unpinned list starts moving. Ctrl/⌘+wheel stays untouched (app zoom),
+	// and horizontal wheels keep their native behaviour.
+	useEffect(() => {
+		const root = paneRootRef.current;
+		if (!root) return undefined;
+		const onWheel = (event) => {
+			if (event.ctrlKey || event.metaKey) return;
+			const shelf =
+				event.target && event.target.closest
+					? event.target.closest("[data-pinned-shelf]")
+					: null;
+			if (!shelf) return;
+			const node = shelf.querySelector("[data-pinned-shelf-scroll]");
+			if (!node) return;
+			let delta = event.deltaY;
+			if (event.deltaMode === 1) delta *= 16;
+			else if (event.deltaMode === 2) delta *= node.clientHeight;
+			if (!delta) return;
+			// Consume first: even with nothing left to scroll, the gesture
+			// must not bubble to the unpinned list behind the sticky band.
+			if (event.cancelable) event.preventDefault();
+			const max = node.scrollHeight - node.clientHeight;
+			if (max <= 1) return;
+			node.scrollTop = Math.max(0, Math.min(max, node.scrollTop + delta));
+		};
+		root.addEventListener("wheel", onWheel, { passive: false });
+		return () => root.removeEventListener("wheel", onWheel);
+	}, []);
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	// Agent monitor tabs. Every hook runs unconditionally; the views only read
 	// the shared snapshot query (one spawn per poll, deduped with the chip).
 	const tab = useValue(paneViewAtom);
 	const monitorOn = useValue(monitorEnabledAtom);
+	// Monitor mode adds a tab row and a summary strip; edit mode adds the
+	// layout toolbar and drag shells. Either can crowd a very short pane, so
+	// both opt into the compact layout (the summary strip and footer step
+	// aside, the tabs stay one scrollable row). A short quiet pane without
+	// the monitor keeps its footer: the cards still scroll there.
+	useEffect(() => {
+		if (!monitorOn && !editing) {
+			setCompactPane(false);
+			return undefined;
+		}
+		const root = paneRootRef.current;
+		if (!root) return undefined;
+		const compactHeight = monitorOn ? COMPACT_PANE_HEIGHT : EDIT_COMPACT_PANE_HEIGHT;
+		const update = () => {
+			const next =
+				root.clientHeight > 0 && root.clientHeight < compactHeight;
+			setCompactPane((current) => (current === next ? current : next));
+		};
+		update();
+		if (typeof ResizeObserver === "function") {
+			const observer = new ResizeObserver(update);
+			observer.observe(root);
+			return () => observer.disconnect();
+		}
+		if (typeof window !== "undefined") {
+			window.addEventListener("resize", update);
+			return () => window.removeEventListener("resize", update);
+		}
+		return undefined;
+	}, [monitorOn, editing]);
 	const forecastOn = useValue(quotaForecastAtom);
 	const mon = useMonitor();
 	const accountsOn = useValue(accountsTabAtom);
 	const activeTab = monitorOn && MONITOR_VIEWS.includes(tab) && (tab !== "accounts" || accountsOn) ? tab : "quota";
+	// Re-measure after the shelf remounts (settings/monitor tabs), and keep
+	// the cues live on scroll through React's own event binding.
+	const measureShelfEdges = () => {
+		const node = shelfScrollRef.current;
+		if (!node) {
+			setShelfEdges((current) => (current.top || current.bottom ? { top: false, bottom: false } : current));
+			return;
+		}
+		// `scrollbar-gutter: stable` reserves this even when the band does
+		// not overflow, so the value cannot flip as cards cross the fold.
+		const bar = Math.max(0, Math.round(node.offsetWidth - node.clientWidth));
+		setShelfScrollbar((current) => (current === bar ? current : bar));
+		const top = node.scrollTop > 2;
+		const bottom = node.scrollHeight - node.clientHeight - node.scrollTop > 2;
+		setShelfEdges((current) =>
+			current.top === top && current.bottom === bottom ? current : { top, bottom },
+		);
+	};
+	useEffect(() => {
+		const node = shelfScrollRef.current;
+		measureShelfEdges();
+		if (!node) return undefined;
+		node.addEventListener("scroll", measureShelfEdges, { passive: true });
+		let observer = null;
+		if (typeof ResizeObserver === "function") {
+			observer = new ResizeObserver(measureShelfEdges);
+			observer.observe(node);
+		}
+		return () => {
+			node.removeEventListener("scroll", measureShelfEdges);
+			if (observer) observer.disconnect();
+		};
+	}, [view, activeTab, editing, data, cardLayout]);
+	// Measure the resizable range from the cards themselves, not from a fixed
+	// percentage: the lower bound is the bottom of the first pinned card plus
+	// the resize strip, and the upper bound is min(the last pinned card's
+	// bottom plus that strip, half the plugin window). Both are in the shelf
+	// scroller's content coordinates, so the values do not change while the
+	// shelf is scrolled. A ResizeObserver keeps them correct when the pane
+	// width, the viewport height or a card's own content changes; pin/unpin
+	// and data refreshes re-run the effect.
+	useEffect(() => {
+		const root = paneRootRef.current;
+		const node = shelfScrollRef.current;
+		// The available card region, not the list scroller: the list shrinks
+		// as the shelf grows, so measuring it here would make the ceiling
+		// chase itself. `data-quota-body` is the stable box that holds both
+		// bands (it replaced the old single scrollport for this budget).
+		const region =
+			root && root.querySelector ? root.querySelector("[data-quota-body]") : null;
+		// Membership only: the list's own scroller, which is now a separate
+		// scrollport from the pinned band.
+		const listViewport =
+			root && root.querySelector ? root.querySelector("[data-quota-scroll]") : null;
+		if (!root || !node) {
+			setShelfMetrics((current) =>
+				current.ready
+					? { ready: false, min: 0, max: 0, overflows: false, floorBlocked: false }
+					: current,
+			);
+			return undefined;
+		}
+		const cardNodes = () => pinnedShelfCards(node);
+		const measure = () => {
+			const cards = cardNodes();
+			const paneHeight = root.clientHeight;
+			const viewportHeight = region ? region.clientHeight : 0;
+			if (!cards.length || paneHeight <= 0 || viewportHeight <= 0) return;
+			const nodeRect = node.getBoundingClientRect();
+			const scrollTop = node.scrollTop;
+			// Client rect + current offset = a stable content-space position.
+			const bottomOf = (el) =>
+				Math.ceil(el.getBoundingClientRect().bottom - nodeRect.top + scrollTop);
+			const firstBottom = bottomOf(cards[0]);
+			const lastBottom = bottomOf(cards[cards.length - 1]);
+			// A shelf sized exactly to the last card would still bury the
+			// strip's intruding half in that card's bottom border. Fitting
+			// the content therefore reserves the strip below it as well; the
+			// 50%/viewport caps still win when the cards do not fit.
+			const contentBottom = lastBottom + PINNED_SHELF_RESIZE_INTRUSION;
+			const hardMax = Math.max(
+				0,
+				Math.min(
+					contentBottom,
+					Math.floor(paneHeight / 2) - PINNED_SHELF_PADDING,
+					Math.floor(viewportHeight) - PINNED_SHELF_PADDING,
+				),
+			);
+			// The first card must stay fully visible above the resize strip:
+			// that is the shelf's floor. The strip intrudes into the bottom
+			// of the scrollport, so reserve its overlapping half below the
+			// card; otherwise the grip sits on the card's bottom border at
+			// the minimum height. A mixed pane also wants a usable slice of
+			// the unpinned list, and prefers 72px for it. In a pane too short
+			// for that budget the old rule let the list keep all 72px and
+			// collapsed the shelf to 0px, hiding every pinned card. Keep a
+			// usable pinned slice instead and shrink the list reserve to its
+			// own minimum; the physical budget still wins when even those
+			// two minima cannot fit. The handle reports the blocked state so
+			// an unattainable floor is visible rather than silently broken.
+			const firstFloor = firstBottom + PINNED_SHELF_RESIZE_INTRUSION;
+			const hasUnpinned = Boolean(
+				listViewport && listViewport.querySelector("[data-provider]"),
+			);
+			const budget = Math.max(
+				0,
+				Math.floor(viewportHeight) - PINNED_SHELF_PADDING,
+			);
+			let listReserve = 0;
+			if (hasUnpinned) {
+				const minimums =
+					PINNED_SHELF_MIN_USABLE + UNPINNED_LIST_MIN_USABLE;
+				if (budget >= minimums) {
+					listReserve = Math.min(
+						UNPINNED_LIST_PREFERRED,
+						Math.max(
+							UNPINNED_LIST_MIN_USABLE,
+							budget - PINNED_SHELF_MIN_USABLE,
+						),
+					);
+				} else {
+					// Neither lower bound fits. Splitting proportionally is
+					// still better than giving the list a fixed reserve and
+					// collapsing the shelf to zero: the pinned band keeps the
+					// larger share so its first card's header stays visible,
+					// while the list keeps a scrollable remainder.
+					listReserve = Math.floor(budget * 0.4);
+				}
+				// A pane shorter than the list minimum has no room for both
+				// bands; the list keeps what is physically available.
+				listReserve = Math.min(listReserve, budget);
+			}
+			const max = Math.max(0, Math.min(hardMax, budget - listReserve));
+			// The first card plus the strip cannot fit under the cap when
+			// the card is taller than half the window (or than the pane's
+			// visible viewport). There is no range that satisfies both
+			// limits, so the range collapses to the safe fallback above and
+			// the card stays scrollable inside the shelf instead of the
+			// band swallowing the pane. `min` never overtakes `max`; the
+			// blocked state exposes the unattainable floor honestly.
+			const min = Math.min(firstFloor, max);
+			const overflows = lastBottom > max + 0.5;
+			// The floor is unreachable when even the card alone fits but the
+			// strip would still cut its border. That is distinct from
+			// "everything already fits" and must not claim the latter.
+			const floorBlocked = firstFloor > max + 0.5;
+			setShelfMetrics((current) =>
+				current.ready &&
+				current.min === min &&
+				current.max === max &&
+				current.overflows === overflows &&
+				current.floorBlocked === floorBlocked
+					? current
+					: { ready: true, min, max, overflows, floorBlocked },
+			);
+		};
+		measure();
+		let observer = null;
+		if (typeof ResizeObserver === "function") {
+			observer = new ResizeObserver(measure);
+			observer.observe(root);
+			observer.observe(node);
+			if (region) observer.observe(region);
+			if (listViewport) observer.observe(listViewport);
+			for (const card of cardNodes()) observer.observe(card);
+		}
+		window.addEventListener("resize", measure);
+		let raf = 0;
+		if (typeof requestAnimationFrame === "function") raf = requestAnimationFrame(measure);
+		return () => {
+			if (raf) cancelAnimationFrame(raf);
+			window.removeEventListener("resize", measure);
+			if (observer) observer.disconnect();
+		};
+	}, [view, activeTab, editing, data, cardLayout]);
 	const showForecast = Boolean(forecastOn && view !== "settings" && activeTab === "quota" && mon.snapshot);
 	const history = useMonitorHistory(mon.scope, showForecast);
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
@@ -2616,6 +4510,9 @@ function QuotaPane({ page = false } = {}) {
 		: { width: "100%" };
 
 	let body;
+	let hasCards = false;
+	let pinnedShelf = null;
+	let layoutTools = null;
 	if (view === "settings") {
 		body = jsx(QuotaSettings, {});
 	} else if (activeTab !== "quota") {
@@ -2662,6 +4559,10 @@ function QuotaPane({ page = false } = {}) {
 		const monitorExtras = showForecast
 			? { burnMap: monitorBurnMap(mon.snapshot, history), history, nowSec: Date.now() / 1000 }
 			: null;
+		// The payload's own card order, before any stored preference. Used to
+		// collapse a complete materialised copy of it back to "default" when
+		// no pins or real ranks remain (legacy snapshots, a no-op sort/drop).
+		const naturalCardOrder = groups.map((group) => group.base);
 		// The announcement belongs to the Codex provider as a whole, so it is
 		// rendered once here instead of prefixing every account card.
 		const special =
@@ -2674,14 +4575,945 @@ function QuotaPane({ page = false } = {}) {
 		// "unconfigured": it keeps a muted card in the main list instead of
 		// vanishing behind the fold; the fold below is kept for markup
 		// stability but no longer holds any row.
-		const visible = groups.filter(
-			(group) => group.entries.length >= 2 || group.hasData
-				|| group.entries.some(([, p]) => isNoData(p)),
-		);
 		const withoutData = groups.filter(
 			(group) => group.entries.length === 1 && !group.hasData
 				&& !isNoData(group.entries[0][1]),
 		);
+		// Pins and both orders are preferences over the whole provider set,
+		// not just today's rows: orderCardGroups filters to what is currently
+		// rendered but the stored arrays keep missing/disabled ids.
+		const layout = sanitizeCardLayout(cardLayout);
+		const ordered = orderCardGroups(groups, layout);
+		const pinnedGroups = ordered.pinned;
+		const withoutBase = new Set(withoutData.map((group) => group.base));
+		const listGroups = ordered.unpinned.filter(
+			(group) => !withoutBase.has(group.base),
+		);
+		const foldGroups = ordered.unpinned.filter((group) =>
+			withoutBase.has(group.base),
+		);
+		// The root pointer handler drops into the band that was last drawn.
+		bandGroupsRef.current = {
+			pinned: pinnedGroups,
+			unpinned: ordered.unpinned,
+		};
+		hasCards = groups.length > 0;
+		const canSortCards = ordered.unpinned.length > 1;
+		// Reset is honest only when the visible layout really differs from the
+		// payload's default. A full order array that merely repeats the payload
+		// order is a materialised pin slot, not a custom choice: normalize it
+		// for this decision so a pin followed by an unpin leaves Reset inert
+		// (and a legacy copy of that state heals the same way).
+		const effectiveLayout = normalizeCardLayout(
+			layout,
+			naturalCardOrder,
+			naturalCardOrder,
+		);
+		const hasCustomCardLayout =
+			effectiveLayout.pinned.length > 0 ||
+			effectiveLayout.order.length > 0 ||
+			Boolean(effectiveLayout.sort);
+		// Alphabetical sorting is an unpinned-band action: pinned membership
+		// and pinned order are never read or written here. Build the full
+		// target layout now, while the question opens, so confirming is a
+		// single storage write instead of a second pass over the groups.
+		const sortedUnpinnedLayout = (direction) => {
+			const current = sanitizeCardLayout(cardLayoutAtom.get());
+			const bandGroups = ordered.unpinned;
+			const ids = bandGroups.map((group) => group.base);
+			if (ids.length < 2) return null;
+			const sorted = sortedCardGroupIds(bandGroups, direction);
+			const next = sortVisibleCardOrder(current.order, ids, sorted);
+			// Remember the direction as a preference, not just today's result:
+			// unpinning later has to know the band is sorted even if a provider
+			// appeared in the meantime and made the rendered order non-monotonic.
+			return { ...current, order: next, sort: direction };
+		};
+		layoutTools = editing
+			? jsxs("div", {
+					"data-card-layout-tools": true,
+					style: {
+						...column,
+						display: "flex",
+						justifyContent: "flex-end",
+						alignItems: "center",
+						gap: 2,
+						flexShrink: 0,
+						paddingTop: 2,
+					},
+					children: [
+						jsx(IconButton, {
+							title: t("sortCardsAz"),
+							disabled: !canSortCards,
+							onClick: () => {
+								const layoutNext = sortedUnpinnedLayout("asc");
+								if (layoutNext) {
+									setCardLayoutPrompt({
+										kind: "asc",
+										layout: layoutNext,
+										owner: paneInstance.current,
+									});
+								}
+							},
+							"data-card-sort": "asc",
+							children: jsx(CardGlyph, { name: "sortAz", className: "h-3.5 w-3.5" }),
+						}, "sort-cards-az"),
+						jsx(IconButton, {
+							title: t("sortCardsZa"),
+							disabled: !canSortCards,
+							onClick: () => {
+								const layoutNext = sortedUnpinnedLayout("desc");
+								if (layoutNext) {
+									setCardLayoutPrompt({
+										kind: "desc",
+										layout: layoutNext,
+										owner: paneInstance.current,
+									});
+								}
+							},
+							"data-card-sort": "desc",
+							children: jsx(CardGlyph, { name: "sortZa", className: "h-3.5 w-3.5" }),
+						}, "sort-cards-za"),
+						// A labelled button, not the circular-arrow icon: that
+						// glyph next to the header's refresh icon reads as
+						// "refresh", while this clears both bands at once.
+						jsx("button", {
+							type: "button",
+							title: `${t("resetCardLayout")}\n${t("resetCardLayoutHint")}`,
+							"aria-label": t("resetCardLayout"),
+							"aria-description": t("resetCardLayoutHint"),
+							disabled: !hasCustomCardLayout,
+							onClick: () => {
+								setCardLayoutPrompt({
+									kind: "reset",
+									layout: { pinned: [], order: [] },
+									owner: paneInstance.current,
+								});
+							},
+							"data-card-reset": true,
+							style: {
+								display: "inline-flex",
+								alignItems: "center",
+								height: 24,
+								padding: "0 8px",
+								flexShrink: 0,
+								borderRadius: 6,
+								border: "1px solid var(--ui-stroke-tertiary)",
+								background: "var(--ui-bg-elevated)",
+								color: "var(--ui-text-secondary)",
+								fontSize: "0.625rem",
+								fontWeight: 600,
+								cursor: hasCustomCardLayout ? "pointer" : "default",
+								opacity: hasCustomCardLayout ? 1 : 0.45,
+							},
+							children: t("resetCardLayoutShort"),
+						}, "reset-card-layout"),
+					],
+				})
+			: null;
+		// The shelf's height range is measured from its cards (see the effect
+		// above): the first card's bottom is the floor and min(last card's
+		// bottom, half the plugin window) is the ceiling. A drag only stores a
+		// preferred pixel height; the clamp runs on every render, so a pane
+		// that becomes shorter or loses pins contracts the band instead of
+		// overflowing it. Preferences survive a temporary clamp: widening the
+		// pane again restores the chosen height while it still fits.
+		const shelfRange = shelfMetrics.ready ? shelfMetrics : null;
+		const preferredShelfHeight =
+			shelfResizePreview == null ? savedShelfHeight : shelfResizePreview;
+		const shelfFrameHeight = shelfRange
+			? Math.round(
+					Math.min(
+						shelfRange.max,
+						Math.max(
+							shelfRange.min,
+							preferredShelfHeight == null ? shelfRange.max : preferredShelfHeight,
+						),
+					),
+				)
+			: preferredShelfHeight == null
+				? null
+				: Math.round(preferredShelfHeight);
+		// Before the first measurement a CSS cap keeps a tall shelf inside the
+		// pane. It is deliberately conservative: half the card region (whose
+		// height the shelf can query) is never more than half the plugin
+		// window, so the first paint cannot violate the final ceiling.
+		const shelfMaxHeight = shelfRange
+			? `${shelfRange.max}px`
+			: "calc(50cqh - 12px)";
+		// The handle is inert whenever the range collapses: a card too tall
+		// for the cap, a pane too tight for the card plus the strip, or
+		// simply "every pinned card already fits", which needs the other
+		// explanation.
+		const shelfResizeCollapsed =
+			Boolean(shelfRange) && shelfRange.max - shelfRange.min < 1;
+		const shelfResizeFits =
+			shelfResizeCollapsed && !shelfRange.overflows && !shelfRange.floorBlocked;
+		const shelfResizeDisabled = !shelfRange || shelfResizeCollapsed;
+		const previewShelfHeight = (value) => setShelfResizePreview(value);
+		const cancelShelfHeight = () => setShelfResizePreview(null);
+		const commitShelfHeight = (value) => {
+			// Choosing the ceiling means "as tall as this pane allows", which is
+			// the automatic fit by another name. Store it as null so a later pin
+			// (or a taller pane) can still grow the band naturally instead of
+			// freezing today's pixel value as a manual preference.
+			const atCeiling =
+				shelfRange != null && value != null && value >= shelfRange.max - 0.5;
+			setPinnedShelfHeight(atCeiling ? null : value);
+			setShelfResizePreview(null);
+		};
+		// Double-click snap: the card under the pointer (in the shelf's own
+		// scrolled content) supplies the boundary, and the measured range
+		// clamps it. The half-pane ceiling always wins, so a click that asks
+		// for a card bottom beyond the cap lands exactly on the cap. The
+		// shared commit path keeps the ceiling's "automatic fit" meaning.
+		const snapShelfToCard = (clientY) => {
+			if (!shelfRange || shelfResizeDisabled) return;
+			const raw = pinnedShelfSnapHeight(shelfScrollRef.current, clientY);
+			if (raw == null) return;
+			const next = Math.round(
+				Math.min(shelfRange.max, Math.max(shelfRange.min, raw)),
+			);
+			commitShelfHeight(next);
+		};
+
+		const pinGroup = (band, bandGroups, base) => {
+			const current = sanitizeCardLayout(cardLayoutAtom.get());
+			// Only an exact ceiling match is the automatic fit. A saved height
+			// above today's temporarily clamped max is still the user's real
+			// preference and must survive into the taller pane. An exact match
+			// also heals a value frozen by an old click on the resize edge, so
+			// the new pin can grow the band instead of staying hidden.
+			if (
+				band === "unpinned" &&
+				shelfRange &&
+				savedShelfHeight != null &&
+				Math.abs(savedShelfHeight - shelfRange.max) <= 0.5
+			) {
+				setPinnedShelfHeight(null);
+			}
+			// The slot and anchors are recorded against the whole unpinned
+			// band as drawn, including the quiet "No data" fold. `bandGroups`
+			// passed to a fold card is only the fold, so read the full band
+			// from the ref that the render stored; unpinning uses that same
+			// list.
+			const slotGroups =
+				band === "unpinned"
+					? bandGroupsRef.current.unpinned || bandGroups
+					: bandGroups;
+			const slotIds = slotGroups.map((group) => group.base);
+			// The full band, as it would be drawn with every card unpinned.
+			// Pinned cards still own ranks here, so it is the only view that
+			// lets a new pin remember its neighbours relative to the cards
+			// already on the shelf. Reconstructing that view from slots and
+			// anchors alone was order-dependent: a pin recorded against a
+			// partial list could name the wrong side of an earlier pin, and the
+			// pair then swapped on unpin depending on which one went first.
+			const fullBandIds = orderCardGroups(groups, {
+				...current,
+				pinned: [],
+			}).unpinned.map((group) => group.base);
+			const toggled = toggleCardPin(current, base);
+			const pinning = toggled.pinned.length > current.pinned.length;
+			const next = { ...toggled };
+			if (pinning) {
+				// Remember the card's current slot and neighbours instead of
+				// copying the whole unpinned band into `order`. A snapshot
+				// would masquerade as a custom order: a provider added while
+				// the card is pinned would be appended after the frozen list,
+				// and a pin followed by an unpin would leave Reset pointing
+				// at a preference the user never made. The anchors are the
+				// primary restore position because indices shift when the
+				// band is sorted or a provider is inserted/removed, and a
+				// hand reorder rewrites an existing rank's slot. Record them
+				// for a card that already has a rank too: that rank alone no
+				// longer names the providers it sat between. The old rank is
+				// still the last-resort fallback when the anchors are gone.
+				// The numeric slot is only recorded for an unranked card;
+				// for a ranked one the rank already is that fallback.
+				if (!current.order.includes(base)) {
+					const at = Math.max(0, slotIds.indexOf(base));
+					next.pinSlots = {
+						...(current.pinSlots || {}),
+						[base]: at,
+					};
+				}
+				const anchors = { ...(current.pinAnchors || {}) };
+				const seat = fullBandIds.indexOf(base);
+				const prev = seat > 0 ? fullBandIds[seat - 1] : "";
+				const following =
+					seat >= 0 && seat < fullBandIds.length - 1
+						? fullBandIds[seat + 1]
+						: "";
+				if (prev || following) {
+					anchors[base] = { prev: prev || null, next: following || null };
+				} else {
+					delete anchors[base];
+				}
+				if (Object.keys(anchors).length > 0) next.pinAnchors = anchors;
+				else delete next.pinAnchors;
+			} else if (
+				(current.pinSlots && base in current.pinSlots) ||
+				(current.pinAnchors && base in current.pinAnchors) ||
+				current.order.includes(base)
+			) {
+				// Unpinning: put the card back at its recorded position in
+				// today's unpinned band. An explicit A-Z / Z-A sort owns the
+				// band, so the card (and any provider that appeared after the
+				// sort) is placed by that sort rather than by a rank or an
+				// anchor pair that the sort has since invalidated. Without an
+				// explicit sort the neighbour anchors restore the relation
+				// from pin time, even if providers before it were inserted or
+				// removed. `order` may also hold ranks for disabled or
+				// temporarily missing providers, and for cards that are still
+				// pinned: only the visible slots are rewritten, and a stored
+				// order that already draws the restored band is left untouched.
+				const unpinnedGroups = bandGroupsRef.current.unpinned || [];
+				const unpinnedIds = unpinnedGroups.map((group) => group.base);
+				const allGroups = [
+					...(bandGroupsRef.current.pinned || []),
+					...unpinnedGroups,
+				];
+				const group = allGroups.find((entry) => entry.base === base);
+				if (current.sort) {
+					const sorted = sortedCardGroupIds(
+						group ? [...unpinnedGroups, group] : unpinnedGroups,
+						current.sort,
+					);
+					next.order = sortVisibleCardOrder(current.order, sorted, sorted);
+				} else {
+					next.order = restorePinnedCardSlot(
+						current.order,
+						unpinnedIds,
+						fullBandIds,
+						current.pinned,
+						base,
+						current.pinSlots && current.pinSlots[base],
+						current.pinAnchors && current.pinAnchors[base],
+					);
+				}
+			}
+			if (!pinning) {
+				if (next.pinSlots) {
+					const slots = { ...next.pinSlots };
+					delete slots[base];
+					if (Object.keys(slots).length > 0) next.pinSlots = slots;
+					else delete next.pinSlots;
+				}
+				if (next.pinAnchors) {
+					const anchors = { ...next.pinAnchors };
+					delete anchors[base];
+					if (Object.keys(anchors).length > 0) next.pinAnchors = anchors;
+					else delete next.pinAnchors;
+				}
+			}
+			pendingCardFocus.current = base;
+			setCardLayout(
+				normalizeCardLayout(next, naturalCardOrder, naturalCardOrder),
+			);
+		};
+		const moveGroup = (band, bandGroups, base, delta) => {
+			const current = sanitizeCardLayout(cardLayoutAtom.get());
+			const ids = bandGroups.map((group) => group.base);
+			const stored = band === "pinned" ? current.pinned : current.order;
+			// A move that cannot happen returns before writing, so an edge
+			// arrow still leaves the stored layout untouched.
+			const seed =
+				band === "unpinned"
+					? seedUnpinnedMoveOrder(
+							current,
+							stored,
+							orderCardGroups(groups, { ...current, pinned: [] }).unpinned.map(
+								(group) => group.base,
+							),
+						)
+					: stored;
+			// A sorted band is drawn from its own sequence, not from `order`:
+			// swap the visible neighbours and write that band into the stored
+			// slots. Swapping stored positions here moved an unrelated card
+			// that a disabled provider's rank had pushed to the other side.
+			let next;
+			if (band === "unpinned" && current.sort) {
+				const from = ids.indexOf(base);
+				const to = from + (Number(delta) < 0 ? -1 : 1);
+				if (from < 0 || to < 0 || to >= ids.length) return;
+				const moved = ids.slice();
+				moved[from] = ids[to];
+				moved[to] = base;
+				next = reorderVisibleCardOrder(seed, ids, moved);
+			} else {
+				const from = ids.indexOf(base);
+				const to = from + (Number(delta) < 0 ? -1 : 1);
+				if (from < 0 || to < 0 || to >= ids.length) return;
+				next = moveCardInBand(seed, ids, base, delta);
+			}
+			if (next.join("\u0000") === stored.join("\u0000")) {
+				// A move under a sort can land on the same stored sequence it
+				// already had (the pre-sort rank happened to be the destination
+				// band). The visible move still happened, so the sort must be
+				// cleared; otherwise the sorted render hides the new order.
+				if (!(band === "unpinned" && current.sort)) return;
+			}
+			const nextLayout = {
+				...current,
+				...(band === "pinned" ? { pinned: next } : { order: next }),
+			};
+			// A hand-placed card is a custom order now: keeping the old
+			// A-Z / Z-A intent would make the next unpin sort the band again.
+			if (band === "unpinned") delete nextLayout.sort;
+			setCardLayout(nextLayout);
+		};
+		// Drag is an insertion, not a swap: the rest of the band shifts. Only
+		// the band that owns the dragged card may change, so a drop over the
+		// other band is refused before it reaches storage.
+		const moveGroupTo = (band, bandGroups, id, targetId, before) => {
+			const current = sanitizeCardLayout(cardLayoutAtom.get());
+			const ids = bandGroups.map((group) => group.base);
+			const stored = band === "pinned" ? current.pinned : current.order;
+			// Dropping a card back into the slot it already occupies is not a
+			// new custom order: leave the stored layout (and an active sort)
+			// untouched instead of materialising the merged band.
+			const moved = draggedCardBand(ids, id, targetId, before);
+			if (!moved) return;
+			const seed =
+				band === "unpinned"
+					? seedUnpinnedMoveOrder(
+							current,
+							stored,
+							orderCardGroups(groups, { ...current, pinned: [] }).unpinned.map(
+								(group) => group.base,
+							),
+						)
+					: stored;
+			const next =
+				band === "unpinned" && current.sort
+					? reorderVisibleCardOrder(seed, ids, moved)
+					: moveCardToSlot(seed, ids, id, targetId, before);
+			if (next.join("\u0000") === stored.join("\u0000")) {
+				// Same as an arrow: a real drop under a sort must clear the
+				// direction even when the stored sequence already matched.
+				if (!(band === "unpinned" && current.sort)) return;
+			}
+			const nextLayout = {
+				...current,
+				...(band === "pinned" ? { pinned: next } : { order: next }),
+			};
+			// Same as an arrow move: a drag is an explicit custom order.
+			if (band === "unpinned") delete nextLayout.sort;
+			setCardLayout(nextLayout);
+		};
+		// The card's own scroller, never the other band's: each band owns its
+		// own scrollport, so a drag in one can never move the other.
+		const cardBandScroller = (band) => {
+			const root = paneRootRef.current;
+			if (!root) return null;
+			return band === "pinned"
+				? root.querySelector("[data-pinned-shelf-scroll]")
+				: root.querySelector("[data-quota-scroll]");
+		};
+		const scrollCardBandBy = (band, delta) => {
+			const node = cardBandScroller(band);
+			if (!node) return false;
+			const max = node.scrollHeight - node.clientHeight;
+			if (max <= 1) return false;
+			const next = Math.max(0, Math.min(max, node.scrollTop + delta));
+			if (next === node.scrollTop) return false;
+			node.scrollTop = next;
+			return true;
+		};
+		// Re-pick the card under the pointer after the band scrolled without a
+		// pointer move (edge autoscroll or wheel), so the insertion preview and
+		// the eventual drop agree with what is now visible.
+		const cardDropAt = (x, y) => {
+			const source = dragSource.current;
+			if (!source) return null;
+			const scroller = cardBandScroller(source.band);
+			if (!scroller) return null;
+			const root = paneRootRef.current;
+			// A pinned drop can land in the shelf's own padding below the last
+			// card; an unpinned drop must not treat the pinned band as list
+			// space even though both bands share the same body region.
+			const boundsNode =
+				source.band === "pinned" && root
+					? root.querySelector("[data-pinned-shelf]") || scroller
+					: scroller;
+			const bounds = boundsNode.getBoundingClientRect();
+			if (x < bounds.left || x > bounds.right || y < bounds.top || y > bounds.bottom) {
+				return null;
+			}
+			if (source.band === "unpinned" && root) {
+				const shelf = root.querySelector("[data-pinned-shelf]");
+				if (shelf) {
+					const shelfRect = shelf.getBoundingClientRect();
+					if (y >= shelfRect.top && y <= shelfRect.bottom) return null;
+				}
+			}
+			const hit = typeof document.elementFromPoint === "function"
+				? document.elementFromPoint(x, y)
+				: null;
+			const shell = hit && hit.closest ? hit.closest("[data-card-shell]") : null;
+			if (shell) {
+				const band = shell.getAttribute("data-card-band");
+				const id = shell.getAttribute("data-card-shell");
+				if (!band || !id || band !== source.band || id === source.id) return null;
+				const rect = shell.getBoundingClientRect();
+				return { band, id, before: y < rect.top + rect.height / 2 };
+			}
+			// A release between cards, above the first or below the last one
+			// is still an insertion, not a dead zone: pick the slot the pointer
+			// is closest to using the cards as drawn. The insertion line then
+			// lands on that card, so the preview matches the drop.
+			const cards = [...scroller.querySelectorAll("[data-card-shell]")]
+				.filter((node) => node.getAttribute("data-card-band") === source.band);
+			if (cards.length === 0) return null;
+			let lastId = null;
+			for (const node of cards) {
+				const id = node.getAttribute("data-card-shell");
+				if (!id) continue;
+				const rect = node.getBoundingClientRect();
+				if (y < rect.top) {
+					if (id === source.id) return null;
+					return { band: source.band, id, before: true };
+				}
+				if (y <= rect.bottom) {
+					if (id === source.id) return null;
+					return {
+						band: source.band,
+						id,
+						before: y < rect.top + rect.height / 2,
+					};
+				}
+				lastId = id;
+			}
+			if (!lastId || lastId === source.id) return null;
+			return { band: source.band, id: lastId, before: false };
+		};
+		// Re-pick the card under the pointer after the band scrolled without a
+		// pointer move (edge autoscroll or wheel), so the insertion preview and
+		// the eventual drop agree with what is now visible.
+		const updateCardDropTarget = (x, y) => {
+			const hit = cardDropAt(x, y);
+			setCardDragOver((current) => {
+				if (!hit) return current ? null : current;
+				return current && current.id === hit.id && current.before === hit.before
+					? current
+					: { id: hit.id, before: hit.before };
+			});
+		};
+		const stopCardAutoScroll = () => {
+			if (dragAutoScrollRaf.current) {
+				cancelAnimationFrame(dragAutoScrollRaf.current);
+				dragAutoScrollRaf.current = 0;
+			}
+			if (dragWheelCleanup.current) {
+				dragWheelCleanup.current();
+				dragWheelCleanup.current = null;
+			}
+		};
+		// Keep the source band scrolling while the pointer is held near its
+		// edge: a drag cannot rely on native autoscroll for a nested shelf, and
+		// wheel input is only an optional accelerator.
+		const startCardAutoScroll = () => {
+			stopCardAutoScroll();
+			// The VM widget harness has no rAF/window; drag still works there,
+			// it just cannot scroll a browser viewport it does not have.
+			if (typeof requestAnimationFrame !== "function") return;
+			const tick = () => {
+				const source = dragSource.current;
+				if (!source) return;
+				const node = cardBandScroller(source.band);
+				const { x, y } = dragPointer.current;
+				if (node) {
+					const rect = node.getBoundingClientRect();
+					if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+						const edge = 36;
+						const step = 14;
+						const fromTop = y - rect.top;
+						const fromBottom = rect.bottom - y;
+						let delta = 0;
+						if (fromTop < edge) {
+							delta = -Math.max(2, Math.ceil(((edge - fromTop) / edge) * step));
+						} else if (fromBottom < edge) {
+							delta = Math.max(2, Math.ceil(((edge - fromBottom) / edge) * step));
+						}
+						if (delta && scrollCardBandBy(source.band, delta)) {
+							updateCardDropTarget(x, y);
+						}
+					}
+				}
+				dragAutoScrollRaf.current = requestAnimationFrame(tick);
+			};
+			dragAutoScrollRaf.current = requestAnimationFrame(tick);
+			// Pointer drags do not suppress wheel input the way native drags do:
+			// route it to the source band and keep the page behind the drag still.
+			const onWheel = (event) => {
+				const source = dragSource.current;
+				if (!source) return;
+				// Ctrl/⌘+wheel is app/browser zoom, never card ordering.
+				if (event.ctrlKey || event.metaKey) return;
+				// The shelf's own wheel routing already consumed this gesture;
+				// scrolling it again here would move two steps per notch.
+				if (event.defaultPrevented) return;
+				let delta = event.deltaY;
+				if (event.deltaMode === 1) delta *= 16;
+				else if (event.deltaMode === 2) delta *= 400;
+				if (!delta) return;
+				if (scrollCardBandBy(source.band, delta)) {
+					if (event.cancelable) event.preventDefault();
+					dragPointer.current = { x: event.clientX, y: event.clientY };
+					updateCardDropTarget(event.clientX, event.clientY);
+				}
+			};
+			window.addEventListener("wheel", onWheel, { passive: false });
+			dragWheelCleanup.current = () => {
+				window.removeEventListener("wheel", onWheel);
+			};
+		};
+		const clearCardDrag = () => {
+			dragSource.current = null;
+			dragCandidate.current = null;
+			setCardDragOver(null);
+			setDraggingId(null);
+			stopCardAutoScroll();
+			if (dragGhost.current) {
+				if (dragGhost.current.parentNode) {
+					dragGhost.current.parentNode.removeChild(dragGhost.current);
+				}
+				dragGhost.current = null;
+			}
+			if (typeof document !== "undefined" && document.body) {
+				document.body.style.cursor = "";
+			}
+			const listeners = dragListeners.current;
+			if (listeners && typeof window !== "undefined") {
+				window.removeEventListener("pointermove", listeners.move);
+				window.removeEventListener("pointerup", listeners.up);
+				window.removeEventListener("pointercancel", listeners.cancel);
+			}
+			dragListeners.current = null;
+		};
+		// Controls stay click targets: a press that starts on a button, link,
+		// input, select or anything marked no-drag must never become a card
+		// drag, however far the pointer then moves.
+		const isInteractiveCardTarget = (target) =>
+			Boolean(
+				target &&
+					target.closest &&
+					target.closest(
+						"button, a[href], input, textarea, select, [contenteditable='true'], [role='button'], [data-no-card-drag]",
+					),
+			);
+		// Arm a pointer drag from the card body. Native HTML5 drag is not used:
+		// Chromium stops delivering drop events after a scroller is moved
+		// programmatically mid-drag, which is exactly what dragging past the fold
+		// requires. Pointer events also let wheel scrolling work normally.
+		const startPointerDrag = (event, shell, band, id) => {
+			if (dragListeners.current) clearCardDrag();
+			const candidate = {
+				band,
+				id,
+				shell,
+				x: event.clientX,
+				y: event.clientY,
+				pointerId: event.pointerId,
+			};
+			dragCandidate.current = candidate;
+			if (event.cancelable) event.preventDefault();
+			const onMove = (moveEvent) => {
+				if (!dragCandidate.current || moveEvent.pointerId !== candidate.pointerId) return;
+				if (!dragSource.current) {
+					const dx = moveEvent.clientX - candidate.x;
+					const dy = moveEvent.clientY - candidate.y;
+					if (Math.hypot(dx, dy) < 5) return;
+					const rect = shell.getBoundingClientRect();
+					dragSource.current = { band, id };
+					dragPointer.current = { x: moveEvent.clientX, y: moveEvent.clientY };
+					dragGhostOffset.current = {
+						x: candidate.x - rect.left,
+						y: candidate.y - rect.top,
+					};
+					const ghost = shell.cloneNode(true);
+					ghost.removeAttribute("data-card-shell");
+					ghost.removeAttribute("data-card-band");
+					ghost.removeAttribute("data-card-drop");
+					ghost.setAttribute("data-card-ghost", "");
+					ghost.setAttribute("aria-hidden", "true");
+					ghost.style.position = "fixed";
+					ghost.style.pointerEvents = "none";
+					ghost.style.zIndex = "2147483000";
+					ghost.style.margin = "0";
+					ghost.style.width = `${rect.width}px`;
+					ghost.style.height = `${rect.height}px`;
+					ghost.style.left = `${rect.left}px`;
+					ghost.style.top = `${rect.top}px`;
+					ghost.style.opacity = "0.92";
+					ghost.style.boxShadow = "0 14px 34px rgba(0, 0, 0, 0.35)";
+					document.body.appendChild(ghost);
+					dragGhost.current = ghost;
+					setDraggingId(id);
+					document.body.style.cursor = "grabbing";
+					try {
+						shell.setPointerCapture(candidate.pointerId);
+					} catch {
+						/* noop */
+					}
+					startCardAutoScroll();
+				}
+				const x = moveEvent.clientX;
+				const y = moveEvent.clientY;
+				dragPointer.current = { x, y };
+				if (dragGhost.current) {
+					dragGhost.current.style.left = `${Math.round(x - dragGhostOffset.current.x)}px`;
+					dragGhost.current.style.top = `${Math.round(y - dragGhostOffset.current.y)}px`;
+				}
+				updateCardDropTarget(x, y);
+				if (moveEvent.cancelable) moveEvent.preventDefault();
+			};
+			const onUp = (upEvent) => {
+				if (upEvent.pointerId !== candidate.pointerId) return;
+				const source = dragSource.current;
+				if (source) {
+					const hit = cardDropAt(upEvent.clientX, upEvent.clientY);
+					if (hit && hit.band === source.band) {
+						moveGroupTo(
+							source.band,
+							bandGroupsRef.current[source.band] || [],
+							source.id,
+							hit.id,
+							hit.before,
+						);
+					}
+				}
+				clearCardDrag();
+			};
+			const onCancel = (cancelEvent) => {
+				if (cancelEvent.pointerId !== candidate.pointerId) return;
+				clearCardDrag();
+			};
+			window.addEventListener("pointermove", onMove, { passive: false });
+			window.addEventListener("pointerup", onUp);
+			window.addEventListener("pointercancel", onCancel);
+			dragListeners.current = { move: onMove, up: onUp, cancel: onCancel };
+		};
+		const onCardPointerDown = (event) => {
+			if (!editing || event.button !== 0 || event.pointerType === "touch") return;
+			if (isInteractiveCardTarget(event.target)) return;
+			const shell =
+				event.target && event.target.closest
+					? event.target.closest("[data-card-shell]")
+					: null;
+			if (!shell) return;
+			const band = shell.getAttribute("data-card-band");
+			const id = shell.getAttribute("data-card-shell");
+			if (!band || !id) return;
+			startPointerDrag(event, shell, band, id);
+		};
+		cardPointerDownRef.current = onCardPointerDown;
+		const renderCard = (group, band, bandGroups, index) => {
+			const isGroup = group.entries.length >= 2;
+			const name = isGroup
+				? providerMeta(group.base).name
+				: providerDisplayName(group.entries[0][0], group.entries[0][1]);
+			// Controls live in a single card's header (the top-right slot the
+			// plan pill normally uses), so edit mode costs no extra vertical
+			// space. A grouped card keeps its account buttons in that header
+			// and gets a compact control row of its own instead, so adding
+			// edit mode cannot squeeze the account selector or the name.
+			// Edit mode turns the whole card into the drag surface: grabbing the
+			// header, a ring or the empty space between controls reorders it. The
+			// pane's pointerdown handler excludes controls, so pin, arrows and
+			// account buttons remain plain click targets.
+			const controls = editing
+				? jsx(CardLayoutControls, {
+						id: group.base,
+						name,
+						pinned: band === "pinned",
+						canUp: index > 0,
+						canDown: index < bandGroups.length - 1,
+						onPin: () => pinGroup(band, bandGroups, group.base),
+						onUp: () => moveGroup(band, bandGroups, group.base, -1),
+						onDown: () => moveGroup(band, bandGroups, group.base, 1),
+					})
+				: null;
+			// Pointer drag anywhere on the card in edit mode. The arrow buttons
+			// stay the keyboard and single-pointer path (WCAG 2.5.7), so drag is
+			// an addition rather than a replacement. Only a same-band drop is
+			// accepted; the top half inserts before the card and the bottom
+			// half after it.
+			const dragging = draggingId === group.base;
+			const dropTarget =
+				editing && cardDragOver && cardDragOver.id === group.base
+					? cardDragOver.before
+						? "before"
+						: "after"
+					: null;
+			const card = isGroup
+				? jsx(ProviderCardGroup, {
+						entries: group.entries,
+						monitor: monitorExtras, page,
+						special: group.base === "openai-codex" ? special : null,
+						editMode: editing,
+						editControls: controls,
+						pinned: band === "pinned",
+						key: group.base,
+					})
+				: jsx(ProviderRow, {
+						id: group.entries[0][0],
+						provider: group.entries[0][1],
+						monitor: monitorExtras, page,
+						special:
+							group.entries[0][0] === "openai-codex" ? special : null,
+						editControls: controls,
+						pinned: band === "pinned",
+						// Base is stable across band moves and reorder; an
+						// index-suffixed key would remount the Codex card on
+						// every move and drop keyboard focus.
+						key: group.base,
+					});
+			if (!editing) return card;
+			return jsx(
+				"div",
+				{
+					"data-card-shell": group.base,
+					"data-card-band": band,
+					"data-card-drop": dropTarget || undefined,
+					style: {
+						display: "flex",
+						flexDirection: "column",
+						flexShrink: 0,
+						minWidth: 0,
+						// The whole card is the handle in edit mode; controls
+						// keep their own pointer cursor from the host stylesheet.
+						cursor: "grab",
+						userSelect: "none",
+						WebkitUserSelect: "none",
+						opacity: dragging ? 0.55 : 1,
+						boxShadow: dropTarget
+							? cardDropLine(dropTarget === "before")
+							: undefined,
+					},
+					children: card,
+				},
+				`shell-${group.base}`,
+			);
+		};
+
+		// The shelf is one sticky, OPAQUE box: its own background paints the
+		// full band including the padding, so unpinned cards scrolling
+		// underneath never show through the gap below the last pinned card.
+		// It must paint the *pane* surface (--ui-bg-chrome, the token the
+		// pane shell uses) rather than the chat/card surface: a different
+		// opaque token made the pinned band read as its own container.
+		// --ui-chat-bubble-opaque-background/--ui-bg-editor are the opaque
+		// fallbacks for older hosts.
+		pinnedShelf = pinnedGroups.length
+			? jsxs("div", {
+					"data-pinned-shelf": true,
+					role: "region",
+					"aria-label": t("pinnedCardsLabel"),
+					style: {
+						...column,
+						width: "100%",
+						position: "sticky",
+						top: 0,
+						zIndex: 2,
+						flexShrink: 0,
+						minHeight: 0,
+						// 4px, not 2px: the band starts at the top edge of
+						// the card region and paints that edge opaquely;
+						// the extra 2px keeps the first card where it used
+						// to sit.
+						paddingTop: PINNED_SHELF_PADDING_TOP,
+						paddingBottom: PINNED_SHELF_PADDING_BOTTOM,
+						background:
+							"var(--ui-bg-chrome, var(--ui-chat-bubble-opaque-background, var(--ui-bg-editor)))",
+						// No border or shadow: the band is only a backdrop, and
+						// any separator would read as a section of its own.
+						// Square corners on purpose: a rounded corner would leave
+						// a transparent notch for a scrolling card to show through.
+						boxSizing: "border-box",
+						// Read by the overflow cues and the resize strip so they
+						// stop at the band's scrollbar instead of covering it.
+						"--quota-pinned-scrollbar": `${shelfScrollbar}px`,
+					},
+					children: [
+						jsx("div", {
+							"data-pinned-shelf-frame": true,
+							style: {
+								display: "flex",
+								flexDirection: "column",
+								minHeight: 0,
+								// `height` is the measured/clamped value; the
+								// cap keeps a preferred height that a resize
+								// has not re-clamped yet from overflowing.
+								height: shelfFrameHeight == null ? undefined : shelfFrameHeight,
+								maxHeight: shelfMaxHeight,
+								width: "100%",
+								position: "relative",
+								boxSizing: "border-box",
+							},
+							children: [
+								// Always mounted, only painted when that edge has more
+								// pinned cards: an overlay cannot change the scroller's
+								// height, so the shelf never jumps as cues appear.
+								jsx(PinnedOverflowCue, { edge: "top", active: shelfEdges.top }, "pinned-overflow-top"),
+								jsx("div", {
+									ref: shelfScrollRef,
+									"data-pinned-shelf-scroll": true,
+									onScroll: measureShelfEdges,
+									style: {
+										display: "flex",
+										flexDirection: "column",
+										gap: 8,
+										flex: "1 1 auto",
+										minHeight: 0,
+										overflowY: "auto",
+										overflowX: "hidden",
+										// Pointer wheels are contained in JS below;
+										// this also stops touch/trackpad scroll
+										// chaining at either end of the shelf.
+										overscrollBehaviorY: "contain",
+										width: "100%",
+										boxSizing: "border-box",
+										// A real, native scrollbar: the pinned band
+										// scrolls on its own and the bar must be
+										// visible (and draggable) inside this band.
+										// `stable` reserves the same gutter as the
+										// list below even when one band fits, so
+										// pinned and unpinned cards keep identical
+										// widths and edges.
+										scrollbarGutter: "stable",
+									},
+									children: pinnedGroups.map((group, index) =>
+										renderCard(group, "pinned", pinnedGroups, index),
+									),
+								}, "pinned-cards"),
+								jsx(PinnedOverflowCue, { edge: "bottom", active: shelfEdges.bottom }, "pinned-overflow-bottom"),
+							],
+						}),
+						// A 16px overlay in the shelf's bottom padding;
+						// it never adds layout height, so the last card
+						// keeps its old distance from the unpinned list.
+						jsx(
+							PinnedShelfResizer,
+							{
+								height: shelfFrameHeight,
+								min: shelfRange ? shelfRange.min : 0,
+								max: shelfRange ? shelfRange.max : 0,
+								disabled: shelfResizeDisabled,
+								blocked: shelfResizeCollapsed,
+								fits: shelfResizeFits,
+								onChange: previewShelfHeight,
+								onCommit: commitShelfHeight,
+								onCancel: cancelShelfHeight,
+								onSnap: snapShelfToCard,
+							},
+							"pinned-shelf-resize",
+						),
+					],
+				})
+			: null;
+
 		body = jsxs("div", {
 			style: { ...UI.col, gap: 8 },
 			children: [
@@ -2701,44 +5533,30 @@ function QuotaPane({ page = false } = {}) {
 						)
 					: null,
 				mon.snapshot ? jsx(AccountHints, { providers: data.providers }, "account-hints") : null,
-				...visible.map((group, index) => {
-					if (group.entries.length >= 2) {
-						return jsx(ProviderCardGroup, {
-							entries: group.entries,
-							monitor: monitorExtras, page,
-							special: group.base === "openai-codex" ? special : null,
-							key: group.base,
-						});
-					}
-					const [id, p] = group.entries[0];
-					return jsx(ProviderRow, {
-						id,
-						provider: p,
-						monitor: monitorExtras, page,
-						special: id === "openai-codex" ? special : null,
-						key: id === "openai-codex" ? `${id}-${index}` : id,
-					});
-				}),
-				withoutData.length > 0
+				editing && page
+					? jsx("div", {
+							"data-card-edit-hint": true,
+							style: { ...UI.tiny, lineHeight: 1.4 },
+							children: t("editCardsHint"),
+						}, "edit-hint")
+					: null,
+				...listGroups.map((group, index) =>
+					renderCard(group, "unpinned", listGroups, index),
+				),
+				foldGroups.length > 0
 					? jsxs("details", {
 							style: { marginTop: 2 },
 							children: [
 								jsx("summary", {
 									className: "cursor-pointer select-none",
 									style: UI.faint,
-									children: t("noDataSection", withoutData.length),
+									children: t("noDataSection", foldGroups.length),
 								}),
 								jsx("div", {
 									className: "mt-1.5 flex flex-col gap-2",
-									children: withoutData.map((group, index) => {
-										const [id, p] = group.entries[0];
-										return jsx(ProviderRow, {
-											id,
-											provider: p,
-											page,
-											key: id === "openai-codex" ? `${id}-${index}` : id,
-										});
-									}),
+									children: foldGroups.map((group, index) =>
+										renderCard(group, "unpinned", foldGroups, index),
+									),
 								}),
 							],
 						})
@@ -2762,12 +5580,28 @@ function QuotaPane({ page = false } = {}) {
 					}
 				: null;
 
+	// The edit toggle only exists while the card list has cards. If an empty
+	// payload leaves the list with nothing to edit, clear the transient session
+	// so a later payload does not silently resume an edit mode whose toggle was
+	// hidden in the meantime. Settings/monitor views keep the session: their
+	// toggle comes back with the list, so nothing is trapped there.
+	const cardListActive = view !== "settings" && activeTab === "quota";
+	useEffect(() => {
+		if (cardListActive && !hasCards) setEditing(false);
+	}, [cardListActive, hasCards]);
+
 	return jsxs("div", {
+		ref: paneRootRef,
 		className: "flex h-full flex-col",
 		"data-quota-layout": page ? "page" : "pane",
+		// The whole-card drag starts here: a press on any non-control area of a
+		// card shell arms a pointer drag, then a small movement starts it.
+		onPointerDown: (event) => {
+			if (cardPointerDownRef.current) cardPointerDownRef.current(event);
+		},
 		dir: localeDir(),
 		lang: intlTag(),
-		style: { minHeight: 0, minWidth: 0, overflow: "auto", boxSizing: "border-box", gap: 8, padding: page ? "14px 20px 10px" : "10px 12px 8px" },
+		style: { minHeight: 0, minWidth: 0, width: "100%", overflow: "auto", boxSizing: "border-box", gap: compactPane ? 6 : 8, padding: page ? "14px 20px 10px" : compactPane ? "8px 12px 6px" : "10px 12px 8px" },
 		children: [
 			jsxs("div", {
 				style: { ...column, ...UI.row, justifyContent: "space-between", flexShrink: 0, flexWrap: "wrap", gap: 8 },
@@ -2789,6 +5623,24 @@ function QuotaPane({ page = false } = {}) {
 										children: jsx(SdkIcon, { name: isRtl() ? "ArrowRight" : "ArrowLeft", className: "h-3.5 w-3.5", fallback: isRtl() ? "›" : "‹" }),
 									})
 								: [
+										hasCards
+											? jsx(IconButton, {
+													title: editing ? t("editCardsDoneTip") : t("editCardsTip"),
+													pressed: editing,
+													onClick: () => {
+														// A pending sort confirmation belongs to
+														// edit mode; leaving it drops the
+														// question without changing anything.
+														setCardLayoutPrompt(null);
+														setEditing(!editing);
+													},
+													"data-card-edit": true,
+													children: jsx(CardGlyph, {
+														name: editing ? "check" : "edit",
+														className: "h-3.5 w-3.5",
+													}),
+												}, "edit-cards")
+											: null,
 										jsx(IconButton, {
 											title: t("refreshTip"),
 											disabled: refresh.isPending,
@@ -2807,19 +5659,60 @@ function QuotaPane({ page = false } = {}) {
 					}),
 				],
 			}),
+			layoutTools,
 			view !== "settings" && monitorOn
-				? jsx("div", { style: { ...column, flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, children: jsx(MonitorTabs, {}) })
+				? jsx("div", { style: { ...column, flexShrink: 0, minWidth: 0 }, "data-monitor-tabs": true, "data-compact": compactPane ? "true" : undefined, children: jsx(MonitorTabs, { compact: compactPane }) })
 				: null,
-			view !== "settings" && monitorOn && mon.snapshot
+			view !== "settings" && monitorOn && mon.snapshot && !compactPane
 				? jsx("div", { style: { ...column, flexShrink: 0 }, children: jsx(SummaryStrip, { snapshot: mon.snapshot, providers: data && data.providers }) })
 				: null,
-			jsx("div", {
-				className: "min-h-0 flex-1",
-				"data-quota-scroll": true,
-				style: { minHeight: 0, minWidth: 0, overflowY: "auto", overflowX: "hidden", flex: "1 1 0%", paddingTop: 2 },
-				children: jsxs("div", { style: column, children: [body, versionSkew] }),
+			jsxs("div", {
+				"data-quota-body": true,
+				style: {
+					...column,
+					display: "flex",
+					flexDirection: "column",
+					flex: "1 1 0%",
+					minHeight: 0,
+					minWidth: 0,
+					// The stable card region the shelf's half-height cap and
+					// the list budget measure against (`50cqh` before the
+					// first JS measurement). It is not a scrollport: it holds
+					// two independent ones, the sticky pinned band and the
+					// unpinned list below it.
+					containerType: "size",
+				},
+				children: [
+					pinnedShelf,
+					jsx("div", {
+						className: "min-h-0 flex-1",
+						"data-quota-scroll": true,
+						style: {
+							minHeight: 0,
+							minWidth: 0,
+							overflowY: "auto",
+							overflowX: "hidden",
+							flex: "1 1 0%",
+							// The list is its own scrollport below the pinned
+							// band, so its native scrollbar starts at this
+							// box's top edge and never runs alongside the
+							// pinned cards. The same stable gutter as the
+							// shelf keeps both bands' cards equally wide even
+							// when only one of them overflows.
+							scrollbarGutter: "stable",
+							overscrollBehaviorY: "contain",
+						},
+						// A small tail below the last card is a real drop strip: releasing
+						// there appends to the band instead of hitting a dead zone.
+						children: jsxs("div", {
+							"data-card-scroll-content": true,
+							style: { ...column, paddingTop: pinnedShelf ? 0 : 2, paddingBottom: 8 },
+							children: [body, versionSkew],
+						}),
+					}),
+				],
 			}),
-			footerText
+			footerText && !compactPane
 				? jsx("div", {
 						"data-quota-checked": true,
 						title: footerText.title,
@@ -2827,6 +5720,11 @@ function QuotaPane({ page = false } = {}) {
 						children: footerText.text,
 					})
 				: null,
+			// The sort warning is modal and explicit: confirming replaces the
+			// custom unpinned order, cancelling (or closing) changes nothing.
+			// CardLayoutConfirm subscribes to the prompt itself, so opening
+			// and cancelling this question never rebuild the card list.
+			jsx(CardLayoutConfirm, { owner: paneInstance.current }, "card-layout-confirm"),
 		],
 	});
 }
@@ -5706,7 +8604,7 @@ function MonitorSettings() {
 // Agent Bar's view switcher: segments sized by their label (six fit a 300px
 // pane untruncated), the active one filled with the accent. Own markup (not
 // SegmentedControl) because the labels need tighter padding than core's control.
-function MonitorTabs() {
+function MonitorTabs({ compact = false }) {
 	const t = useQT();
 	const view = useValue(paneViewAtom);
 	const accountsOn = useValue(accountsTabAtom);
@@ -5714,9 +8612,24 @@ function MonitorTabs() {
 	return jsx("div", {
 		role: "tablist",
 		"data-tabs": views.join(","),
-		// Long labels (German, Russian) wrap onto a second row in the 300px
-		// pane instead of truncating to "Konting…".
-		style: { display: "flex", flexWrap: "wrap", gap: 2, padding: 2, borderRadius: 7, background: "var(--ui-bg-tertiary)", minWidth: 0 },
+		// Long labels (German, Russian) wrap onto a second row in a normal
+		// 300px pane instead of truncating to "Konting…". In a compact pane
+		// that second row is exactly the space the cards need, so the tabs
+		// stay on one horizontally scrollable row: every label remains
+		// reachable, and keyboard focus brings the selected one into view.
+		style: {
+			display: "flex",
+			flexWrap: compact ? "nowrap" : "wrap",
+			gap: 2,
+			padding: 2,
+			borderRadius: 7,
+			background: "var(--ui-bg-tertiary)",
+			minWidth: 0,
+			overflowX: compact ? "auto" : undefined,
+			overflowY: compact ? "hidden" : undefined,
+			scrollbarWidth: compact ? "thin" : undefined,
+			overscrollBehaviorX: compact ? "contain" : undefined,
+		},
 		children: views.map((id) => {
 			const active = id === view;
 			const label = t(`tab_${id}`);
@@ -5729,7 +8642,7 @@ function MonitorTabs() {
 				className: active ? undefined : "hover:text-foreground transition-colors",
 				onClick: () => setPaneView(id),
 				style: {
-					flex: "1 0 auto",
+					flex: compact ? "0 0 auto" : "1 0 auto",
 					minWidth: 0,
 					maxWidth: "100%",
 					height: 22,
@@ -6575,6 +9488,7 @@ function AccountsConfirm({ ctl }) {
 			: t("accountsConfirmOrderOwn", c.owner);
 		body = jsxs("div", {
 			"data-confirm": "priority",
+			"data-quota-confirm": true,
 			style: { ...UI.col, gap: 8, fontSize: "0.75rem" },
 			children: [
 				jsxs("div", {
@@ -6594,6 +9508,7 @@ function AccountsConfirm({ ctl }) {
 		description = t("accountsConfirmStrategyDesc", c.profile);
 		body = jsxs("div", {
 			"data-confirm": "strategy",
+			"data-quota-confirm": true,
 			style: { ...UI.col, gap: 8, fontSize: "0.75rem" },
 			children: [
 				jsx("span", { style: UI.text, children: `${t(`strategy_${c.from}`)} ${arrowFwd()} ${t(`strategy_${c.to}`)}` }, "chg"),
@@ -6991,8 +9906,17 @@ export default {
 
 		// Chip keyframes (attention flash) + focus ring, scoped `qm-sb-`.
 		const styleEl = ensureStatusbarStyles();
+		// Pinned shelf resize grip: hidden until hover/focus, and a focus
+		// ring for its keyboard path. Scoped by the shelf's data attributes.
+		const shelfStyleEl = ensureShelfStyles();
+		// Confirmation dialogs: their footer buttons answer hover on the next
+		// frame instead of the host's 100 ms colour ramp. Scoped by the
+		// dialog's own marker attribute.
+		const confirmStyleEl = ensureConfirmStyles();
 		try {
 			ctx.onDispose?.(() => styleEl?.remove?.());
+			ctx.onDispose?.(() => shelfStyleEl?.remove?.());
+			ctx.onDispose?.(() => confirmStyleEl?.remove?.());
 		} catch {
 			/* older host */
 		}
@@ -7032,6 +9956,30 @@ const I18N_EN = {
 	refreshTip: "Refresh quota",
 	settingsTip: "Quota settings",
 	backTip: "Back to quota",
+	editCardsTip: "Edit card layout",
+	editCardsDoneTip: "Done editing card layout",
+	pinCardTip: (name) => `Pin ${name}`,
+	unpinCardTip: (name) => `Unpin ${name}`,
+	moveCardUpTip: (name) => `Move ${name} up`,
+	moveCardDownTip: (name) => `Move ${name} down`,
+	pinnedCardsLabel: "Pinned",
+	pinnedCardTip: "Pinned card",
+	pinnedShelfResizeLabel: "Resize pinned section",
+	pinnedShelfResizeHint: "Drag the bottom edge or use the arrow keys to change how many pinned cards are visible. Double-click to snap to a card's bottom edge.",
+	pinnedShelfResizeTip: "Drag to resize the pinned section",
+	pinnedShelfResizeBlocked: "The pinned section cannot be resized at this window size; scroll inside it to see every pinned card.",
+	pinnedShelfResizeNotNeeded: "All pinned cards already fit; the pinned section does not need resizing.",
+	sortCardsAz: "Sort unpinned cards A to Z",
+	sortCardsZa: "Sort unpinned cards Z to A",
+	sortCardsConfirmTitle: "Replace custom unpinned order?",
+	sortCardsConfirmBody: "Sorting the unpinned cards replaces their custom order. Pinned cards and their order stay unchanged.",
+	sortCardsConfirm: "Sort",
+	resetCardLayout: "Reset card layout",
+	resetCardLayoutHint: "Clear every pin and restore the default card order.",
+	resetCardLayoutShort: "Reset",
+	resetCardLayoutConfirmTitle: "Clear all pins and reset the card order?",
+	resetCardLayoutConfirmBody: "This removes every pin and the custom card order, restoring the default layout.",
+	editCardsHint: "Drag a card, or use the arrows, to reorder it within its section; scroll while dragging to reach cards beyond the fold, and pinned cards stay visible while you scroll.",
 	loading: "Loading…",
 	error: "Quota backend unavailable",
 	errorStale: "Backend unreachable — showing the last good data.",
@@ -7465,6 +10413,30 @@ const I18N_TR = {
 	refreshTip: "Kotayı yenile",
 	settingsTip: "Kota ayarları",
 	backTip: "Kotaya dön",
+	editCardsTip: "Kart düzenini düzenle",
+	editCardsDoneTip: "Kart düzenini düzenlemeyi bitir",
+	pinCardTip: (name) => `${name} kartını sabitle`,
+	unpinCardTip: (name) => `${name} kartının sabitlemesini kaldır`,
+	moveCardUpTip: (name) => `${name} kartını yukarı taşı`,
+	moveCardDownTip: (name) => `${name} kartını aşağı taşı`,
+	pinnedCardsLabel: "Sabitlenenler",
+	pinnedCardTip: "Sabitlenmiş kart",
+	pinnedShelfResizeLabel: "Sabitlenen bölümü yeniden boyutlandır",
+	pinnedShelfResizeHint: "Görünen sabitlenmiş kart sayısını değiştirmek için alt kenarı sürükleyin veya ok tuşlarını kullanın. Bir kartın alt kenarına oturtmak için çift tıklayın.",
+	pinnedShelfResizeTip: "Sabitlenen bölümü yeniden boyutlandırmak için sürükleyin",
+	pinnedShelfResizeBlocked: "Sabitlenen bölüm bu pencere boyutunda yeniden boyutlandırılamaz; tüm kartlar için içinde kaydırın.",
+	pinnedShelfResizeNotNeeded: "Tüm sabitlenmiş kartlar zaten sığıyor; sabitlenen bölümün yeniden boyutlandırılmasına gerek yok.",
+	sortCardsAz: "Sabitlenmemiş kartları A'dan Z'ye sırala",
+	sortCardsZa: "Sabitlenmemiş kartları Z'den A'ya sırala",
+	sortCardsConfirmTitle: "Özel sabitlenmemiş sıralama değiştirilsin mi?",
+	sortCardsConfirmBody: "Sabitlenmemiş kartları sıralamak özel sıralamalarını değiştirir. Sabitlenen kartlar ve sıraları değişmez.",
+	sortCardsConfirm: "Sırala",
+	resetCardLayout: "Kart düzenini sıfırla",
+	resetCardLayoutHint: "Tüm sabitlemeleri temizle ve varsayılan kart sırasına dön.",
+	resetCardLayoutShort: "Sıfırla",
+	resetCardLayoutConfirmTitle: "Tüm sabitlemeler silinsin ve kart sırası sıfırlansın mı?",
+	resetCardLayoutConfirmBody: "Bu, tüm sabitlemeleri ve özel kart sırasını kaldırıp varsayılan düzeni geri yükler.",
+	editCardsHint: "Bir kartı sürükleyin veya okları kullanın; kartı kendi bölümünde sıralayın. Sürüklerken kaydırarak ekranın ötesindeki kartlara ulaşın; sabitlenen kartlar kaydırırken görünür kalır.",
 	loading: "Yükleniyor…",
 	error: "Kota arka ucu kullanılamıyor",
 	errorStale: "Arka uç erişilemiyor — en son sağlamlı veriler gösteriliyor.",
@@ -7919,6 +10891,30 @@ const I18N_DE = {
 	refreshTip: "Kontingent aktualisieren",
 	settingsTip: "Kontingent-Einstellungen",
 	backTip: "Zurück zum Kontingent",
+	editCardsTip: "Kartenlayout bearbeiten",
+	editCardsDoneTip: "Kartenlayout-Bearbeitung beenden",
+	pinCardTip: (name) => `${name} anheften`,
+	unpinCardTip: (name) => `${name} lösen`,
+	moveCardUpTip: (name) => `${name} nach oben verschieben`,
+	moveCardDownTip: (name) => `${name} nach unten verschieben`,
+	pinnedCardsLabel: "Angeheftet",
+	pinnedCardTip: "Angeheftete Karte",
+	pinnedShelfResizeLabel: "Angehefteten Bereich in der Höhe ändern",
+	pinnedShelfResizeHint: "Ziehe die Unterkante oder nutze die Pfeiltasten, um zu ändern, wie viele angeheftete Karten sichtbar sind. Doppelklicken, um an der Unterkante einer Karte einzurasten.",
+	pinnedShelfResizeTip: "Ziehen, um die Höhe des angehefteten Bereichs zu ändern",
+	pinnedShelfResizeBlocked: "Der angeheftete Bereich kann bei dieser Fenstergröße nicht geändert werden; scrolle darin, um alle Karten zu sehen.",
+	pinnedShelfResizeNotNeeded: "Alle angehefteten Karten passen bereits; der angeheftete Bereich muss nicht angepasst werden.",
+	sortCardsAz: "Nicht angeheftete Karten von A bis Z sortieren",
+	sortCardsZa: "Nicht angeheftete Karten von Z bis A sortieren",
+	sortCardsConfirmTitle: "Eigene Reihenfolge der nicht angehefteten Karten ersetzen?",
+	sortCardsConfirmBody: "Das Sortieren der nicht angehefteten Karten ersetzt ihre eigene Reihenfolge. Angeheftete Karten und ihre Reihenfolge bleiben unverändert.",
+	sortCardsConfirm: "Sortieren",
+	resetCardLayout: "Kartenlayout zurücksetzen",
+	resetCardLayoutHint: "Alle Anheftungen entfernen und die Standardreihenfolge der Karten wiederherstellen.",
+	resetCardLayoutShort: "Zurücksetzen",
+	resetCardLayoutConfirmTitle: "Alle Anheftungen entfernen und die Kartenreihenfolge zurücksetzen?",
+	resetCardLayoutConfirmBody: "Dadurch werden alle Anheftungen und die eigene Kartenreihenfolge entfernt und das Standardlayout wiederhergestellt.",
+	editCardsHint: "Ziehe eine Karte oder nutze die Pfeile, um sie in ihrem Bereich zu sortieren; scrolle beim Ziehen, um Karten außerhalb des sichtbaren Bereichs zu erreichen. Angeheftete Karten bleiben beim Scrollen sichtbar.",
 	loading: "Wird geladen…",
 	error: "Kontingent-Backend nicht verfügbar",
 	errorStale: "Backend nicht erreichbar — die letzten guten Daten werden angezeigt.",
@@ -8351,6 +11347,30 @@ const I18N_ES = {
 	refreshTip: "Actualizar cuota",
 	settingsTip: "Ajustes de cuota",
 	backTip: "Volver a la cuota",
+	editCardsTip: "Editar diseño de tarjetas",
+	editCardsDoneTip: "Terminar de editar el diseño",
+	pinCardTip: (name) => `Fijar ${name}`,
+	unpinCardTip: (name) => `Desfijar ${name}`,
+	moveCardUpTip: (name) => `Mover ${name} hacia arriba`,
+	moveCardDownTip: (name) => `Mover ${name} hacia abajo`,
+	pinnedCardsLabel: "Fijadas",
+	pinnedCardTip: "Tarjeta fijada",
+	pinnedShelfResizeLabel: "Cambiar el tamaño de la sección fijada",
+	pinnedShelfResizeHint: "Arrastra el borde inferior o usa las flechas para cambiar cuántas tarjetas fijadas se ven. Haz doble clic para ajustar al borde inferior de una tarjeta.",
+	pinnedShelfResizeTip: "Arrastra para cambiar el tamaño de la sección fijada",
+	pinnedShelfResizeBlocked: "La sección fijada no se puede cambiar de tamaño con este tamaño de ventana; desplázala para ver todas las tarjetas.",
+	pinnedShelfResizeNotNeeded: "Todas las tarjetas fijadas ya caben; no es necesario cambiar el tamaño de la sección fijada.",
+	sortCardsAz: "Ordenar las tarjetas no fijadas de A a Z",
+	sortCardsZa: "Ordenar las tarjetas no fijadas de Z a A",
+	sortCardsConfirmTitle: "¿Reemplazar el orden personalizado de las tarjetas no fijadas?",
+	sortCardsConfirmBody: "Ordenar las tarjetas no fijadas reemplaza su orden personalizado. Las tarjetas fijadas y su orden no cambian.",
+	sortCardsConfirm: "Ordenar",
+	resetCardLayout: "Restablecer el diseño de tarjetas",
+	resetCardLayoutHint: "Borrar todas las fijaciones y restaurar el orden predeterminado de las tarjetas.",
+	resetCardLayoutShort: "Restablecer",
+	resetCardLayoutConfirmTitle: "¿Borrar todas las fijaciones y restablecer el orden de las tarjetas?",
+	resetCardLayoutConfirmBody: "Esto elimina todas las fijaciones y el orden personalizado de las tarjetas, y restaura el diseño predeterminado.",
+	editCardsHint: "Arrastra una tarjeta o usa las flechas para ordenarla dentro de su sección; desplázate mientras arrastras para llegar a tarjetas fuera de la vista, y las tarjetas fijadas siguen visibles al desplazarte.",
 	loading: "Cargando…",
 	error: "Backend de cuota no disponible",
 	errorStale: "Backend no disponible: se muestran los últimos datos buenos.",
@@ -8783,6 +11803,30 @@ const I18N_FR = {
 	refreshTip: "Actualiser le quota",
 	settingsTip: "Réglages du quota",
 	backTip: "Retour au quota",
+	editCardsTip: "Modifier la disposition des cartes",
+	editCardsDoneTip: "Terminer la modification de la disposition",
+	pinCardTip: (name) => `Épingler ${name}`,
+	unpinCardTip: (name) => `Désépingler ${name}`,
+	moveCardUpTip: (name) => `Déplacer ${name} vers le haut`,
+	moveCardDownTip: (name) => `Déplacer ${name} vers le bas`,
+	pinnedCardsLabel: "Épinglées",
+	pinnedCardTip: "Carte épinglée",
+	pinnedShelfResizeLabel: "Redimensionner la section épinglée",
+	pinnedShelfResizeHint: "Faites glisser le bord inférieur ou utilisez les flèches pour changer le nombre de cartes épinglées visibles. Double-cliquez pour aligner sur le bord inférieur d'une carte.",
+	pinnedShelfResizeTip: "Faites glisser pour redimensionner la section épinglée",
+	pinnedShelfResizeBlocked: "La section épinglée ne peut pas être redimensionnée à cette taille de fenêtre ; faites-la défiler pour voir toutes les cartes.",
+	pinnedShelfResizeNotNeeded: "Toutes les cartes épinglées tiennent déjà ; la section épinglée n’a pas besoin d’être redimensionnée.",
+	sortCardsAz: "Trier les cartes non épinglées de A à Z",
+	sortCardsZa: "Trier les cartes non épinglées de Z à A",
+	sortCardsConfirmTitle: "Remplacer l'ordre personnalisé des cartes non épinglées ?",
+	sortCardsConfirmBody: "Le tri des cartes non épinglées remplace leur ordre personnalisé. Les cartes épinglées et leur ordre restent inchangés.",
+	sortCardsConfirm: "Trier",
+	resetCardLayout: "Réinitialiser la disposition des cartes",
+	resetCardLayoutHint: "Effacer toutes les épingles et rétablir l'ordre par défaut des cartes.",
+	resetCardLayoutShort: "Réinitialiser",
+	resetCardLayoutConfirmTitle: "Effacer toutes les épingles et réinitialiser l'ordre des cartes ?",
+	resetCardLayoutConfirmBody: "Cela supprime toutes les épingles et l'ordre personnalisé des cartes, puis rétablit la disposition par défaut.",
+	editCardsHint: "Faites glisser une carte ou utilisez les flèches pour la réorganiser dans sa section ; faites défiler pendant le glissement pour atteindre les cartes hors de vue, et les cartes épinglées restent visibles pendant le défilement.",
 	loading: "Chargement…",
 	error: "Backend de quota indisponible",
 	errorStale: "Backend injoignable — affichage des dernières bonnes données.",
@@ -9215,6 +12259,30 @@ const I18N_RU = {
 	refreshTip: "Обновить квоты",
 	settingsTip: "Настройки квот",
 	backTip: "Назад к квотам",
+	editCardsTip: "Изменить расположение карточек",
+	editCardsDoneTip: "Завершить изменение расположения",
+	pinCardTip: (name) => `Закрепить ${name}`,
+	unpinCardTip: (name) => `Открепить ${name}`,
+	moveCardUpTip: (name) => `Переместить ${name} вверх`,
+	moveCardDownTip: (name) => `Переместить ${name} вниз`,
+	pinnedCardsLabel: "Закреплённые",
+	pinnedCardTip: "Закреплённая карточка",
+	pinnedShelfResizeLabel: "Изменить высоту закреплённого раздела",
+	pinnedShelfResizeHint: "Потяните нижний край или используйте стрелки, чтобы изменить число видимых закреплённых карточек. Дважды щёлкните, чтобы привязать к нижнему краю карточки.",
+	pinnedShelfResizeTip: "Потяните, чтобы изменить высоту закреплённого раздела",
+	pinnedShelfResizeBlocked: "При этом размере окна высоту закреплённого раздела изменить нельзя; прокрутите его, чтобы увидеть все карточки.",
+	pinnedShelfResizeNotNeeded: "Все закреплённые карточки уже помещаются; изменять высоту закреплённого раздела не нужно.",
+	sortCardsAz: "Сортировать незакреплённые карточки от А до Я",
+	sortCardsZa: "Сортировать незакреплённые карточки от Я до А",
+	sortCardsConfirmTitle: "Заменить пользовательский порядок незакреплённых карточек?",
+	sortCardsConfirmBody: "Сортировка незакреплённых карточек заменит их пользовательский порядок. Закреплённые карточки и их порядок останутся без изменений.",
+	sortCardsConfirm: "Сортировать",
+	resetCardLayout: "Сбросить раскладку карточек",
+	resetCardLayoutHint: "Снять все закрепления и восстановить порядок карточек по умолчанию.",
+	resetCardLayoutShort: "Сбросить",
+	resetCardLayoutConfirmTitle: "Снять все закрепления и сбросить порядок карточек?",
+	resetCardLayoutConfirmBody: "Будут сняты все закрепления и удалён пользовательский порядок карточек; раскладка вернётся к настройкам по умолчанию.",
+	editCardsHint: "Перетащите карточку или используйте стрелки, чтобы изменить порядок в её разделе; прокручивайте во время перетаскивания, чтобы добраться до карточек за пределами экрана; закреплённые карточки остаются видимыми при прокрутке.",
 	loading: "Загрузка…",
 	error: "Бэкенд квот недоступен",
 	errorStale: "Бэкенд недоступен — показаны последние удачные данные.",
@@ -9647,6 +12715,30 @@ const I18N_JA = {
 	refreshTip: "クォータを更新",
 	settingsTip: "クォータの設定",
 	backTip: "クォータに戻る",
+	editCardsTip: "カードのレイアウトを編集",
+	editCardsDoneTip: "カードのレイアウト編集を終了",
+	pinCardTip: (name) => `${name} を固定`,
+	unpinCardTip: (name) => `${name} の固定を解除`,
+	moveCardUpTip: (name) => `${name} を上へ移動`,
+	moveCardDownTip: (name) => `${name} を下へ移動`,
+	pinnedCardsLabel: "固定済み",
+	pinnedCardTip: "固定されたカード",
+	pinnedShelfResizeLabel: "固定セクションの高さを変更",
+	pinnedShelfResizeHint: "下端をドラッグするか矢印キーで、表示する固定カードの数を変更できます。ダブルクリックでカードの下端に合わせます。",
+	pinnedShelfResizeTip: "ドラッグして固定セクションの高さを変更",
+	pinnedShelfResizeBlocked: "このウィンドウサイズでは固定セクションの高さを変更できません。中をスクロールしてすべてのカードを表示してください。",
+	pinnedShelfResizeNotNeeded: "固定されたカードはすべて収まっています。固定セクションの高さを変更する必要はありません。",
+	sortCardsAz: "固定していないカードを A から Z へ並べ替え",
+	sortCardsZa: "固定していないカードを Z から A へ並べ替え",
+	sortCardsConfirmTitle: "固定していないカードのカスタム順を置き換えますか？",
+	sortCardsConfirmBody: "固定していないカードを並べ替えると、カスタム順が置き換わります。固定したカードとその順序は変わりません。",
+	sortCardsConfirm: "並べ替え",
+	resetCardLayout: "カードレイアウトをリセット",
+	resetCardLayoutHint: "すべての固定を解除し、カードを既定の順序に戻します。",
+	resetCardLayoutShort: "リセット",
+	resetCardLayoutConfirmTitle: "すべての固定を解除してカードの順序をリセットしますか？",
+	resetCardLayoutConfirmBody: "すべての固定とカスタムのカード順が削除され、既定のレイアウトに戻ります。",
+	editCardsHint: "カードをドラッグするか矢印で、各セクション内の順番を変更できます。ドラッグ中にスクロールすると画面外のカードにも移動できます。固定したカードはスクロール中も表示されます。",
 	loading: "読み込み中…",
 	error: "クォータのバックエンドを利用できません",
 	errorStale: "バックエンドに接続できません — 最後の正常なデータを表示しています。",
@@ -10079,6 +13171,30 @@ const I18N_ZH = {
 	refreshTip: "刷新额度",
 	settingsTip: "额度设置",
 	backTip: "返回额度",
+	editCardsTip: "编辑卡片布局",
+	editCardsDoneTip: "完成卡片布局编辑",
+	pinCardTip: (name) => `固定 ${name}`,
+	unpinCardTip: (name) => `取消固定 ${name}`,
+	moveCardUpTip: (name) => `上移 ${name}`,
+	moveCardDownTip: (name) => `下移 ${name}`,
+	pinnedCardsLabel: "已固定",
+	pinnedCardTip: "已固定的卡片",
+	pinnedShelfResizeLabel: "调整已固定区域的大小",
+	pinnedShelfResizeHint: "拖动下边缘或使用方向键，改变可见的已固定卡片数量。双击可对齐到卡片下边缘。",
+	pinnedShelfResizeTip: "拖动以调整已固定区域的大小",
+	pinnedShelfResizeBlocked: "当前窗口大小无法调整已固定区域的高度；请在区域内滚动以查看所有卡片。",
+	pinnedShelfResizeNotNeeded: "已固定的卡片都已完整显示，无需调整已固定区域的大小。",
+	sortCardsAz: "将未固定卡片按 A 到 Z 排序",
+	sortCardsZa: "将未固定卡片按 Z 到 A 排序",
+	sortCardsConfirmTitle: "替换未固定卡片的自定义顺序？",
+	sortCardsConfirmBody: "排序未固定卡片会替换其自定义顺序。已固定卡片及其顺序保持不变。",
+	sortCardsConfirm: "排序",
+	resetCardLayout: "重置卡片布局",
+	resetCardLayoutHint: "清除所有固定并恢复默认卡片顺序。",
+	resetCardLayoutShort: "重置",
+	resetCardLayoutConfirmTitle: "清除所有固定并重置卡片顺序？",
+	resetCardLayoutConfirmBody: "这将移除所有固定和自定义卡片顺序，并恢复默认布局。",
+	editCardsHint: "拖动卡片或使用箭头调整其所在区域内的顺序；拖动时滚动可到达视野外的卡片，固定的卡片在滚动时保持可见。",
 	loading: "加载中…",
 	error: "额度后端不可用",
 	errorStale: "后端不可用 — 显示最后一次成功的数据。",
@@ -10511,6 +13627,30 @@ const I18N_ZH_HANT = {
 	refreshTip: "重新整理額度",
 	settingsTip: "額度設定",
 	backTip: "返回額度",
+	editCardsTip: "編輯卡片版面",
+	editCardsDoneTip: "完成卡片版面編輯",
+	pinCardTip: (name) => `固定 ${name}`,
+	unpinCardTip: (name) => `取消固定 ${name}`,
+	moveCardUpTip: (name) => `上移 ${name}`,
+	moveCardDownTip: (name) => `下移 ${name}`,
+	pinnedCardsLabel: "已固定",
+	pinnedCardTip: "已固定的卡片",
+	pinnedShelfResizeLabel: "調整已固定區域的大小",
+	pinnedShelfResizeHint: "拖曳下緣或使用方向鍵，改變可見的已固定卡片數量。雙擊可對齊到卡片下邊緣。",
+	pinnedShelfResizeTip: "拖曳以調整已固定區域的大小",
+	pinnedShelfResizeBlocked: "目前視窗大小無法調整已固定區域的高度；請在區域內捲動以查看所有卡片。",
+	pinnedShelfResizeNotNeeded: "已固定的卡片都已完整顯示，無需調整已固定區域的大小。",
+	sortCardsAz: "將未固定卡片依 A 到 Z 排序",
+	sortCardsZa: "將未固定卡片依 Z 到 A 排序",
+	sortCardsConfirmTitle: "要取代未固定卡片的自訂順序嗎？",
+	sortCardsConfirmBody: "排序未固定卡片會取代其自訂順序。已固定卡片及其順序維持不變。",
+	sortCardsConfirm: "排序",
+	resetCardLayout: "重設卡片版面",
+	resetCardLayoutHint: "清除所有固定並還原預設卡片順序。",
+	resetCardLayoutShort: "重設",
+	resetCardLayoutConfirmTitle: "清除所有固定並重設卡片順序？",
+	resetCardLayoutConfirmBody: "這將移除所有固定和自訂卡片順序，並還原預設版面。",
+	editCardsHint: "拖曳卡片或使用箭頭調整其所在區域內的順序；拖曳時捲動可到達視野外的卡片，固定的卡片在捲動時保持可見。",
 	loading: "載入中…",
 	error: "額度後端不可用",
 	errorStale: "後端無法連線 — 顯示最後一次成功的資料。",
@@ -10943,6 +14083,30 @@ const I18N_AR = {
 	refreshTip: "تحديث الحصة",
 	settingsTip: "إعدادات الحصة",
 	backTip: "العودة إلى الحصة",
+	editCardsTip: "تعديل تخطيط البطاقات",
+	editCardsDoneTip: "إنهاء تعديل تخطيط البطاقات",
+	pinCardTip: (name) => `تثبيت ${name}`,
+	unpinCardTip: (name) => `إلغاء تثبيت ${name}`,
+	moveCardUpTip: (name) => `نقل ${name} لأعلى`,
+	moveCardDownTip: (name) => `نقل ${name} لأسفل`,
+	pinnedCardsLabel: "المثبّتة",
+	pinnedCardTip: "بطاقة مثبّتة",
+	pinnedShelfResizeLabel: "تغيير حجم القسم المثبّت",
+	pinnedShelfResizeHint: "اسحب الحافة السفلية أو استخدم مفاتيح الأسهم لتغيير عدد البطاقات المثبّتة الظاهرة. انقر نقرًا مزدوجًا للمحاذاة إلى الحافة السفلية لبطاقة.",
+	pinnedShelfResizeTip: "اسحب لتغيير حجم القسم المثبّت",
+	pinnedShelfResizeBlocked: "لا يمكن تغيير حجم القسم المثبّت بحجم النافذة هذا؛ مرّر داخله لرؤية كل البطاقات.",
+	pinnedShelfResizeNotNeeded: "جميع البطاقات المثبّتة ظاهرة بالكامل بالفعل؛ لا حاجة لتغيير حجم القسم المثبّت.",
+	sortCardsAz: "ترتيب البطاقات غير المثبتة من A إلى Z",
+	sortCardsZa: "ترتيب البطاقات غير المثبتة من Z إلى A",
+	sortCardsConfirmTitle: "هل تريد استبدال الترتيب المخصص للبطاقات غير المثبتة؟",
+	sortCardsConfirmBody: "سيؤدي ترتيب البطاقات غير المثبتة إلى استبدال ترتيبها المخصص. تبقى البطاقات المثبتة وترتيبها دون تغيير.",
+	sortCardsConfirm: "ترتيب",
+	resetCardLayout: "إعادة تعيين تخطيط البطاقات",
+	resetCardLayoutHint: "مسح كل التثبيتات واستعادة الترتيب الافتراضي للبطاقات.",
+	resetCardLayoutShort: "إعادة تعيين",
+	resetCardLayoutConfirmTitle: "هل تريد مسح كل التثبيتات وإعادة تعيين ترتيب البطاقات؟",
+	resetCardLayoutConfirmBody: "سيؤدي هذا إلى إزالة كل التثبيتات والترتيب المخصص للبطاقات واستعادة التخطيط الافتراضي.",
+	editCardsHint: "اسحب البطاقة أو استخدم الأسهم لإعادة ترتيبها داخل قسمها؛ مرّر أثناء السحب للوصول إلى البطاقات خارج العرض، وتبقى البطاقات المثبتة ظاهرة أثناء التمرير.",
 	loading: "جارٍ التحميل…",
 	error: "خادم الحصة غير متاح",
 	errorStale: "الخادم غير متاح — يتم عرض آخر بيانات سليمة.",

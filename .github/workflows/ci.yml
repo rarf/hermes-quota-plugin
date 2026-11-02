@@ -8,11 +8,20 @@ on:
 jobs:
   python-tests:
     name: Python tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.image }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+        # Python 3.9 is unavailable on Ubuntu 26.04; retain the supported floor.
+        include:
+          - python-version: "3.9"
+            image: ubuntu-24.04
+          - python-version: "3.10"
+            image: ubuntu-latest
+          - python-version: "3.11"
+            image: ubuntu-latest
+          - python-version: "3.12"
+            image: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
