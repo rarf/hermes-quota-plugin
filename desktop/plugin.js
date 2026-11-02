@@ -1415,6 +1415,7 @@ function QuotaChipWithBar() {
 	let worst = null;
 	let worstLabel = "";
 	let worstProvider = null;
+	let worstProviderId = null;
 	for (const [pid, p] of providers) {
 		if (!isProviderEnabled(pid)) continue;
 		const r = p?.unavailable_reason ? null : p?.display_accounts ? p.display_remaining : worstWindow(p);
@@ -1423,6 +1424,7 @@ function QuotaChipWithBar() {
 			worst = r;
 			worstLabel = providerDisplayName(pid, p);
 			worstProvider = p;
+			worstProviderId = pid;
 		}
 	}
 	if (worst == null) {
@@ -1447,7 +1449,7 @@ function QuotaChipWithBar() {
 			"qm-sb-chip inline-flex items-center gap-1.5 px-1.5 py-0.5 rounded cursor-pointer hover:bg-(--chrome-action-hover) transition-colors",
 		style: CHIP_NOWRAP,
 		children: [
-			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst) }),
+			jsx(Ring, { value: worst, tone, size: 13, stroke: 2, label: fmtPct(worst), timeRemaining: providerTimeRemaining(worstProvider, worstProviderId, worst, Date.now()) }),
 			jsx("span", {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
 				children: valueText,
@@ -1558,6 +1560,7 @@ function codexAccountsTip(provider, special) {
 }
 
 function ProviderChip({ pid, provider, alert = null, special = null }) {
+	const nowMs = useNow();
 	const cachedRemaining = provider?.display_stale ? provider.display_cached_remaining : provider?.display_remaining;
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
@@ -1581,7 +1584,7 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 				// A percentage gets Agent Bar's mini ring; balance/availability-only
 				// providers keep the plain dot.
 				r != null
-					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
+					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r), timeRemaining: providerTimeRemaining(provider, pid, r, nowMs) })
 					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
@@ -1865,22 +1868,53 @@ function Pill({ color = "var(--ui-text-tertiary)", dot = false, halo = false, ti
 	});
 }
 
-/**
- * Donut gauge: plain inline SVG (stroke-dasharray on a circle), fixed size from
- * props, so a pane resize needs no measuring. The arc is the share LEFT, like
- * the bars it replaces; colour follows the same thresholds as Agent Bar's
- * levelColor (≥85 % used red, ≥60 % used amber).
- */
-function Ring({ value, tone, color, size = 52, stroke, label, children }) {
+// Match time remaining to the existing remaining-quota arc.
+function resetTimeRemaining(w, providerId, nowMs = Date.now()) {
+	const label = String(w?.label || "");
+	const durations = [];
+	if (/\b(?:weekly|week)\b/i.test(label)) durations.push(7 * 24 * 3600);
+	if (/\b(?:5\s*-?\s*(?:h|hours?)|five[- ]hours?)\b/i.test(label)) durations.push(5 * 3600);
+	if (/\bdaily\b/i.test(label)) durations.push(24 * 3600);
+	if (/(?:^|·\s*)(?:current )?session$/i.test(label) && ["anthropic", "openai-codex", "ollama", "ollama-cloud", "kimi", "minimax", "zai"].includes(baseProviderId(providerId))) durations.push(5 * 3600);
+	if (/^video session$/i.test(label) && baseProviderId(providerId) === "minimax") durations.push(5 * 3600);
+	if (durations.length !== 1) return null;
+	const duration = durations[0];
+	const used = w?.used_percent ?? w?.used;
+	if (typeof used !== "number" || !Number.isFinite(used) || used < 0) return null;
+	const reset = typeof w?.reset === "number" && Number.isFinite(w.reset) ? w.reset : isoToSeconds(w?.reset_at);
+	if (reset == null || !Number.isFinite(nowMs)) return null;
+	const left = reset - nowMs / 1000;
+	return left > 0 && left <= duration ? left / duration * 100 : null;
+}
+
+function providerTimeRemaining(provider, providerId, remaining, nowMs) {
+	if (remaining == null || provider?.unavailable_reason || provider?.display_stale) return null;
+	const windows = asWindowList(provider?.windows);
+	// Account summaries keep fractional percentages; worstWindow rounds each window first.
+	const w = (provider?.display_accounts ? windows.find((window) => typeof window.used_percent === "number" && Math.max(0, Math.min(100, 100 - window.used_percent)) === remaining) : null)
+		|| windows.find((window) => remainingPct(window) === remaining);
+	return resetTimeRemaining(w, providerId, nowMs);
+}
+
+function Ring({ value, tone, color, size = 52, stroke, label, children, timeRemaining = null }) {
 	const sw = stroke ?? Math.max(3, Math.round(size / 11));
 	const r = (size - sw) / 2;
 	const c = 2 * Math.PI * r;
 	const pct = value == null ? 0 : Math.max(0, Math.min(100, value));
 	const mid = size / 2;
+	const marker = typeof timeRemaining === "number" && Number.isFinite(timeRemaining) && timeRemaining >= 0 && timeRemaining <= 100 ? timeRemaining : null;
+	const angle = (marker ?? 0) / 100 * 2 * Math.PI;
+	const tick = {
+		x1: mid + Math.cos(angle) * Math.max(0, r - sw / 2 - 1),
+		y1: mid + Math.sin(angle) * Math.max(0, r - sw / 2 - 1),
+		x2: mid + Math.cos(angle) * (r + sw / 2 - 0.5),
+		y2: mid + Math.sin(angle) * (r + sw / 2 - 0.5),
+	};
 	return jsxs("div", {
 		role: "img",
-		"aria-label": label,
+		"aria-label": marker == null ? label : [label, tr("resetPaceTime", fmtPct(Math.round(marker)))].filter(Boolean).join(" · "),
 		"data-ring": tone,
+		title: marker == null ? undefined : [label, tr("resetPaceTime", fmtPct(Math.round(marker)))].filter(Boolean).join(" · "),
 		style: { position: "relative", width: size, height: size, flexShrink: 0 },
 		children: [
 			jsxs("svg", {
@@ -1902,6 +1936,14 @@ function Ring({ value, tone, color, size = 52, stroke, label, children }) {
 								strokeDasharray: `${((pct / 100) * c).toFixed(2)} ${c.toFixed(2)}`,
 							}, "arc")
 						: null,
+					marker == null ? null : jsxs("g", {
+						"data-reset-pace": marker,
+						"aria-hidden": true,
+						children: [
+							jsx("line", { ...tick, stroke: "var(--ui-bg-elevated)", strokeWidth: 3.5 }),
+							jsx("line", { ...tick, stroke: "var(--ui-text-primary)", strokeWidth: 1.5 }),
+						],
+					}, "reset-pace"),
 				],
 			}),
 			children
@@ -2073,27 +2115,51 @@ function QuotaBar({ value, tone }) {
 
 // Layout A: a quota window is one compact row: label, exact value and a thin
 // remaining bar. Unknown stays an empty track with "—", never 0%.
-function WindowBar({ r, tone }) {
+// The pace tick rides the same track: the fill is quota left, the tick is time
+// left, so a fill crossing the tick reads the pace at a glance.
+function WindowBar({ r, tone, timeRemaining = null }) {
+	const marker = typeof timeRemaining === "number" && Number.isFinite(timeRemaining) && timeRemaining >= 0 && timeRemaining <= 100 ? timeRemaining : null;
 	return jsx("span", {
 		"aria-hidden": true,
-		style: { display: "block", height: 4, borderRadius: 2, background: "var(--ui-stroke-tertiary)", overflow: "hidden", minWidth: 0 },
-		children: r == null
-			? null
-			: jsx("span", { style: { display: "block", height: "100%", width: `${r}%`, background: toneColor(tone), borderRadius: 2 } }),
+		"data-window-track": true,
+		style: { position: "relative", display: "block", height: 4, borderRadius: 2, background: "var(--ui-stroke-tertiary)", minWidth: 0 },
+		children: [
+			r == null
+				? null
+				: jsx("span", { style: { display: "block", height: "100%", width: `${r}%`, background: toneColor(tone), borderRadius: 2 } }, "fill"),
+			marker == null
+				? null
+				: jsx("span", {
+					"data-reset-pace": marker,
+					style: {
+						position: "absolute",
+						top: -2,
+						bottom: -2,
+						left: `calc(${marker}% - 1px)`,
+						width: 2,
+						borderRadius: 1,
+						background: "var(--ui-text-primary)",
+						boxShadow: "0 0 0 1px var(--ui-bg-elevated)",
+					},
+				}, "reset-pace"),
+		],
 	});
 }
 
-function WindowTile({ w, resetFormat }) {
+/** One quota window as a compact row: label · exact value · bar · reset. */
+function WindowTile({ w, resetFormat, providerId, showPace = true }) {
 	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? (resetFormat === "absolute" ? absoluteReset(w.reset_at) : relativeCountdown(w.reset_at)) : "";
 	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
+	const nowMs = useNow();
+	const timeRemaining = r == null || !showPace ? null : resetTimeRemaining(w, providerId, nowMs);
 	return jsxs("div", {
 		"data-window": label,
 		"data-window-bar": r,
-		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full, timeRemaining == null ? "" : t("resetPaceTime", fmtPct(Math.round(timeRemaining)))].filter(Boolean).join(" · "),
 		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
 			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", overflowWrap: "anywhere" }, children: label }, "label"),
@@ -2101,7 +2167,7 @@ function WindowTile({ w, resetFormat }) {
 				style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)", textAlign: "end", whiteSpace: "nowrap" },
 				children: r == null ? "—" : `${fmtPct(r)} ${t("left")}`,
 			}, "value"),
-			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone, timeRemaining }) }, "bar"),
 			// Shown in both pane-detail modes: "% left" is hard to act on
 			// without knowing when the window refills (#77).
 			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", ...UI.ellipsis }, children: reset }, "reset") : null,
@@ -2228,7 +2294,7 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				? jsx("div", {
 						"data-windows": true,
 						style: { display: "grid", gridTemplateColumns: page ? "repeat(auto-fill, minmax(180px, 1fr))" : "minmax(0, 1fr)", gap: "8px 16px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, resetFormat }, `${id}-w-${i}`)),
+						children: windows.map((w, i) => jsx(WindowTile, { w, resetFormat, providerId: id, showPace: !provider.display_stale }, `${id}-w-${i}`)),
 					})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
@@ -5456,22 +5522,23 @@ function ContextChip() {
 
 // ---- quota card ----
 
-function QuotaCardWindow({ w, nowMs }) {
+function QuotaCardWindow({ w, nowMs, providerId, showPace = true }) {
 	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	const timeRemaining = r == null || !showPace ? null : resetTimeRemaining(w, providerId, nowMs);
 	// Same compact-row grammar as the pane: label · exact value · bar · reset.
 	return jsxs("div", {
 		"data-card-window": label,
 		"data-window-bar": r,
-		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
+		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : "", timeRemaining == null ? "" : t("resetPaceTime", fmtPct(Math.round(timeRemaining)))].filter(Boolean).join(" · "),
 		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
 			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }, "label"),
 			jsx("span", { style: { ...UI.num, fontSize: "0.6875rem", fontWeight: 600, color: "var(--ui-text-primary)", whiteSpace: "nowrap" }, children: r == null ? "—" : fmtPct(r) }, "value"),
-			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone, timeRemaining }) }, "bar"),
 			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", lineHeight: 1.1 }, children: `↻ ${reset}` }, "reset") : null,
 		],
 	});
@@ -5532,7 +5599,7 @@ function QuotaCard({ close }) {
 								? jsx("span", { "data-card-unavailable": "", style: { ...UI.meta, overflowWrap: "anywhere" }, children: t("unavailable", p.unavailable_reason) })
 								: null,
 							windows.length
-								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs, providerId: pid, showPace: !p.display_stale }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
 							...forecasts.map(({ w, f }, j) =>
@@ -6182,13 +6249,14 @@ function createAccountsController(initial) {
 
 // ---- Accounts view (React) ----
 
-function AccountRing({ windows, size = 30 }) {
+function AccountRing({ windows, size = 30, providerId, nowMs = Date.now() }) {
 	const t = useQT();
 	const w = mostUsedWindow(windows);
 	const left = w ? Math.max(0, Math.min(100, Math.round(100 - w.used))) : null;
 	return jsx(Ring, {
 		value: left,
 		tone: toneForRemaining(left),
+		timeRemaining: resetTimeRemaining(w, providerId, nowMs),
 		size,
 		stroke: 3,
 		label: w ? t("accountsRingLabel", w.label, left) : t("accountsRingNone"),
@@ -6200,8 +6268,9 @@ const ACCOUNT_STATUS_COLOR = { active: "var(--ui-green)", cooldown: "var(--ui-ye
 
 // Layout A: every quota window of a saved account, in the pane's compact
 // bar grammar. Display only — showing an account never switches it.
-function AccountWindows({ windows }) {
+function AccountWindows({ windows, providerId }) {
 	const t = useQT();
+	const nowMs = useNow();
 	const list = asList(windows).filter((w) => w && w.label);
 	if (!list.length) return null;
 	return jsx("div", {
@@ -6210,15 +6279,16 @@ function AccountWindows({ windows }) {
 		children: list.map((w, i) => {
 			const used = finiteNumber(w.used);
 			const left = used == null ? null : Math.max(0, Math.min(100, Math.round(100 - used)));
+			const timeRemaining = left == null ? null : resetTimeRemaining(w, providerId, nowMs);
 			return jsxs("div", {
 				"data-account-window": w.label,
 				"data-window-bar": left,
-				title: left == null ? `${w.label}: —` : t("accountsRingLabel", w.label, left),
+				title: [left == null ? `${w.label}: —` : t("accountsRingLabel", w.label, left), timeRemaining == null ? "" : t("resetPaceTime", fmtPct(Math.round(timeRemaining)))].filter(Boolean).join(" · "),
 				style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "1px 6px", minWidth: 0 },
 				children: [
 					jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, children: w.label }, "l"),
 					jsx("span", { style: { ...UI.tiny, ...UI.num, color: left == null ? "var(--ui-text-quaternary)" : "var(--ui-text-secondary)" }, children: left == null ? "—" : `${left}%` }, "v"),
-					jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r: left, tone: toneForRemaining(left) }) }, "b"),
+					jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r: left, tone: toneForRemaining(left), timeRemaining }) }, "b"),
 				],
 			}, `${w.label}-${i}`);
 		}),
@@ -6330,7 +6400,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 				children: "⋮⋮",
 			}, "grip"),
 			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "end" }, children: String(index + 1) }, "n"),
-			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28 }, "ring"),
+			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28, providerId: pool.provider, nowMs: nowSec * 1000 }, "ring"),
 			jsxs("div", {
 				style: { ...UI.col, gap: 3, flex: "1 1 auto", minWidth: 0 },
 				children: [
@@ -6350,7 +6420,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 							page && row.id ? jsx("span", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)" }, children: row.id }, "id") : null,
 						],
 					}, "meta"),
-					jsx(AccountWindows, { windows: row.windows }, "windows"),
+					jsx(AccountWindows, { windows: row.windows, providerId: pool.provider }, "windows"),
 				],
 			}, "body"),
 			jsxs("div", {
@@ -7181,6 +7251,7 @@ const I18N_EN = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}%${reset ? ` · resets in ${reset}` : ""}`,
 	popoverReset: (reset) => `resets in ${reset}`,
+	resetPaceTime: (pct) => `${pct} of reset window remaining`,
 	refreshTip: "Refresh quota",
 	settingsTip: "Quota settings",
 	backTip: "Back to quota",
@@ -7622,6 +7693,7 @@ const I18N_TR = {
 	providerTip: (label, pct, reset) =>
 		`${label} · %${pct}${reset ? ` · ${reset} sonra sıfırlanır` : ""}`,
 	popoverReset: (reset) => `${reset} sonra sıfırlanır`,
+	resetPaceTime: (pct) => `Sıfırlama süresinin ${pct} kadarı kaldı`,
 	refreshTip: "Kotayı yenile",
 	settingsTip: "Kota ayarları",
 	backTip: "Kotaya dön",
@@ -8084,6 +8156,7 @@ const I18N_DE = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}\u00a0%${reset ? ` · Reset in ${reset}` : ""}`,
 	popoverReset: (reset) => `Reset in ${reset}`,
+	resetPaceTime: (pct) => `${pct} des Reset-Zeitraums verbleibend`,
 	refreshTip: "Kontingent aktualisieren",
 	settingsTip: "Kontingent-Einstellungen",
 	backTip: "Zurück zum Kontingent",
@@ -8524,6 +8597,7 @@ const I18N_ES = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}\u00a0%${reset ? ` · se restablece en ${reset}` : ""}`,
 	popoverReset: (reset) => `se restablece en ${reset}`,
+	resetPaceTime: (pct) => `Queda ${pct} del periodo de reinicio`,
 	refreshTip: "Actualizar cuota",
 	settingsTip: "Ajustes de cuota",
 	backTip: "Volver a la cuota",
@@ -8964,6 +9038,7 @@ const I18N_FR = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}\u00a0%${reset ? ` · réinitialisé dans ${reset}` : ""}`,
 	popoverReset: (reset) => `réinitialisé dans ${reset}`,
+	resetPaceTime: (pct) => `Temps restant avant réinitialisation : ${pct}`,
 	refreshTip: "Actualiser le quota",
 	settingsTip: "Réglages du quota",
 	backTip: "Retour au quota",
@@ -9404,6 +9479,7 @@ const I18N_RU = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}\u00a0%${reset ? ` · сброс через ${reset}` : ""}`,
 	popoverReset: (reset) => `сброс через ${reset}`,
+	resetPaceTime: (pct) => `До сброса осталось ${pct} периода`,
 	refreshTip: "Обновить квоты",
 	settingsTip: "Настройки квот",
 	backTip: "Назад к квотам",
@@ -9844,6 +9920,7 @@ const I18N_JA = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}%${reset ? ` · ${reset}後にリセット` : ""}`,
 	popoverReset: (reset) => `${reset}後にリセット`,
+	resetPaceTime: (pct) => `リセット期間の残り ${pct}`,
 	refreshTip: "クォータを更新",
 	settingsTip: "クォータの設定",
 	backTip: "クォータに戻る",
@@ -10284,6 +10361,7 @@ const I18N_ZH = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}%${reset ? ` · ${reset}后重置` : ""}`,
 	popoverReset: (reset) => `${reset}后重置`,
+	resetPaceTime: (pct) => `重置周期剩余 ${pct}`,
 	refreshTip: "刷新额度",
 	settingsTip: "额度设置",
 	backTip: "返回额度",
@@ -10724,6 +10802,7 @@ const I18N_ZH_HANT = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}%${reset ? ` · ${reset}後重設` : ""}`,
 	popoverReset: (reset) => `${reset}後重設`,
+	resetPaceTime: (pct) => `重設週期剩餘 ${pct}`,
 	refreshTip: "重新整理額度",
 	settingsTip: "額度設定",
 	backTip: "返回額度",
@@ -11164,6 +11243,7 @@ const I18N_AR = {
 	providerTip: (label, pct, reset) =>
 		`${label} · ${pct}%${reset ? ` · تُعاد بعد ${reset}` : ""}`,
 	popoverReset: (reset) => `تُعاد بعد ${reset}`,
+	resetPaceTime: (pct) => `المتبقي من فترة إعادة التعيين: ${pct}`,
 	refreshTip: "تحديث الحصة",
 	settingsTip: "إعدادات الحصة",
 	backTip: "العودة إلى الحصة",
