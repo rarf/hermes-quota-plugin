@@ -14,6 +14,9 @@ CLI:
     hermes quota              → status
     hermes quota refresh      → force re-fetch
     hermes quota provider X   → single provider
+    hermes quota switch P on|off|status
+                              → read/write a provider's backend polling
+                                switch (currently antigravity)
     hermes quota monitor ...  → Agent Monitor views as JSON (snapshot, history,
                                 recommend, budget, set-budget, accounts,
                                 set-priority, set-strategy; see docs/monitor.md)
@@ -37,7 +40,7 @@ from .quota_cache import (
     timezone_name,
     MAX_AGE_S,
 )
-from .quota_providers import PROVIDER_FETCHERS
+from .quota_providers import PROVIDER_FETCHERS, antigravity_switch
 from .codex_special_reset import normalize_entry as normalize_special_reset
 
 _PROVIDER_IDS = tuple(PROVIDER_FETCHERS)
@@ -446,6 +449,9 @@ def _render_quota_json() -> str:
         # The user's zone for every human timestamp on the client surfaces;
         # clients must not inherit their own process TZ.
         "timezone": cache.get("timezone") or timezone_name(),
+        # Backend polling switches the Desktop Settings card reads. The switch
+        # itself is persisted by `hermes quota switch`, not by client storage.
+        "provider_switches": antigravity_switch.switch_payload(),
         # Additive root contract shared with the TUI/Desktop reset panels.
         # It is announcement metadata only, never account quota/reset_at.
         "codex_special_reset": normalize_special_reset(
@@ -512,6 +518,23 @@ def setup_argparse(subparser):
     subs.add_parser("refresh", help="Force a re-fetch of all providers")
     prov = subs.add_parser("provider", help="Show quota for one provider")
     prov.add_argument("name", help="provider id, e.g. anthropic, grok, openai-codex")
+    sw = subs.add_parser(
+        "switch",
+        help="Turn backend polling for one provider on or off (currently antigravity)",
+    )
+    sw.add_argument("name", help="provider id, e.g. antigravity")
+    sw.add_argument(
+        "state",
+        nargs="?",
+        default="status",
+        choices=("on", "off", "status"),
+        help="new switch state (default: status)",
+    )
+    sw.add_argument(
+        "--json",
+        action="store_true",
+        help="Accepted for consistency; JSON is the only output format",
+    )
     for provider_id in _PROVIDER_IDS:
         subs.add_parser(provider_id, help=f"Show quota for {provider_id}")
     _setup_monitor_argparse(subs)
@@ -584,10 +607,37 @@ def _handle_monitor(args) -> int:
     return 1 if "error" in payload else 0
 
 
+def _handle_provider_switch(args) -> int:
+    """``hermes quota switch <provider> [on|off|status] --json``.
+
+    For every invocation that reaches this handler, emit exactly one JSON object:
+    the Desktop's out-of-band refresh path parses stdout, and a failed write must
+    be a non-zero exit with a stable error field rather than a traceback.
+    Argparse errors (bad state word, missing provider) happen before this point
+    and are usage errors on stderr, not JSON.
+    """
+    provider_id = str(getattr(args, "name", "") or "").strip().lower()
+    action = str(getattr(args, "state", "status") or "status").strip().lower()
+    try:
+        payload = antigravity_switch.switch_command(provider_id, action)
+    except antigravity_switch.SwitchError as exc:
+        payload = {"ok": False, "provider": provider_id or None, "error": str(exc)}
+    except Exception as exc:  # noqa: BLE001 - CLI boundary, keep stdout parseable
+        payload = {
+            "ok": False,
+            "provider": provider_id or None,
+            "error": f"{type(exc).__name__}: {exc}"[:300],
+        }
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if payload.get("ok") else 1
+
+
 def _handle_cli(args):
     cmd = getattr(args, "quota_command", None) or "status"
     if cmd == "monitor":
         return _handle_monitor(args)
+    if cmd == "switch":
+        return _handle_provider_switch(args)
     if cmd == "refresh":
         refresh_quota_cache()
         print(_render_quota(None))

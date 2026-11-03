@@ -1,4 +1,4 @@
-"""Executable regressions for focused-profile desktop quota routing."""
+"""Executable regressions for focused-profile desktop quota routing and refreshes."""
 
 from __future__ import annotations
 
@@ -111,9 +111,18 @@ const factory = new Function(
   "CTX",
   "setTimeout",
   "clearTimeout",
-  `${source.slice(start, end)}\nreturn { CLI_TIMEOUT_MS, normalizeQuotaScope, parseJsonOutput, quotaQueryKey, readSnapshot, writeSnapshot, quotaCli, refreshQuotaCache, refreshFocusedQuota: typeof refreshFocusedQuota === "function" ? refreshFocusedQuota : undefined };`,
+  "ANTIGRAVITY_PROVIDER_ID",
+  "baseProviderId",
+  `${source.slice(start, end)}\nreturn { CLI_TIMEOUT_MS, REFRESH_TIMEOUT_MS, normalizeQuotaScope, quotaScopeKey, antigravitySwitchState, parseJsonOutput, quotaQueryKey, readSnapshot, writeSnapshot, quotaCli, refreshQuotaCache, withAntigravityVisibility, refreshFocusedQuota: typeof refreshFocusedQuota === "function" ? refreshFocusedQuota : undefined };`,
 );
-const api = factory(host, CTX, setTimeout, clearTimeout);
+const api = factory(
+  host,
+  CTX,
+  setTimeout,
+  clearTimeout,
+  "antigravity",
+  (pid) => String(pid || "").split(":")[0],
+);
 const invalidated = [];
 const mutationConfig = new Function(
   "refreshFocusedQuota",
@@ -121,6 +130,7 @@ const mutationConfig = new Function(
   "normalizeQuotaScope",
   "quotaCli",
   "CLI_TIMEOUT_MS",
+  "REFRESH_TIMEOUT_MS",
   "quotaQueryKey",
   "qc",
   `return (${extractObjectAfter("const refresh = useMutation(")});`,
@@ -130,6 +140,7 @@ const mutationConfig = new Function(
   api.normalizeQuotaScope,
   api.quotaCli,
   api.CLI_TIMEOUT_MS,
+  api.REFRESH_TIMEOUT_MS,
   api.quotaQueryKey,
   { invalidateQueries: (request) => invalidated.push(request.queryKey) },
 );
@@ -139,6 +150,7 @@ if (useQuotaStart < 0 || useQuotaEnd < 0) throw new Error("useQuota block not fo
 const makeUseQuota = new Function(
   "host",
   "refreshIntervalAtom",
+  "antigravitySwitchAtom",
   "useQueryClient",
   "useValue",
   "useQuery",
@@ -149,6 +161,10 @@ const makeUseQuota = new Function(
   "writeSnapshot",
   "readSnapshot",
   "refreshQuotaCache",
+  "withAntigravityVisibility",
+  "quotaScopeKey",
+  "antigravitySwitchState",
+  "useMemo",
   `${source.slice(useQuotaStart, useQuotaEnd)}\nreturn useQuota;`,
 );
 
@@ -176,11 +192,17 @@ const makeUseQuota = new Function(
   };
   const hookInvalidated = [];
   const refreshIntervalAtom = {};
+  const antigravitySwitchAtom = {};
   const useQuota = makeUseQuota(
     host,
     refreshIntervalAtom,
+    antigravitySwitchAtom,
     () => ({ invalidateQueries: (request) => hookInvalidated.push(request.queryKey) }),
-    (atom) => atom === refreshIntervalAtom ? 60 : focusedOwner,
+    (atom) => atom === refreshIntervalAtom
+      ? 60
+      : atom === antigravitySwitchAtom
+        ? {}
+        : focusedOwner,
     (options) => options,
     api.normalizeQuotaScope,
     api.quotaQueryKey,
@@ -189,12 +211,97 @@ const makeUseQuota = new Function(
     api.writeSnapshot,
     api.readSnapshot,
     api.refreshQuotaCache,
+    api.withAntigravityVisibility,
+    api.quotaScopeKey,
+    api.antigravitySwitchState,
+    (factory) => factory(),
   );
   const hookOptions = useQuota();
   focusedOwner = { connectionId: "remote-b", profile: "shared" };
   const hookData = await hookOptions.queryFn();
   await new Promise((resolve) => setImmediate(resolve));
   const hookCalls = calls.splice(0);
+
+  // Regression: while the switch is off, a render that did not change the raw
+  // payload must return the SAME filtered object. Rebuilding it on every
+  // repaint gave every effect keyed on `data` (cache-age timer, notifier) a
+  // new dependency and restarted them.
+  const memoAtoms = { refresh: {}, switch: {} };
+  const memoScopeKey = api.quotaScopeKey(api.normalizeQuotaScope(focusedOwner));
+  const memoPayload = {
+    age_s: 5,
+    providers: {
+      antigravity: { windows: [] },
+      "antigravity:work": { windows: [] },
+      anthropic: { windows: [] },
+    },
+    provider_switches: { antigravity: { enabled: false, setting: "antigravityEnabled" } },
+  };
+  let memoData = memoPayload;
+  let memoOverrides = { [memoScopeKey]: false };
+  let memoState = null;
+  const memoize = (factory, deps) => {
+    if (
+      memoState &&
+      memoState.deps.length === deps.length &&
+      deps.every((dep, index) => Object.is(dep, memoState.deps[index]))
+    ) {
+      return memoState.value;
+    }
+    const value = factory();
+    memoState = { deps, value };
+    return value;
+  };
+  const useMemoQuota = makeUseQuota(
+    host,
+    memoAtoms.refresh,
+    memoAtoms.switch,
+    () => ({ invalidateQueries: () => {} }),
+    (atom) => atom === memoAtoms.refresh
+      ? 60
+      : atom === memoAtoms.switch
+        ? memoOverrides
+        : focusedOwner,
+    (options) => ({ ...options, data: memoData }),
+    api.normalizeQuotaScope,
+    api.quotaQueryKey,
+    api.quotaCli,
+    api.parseJsonOutput,
+    api.writeSnapshot,
+    api.readSnapshot,
+    api.refreshQuotaCache,
+    api.withAntigravityVisibility,
+    api.quotaScopeKey,
+    api.antigravitySwitchState,
+    memoize,
+  );
+  const memoFirst = useMemoQuota();
+  const memoSecond = useMemoQuota();
+  const filteredOnce = memoFirst.data;
+  const filteredStable = memoFirst.data === memoSecond.data;
+  const filteredShape =
+    filteredOnce !== memoPayload &&
+    filteredOnce.providers !== memoPayload.providers &&
+    filteredOnce.providers.anthropic === memoPayload.providers.anthropic &&
+    !("antigravity" in filteredOnce.providers) &&
+    !("antigravity:work" in filteredOnce.providers) &&
+    filteredOnce.provider_switches === memoPayload.provider_switches;
+  const nextPayload = { ...memoPayload, age_s: 6 };
+  memoData = nextPayload;
+  const memoThird = useMemoQuota();
+  const refiltersNewPayload =
+    memoThird.data !== filteredOnce &&
+    memoThird.data !== nextPayload &&
+    memoThird.data.age_s === 6;
+  memoOverrides = { [memoScopeKey]: true };
+  const memoOn = useMemoQuota();
+  const onReturnsRaw = memoOn.data === nextPayload;
+  memoOverrides = { [memoScopeKey]: false };
+  const memoOffAgain = useMemoQuota();
+  const memoOffAgainSecond = useMemoQuota();
+  const offAgainStable =
+    memoOffAgain.data === memoOffAgainSecond.data &&
+    memoOffAgain.data !== nextPayload;
 
   nextResult = { code: 127, output: "quota: command not found" };
   let failure = "";
@@ -309,6 +416,8 @@ const makeUseQuota = new Function(
     CTX,
     (callback, delay) => setTimeout(callback, Math.min(delay, 5)),
     clearTimeout,
+    "antigravity",
+    (pid) => String(pid || "").split(":")[0],
   );
   routes = [
     { connectionId: "remote-a", profile: "shared", targetProfile: "shared", mode: "remote" },
@@ -323,6 +432,24 @@ const makeUseQuota = new Function(
   nextResult = { code: 0, output: "{}" };
   const refreshAfterTimeout = await fastTimeoutApi.refreshQuotaCache(ownerA);
   const refreshAfterTimeoutCalls = calls.splice(0);
+
+  // A switch flip must not be dropped because the poll path is already
+  // sweeping with the old setting. `trailing` waits for that sweep and then
+  // runs exactly one more; the extra caller coalesces into the same follow-up.
+  routes = [
+    { connectionId: "remote-a", profile: "shared", targetProfile: "shared", mode: "remote" },
+  ];
+  hangRoutes = true;
+  const trailingFirst = api.refreshQuotaCache(ownerA);
+  await new Promise((resolve) => setImmediate(resolve));
+  const trailingSecond = api.refreshQuotaCache(ownerA, { trailing: true });
+  const trailingThird = api.refreshQuotaCache(ownerA, { trailing: true });
+  const plainWhileTrailing = await api.refreshQuotaCache(ownerA);
+  hangRoutes = false;
+  releaseRoutes();
+  releaseRoutes = null;
+  const trailingResults = await Promise.all([trailingFirst, trailingSecond, trailingThird]);
+  const trailingCalls = calls.splice(0);
 
   process.stdout.write(JSON.stringify({
     ownerA,
@@ -369,6 +496,17 @@ const makeUseQuota = new Function(
     lateRefreshCalls,
     refreshAfterTimeout,
     refreshAfterTimeoutCalls,
+    trailingResults,
+    plainWhileTrailing,
+    trailingCalls,
+    quotaMemo: {
+      filteredStable,
+      filteredShape,
+      refiltersNewPayload,
+      onReturnsRaw,
+      offAgainStable,
+    },
+    REFRESH_TIMEOUT_MS: api.REFRESH_TIMEOUT_MS,
   }));
 })().catch((error) => {
   console.error(error && error.stack || error);
@@ -508,6 +646,26 @@ class WidgetProfileRoutingTests(unittest.TestCase):
         )
         self.assertEqual([expected_key], self.result["hookInvalidated"])
 
+    def test_filtered_payload_identity_is_stable_across_renders(self) -> None:
+        memo = self.result["quotaMemo"]
+        self.assertTrue(
+            memo["filteredStable"],
+            "the off-switch payload changed identity between unchanged renders",
+        )
+        self.assertTrue(
+            memo["filteredShape"],
+            "the filtered payload lost Antigravity rows or copied its siblings",
+        )
+        self.assertTrue(
+            memo["refiltersNewPayload"],
+            "a new raw payload must produce a new filtered payload",
+        )
+        self.assertTrue(memo["onReturnsRaw"], "an on switch must render the raw payload")
+        self.assertTrue(
+            memo["offAgainStable"],
+            "turning the switch off again must not rebuild the payload per render",
+        )
+
     def test_route_discovery_is_bounded_by_cli_timeout(self) -> None:
         self.assertIn("quota cli timeout", self.result["timeoutFailure"])
         self.assertEqual(0, self.result["callsAfterTimeout"])
@@ -523,6 +681,29 @@ class WidgetProfileRoutingTests(unittest.TestCase):
         self.assertEqual(
             {"remote-a", "remote-b"},
             {call["route"]["connectionId"] for call in calls},
+        )
+
+    def test_refresh_deadline_covers_the_backend_sweep_budget(self) -> None:
+        # quota_cache.REFRESH_BUDGET_S is 20s; a 15s UI deadline used to abort
+        # a healthy sweep and leave the card a switch behind.
+        self.assertGreaterEqual(self.result["REFRESH_TIMEOUT_MS"], 20_000)
+        self.assertGreaterEqual(self.result["manualCall"]["timeoutMs"], 20_000)
+        self.assertLessEqual(
+            self.result["manualCall"]["timeoutMs"], self.result["REFRESH_TIMEOUT_MS"]
+        )
+        for call in self.result["refreshCalls"]:
+            self.assertGreaterEqual(call["timeoutMs"], 20_000)
+        for call in self.result["trailingCalls"]:
+            self.assertGreaterEqual(call["timeoutMs"], 20_000)
+
+    def test_switch_refresh_trails_an_in_flight_sweep_instead_of_being_dropped(self) -> None:
+        self.assertEqual([True, True, True], self.result["trailingResults"])
+        self.assertFalse(self.result["plainWhileTrailing"])
+        calls = self.result["trailingCalls"]
+        self.assertEqual(2, len(calls), "one in-flight sweep plus exactly one follow-up")
+        self.assertEqual(
+            [["quota", "refresh"], ["quota", "refresh"]],
+            [call["params"]["argv"][2:] for call in calls],
         )
 
 

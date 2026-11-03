@@ -46,7 +46,14 @@ async function run(options = {}) {
   const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: [], navigated: []};
   const focus = options.focus || {};
   const ro = value => ({get: () => value, listen: () => () => {}, subscribe: () => () => {}});
-  const scope = options.noScope ? null : {connectionId: 'local', profile: 'work'};
+  // The focused owner is mutable so a test can switch profiles mid-render, and
+  // `dataByProfile` lets the quota query answer with that profile's payload.
+  let owner = options.noScope ? null : (options.owner || {connectionId: 'local', profile: 'work'});
+  const fixtureFor = () => {
+    const table = options.dataByProfile;
+    if (table && owner && owner.profile in table) return table[owner.profile];
+    return options.data;
+  };
   const routes = [{connectionId: 'local', profile: 'work', targetProfile: 'work', mode: 'local'},
                   {connectionId: 'local', profile: 'home', targetProfile: 'home', mode: 'local'}];
   const queryResult = (opts) => {
@@ -61,11 +68,11 @@ async function run(options = {}) {
       }
       return {data: opts.enabled === false ? undefined : options.history, isError: false, isLoading: false};
     }
-    return {data: options.data, isError: !!options.isError, isPlaceholderData: false, isLoading: false};
+    return {data: fixtureFor(), isError: !!options.isError, isPlaceholderData: false, isLoading: false};
   };
   const host = {
     state: {
-      focusedSessionOwner: {get: () => scope, set: () => {}, subscribe: () => () => {}},
+      focusedSessionOwner: {get: () => owner, set: (next) => { owner = next; }, subscribe: () => () => {}},
       focusedUsage: ro(focus.usage ?? null),
       focusedSessionId: ro(focus.sessionId ?? null),
       focusedStoredSessionId: ro(focus.storedId ?? null),

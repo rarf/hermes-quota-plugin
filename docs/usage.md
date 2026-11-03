@@ -103,7 +103,7 @@ icon).
 
 ### Settings
 
-Everything lives in the pane's **Quota Settings** view and persists locally:
+Most settings live in the pane's **Quota Settings** view and persist locally:
 
 | Setting | Values | Default |
 | --- | --- | --- |
@@ -112,9 +112,15 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | Pane detail | `clean` — rings with their reset times · `dense` — adds forecasts, history and detail lines | `dense` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
-| Enabled providers | toggle any provider on/off (cherry-pick) | all on |
+| Enabled providers | provider pills: local visibility toggle, except Antigravity's pill, which is its backend polling switch | all on; Antigravity off |
 | Show docked quota pane | on · off | on |
 | Agent monitor | on · off (widget-local views and polling; backend enrollment is separate) | off |
+
+The **Enabled providers** group is one list of pills. Most are client-local
+visibility toggles; **Antigravity**'s pill is its backend `antigravityEnabled`
+gate, the same setting `hermes quota switch antigravity` writes. It is off by
+default and has no separate settings card. See
+[Antigravity switch](antigravity-switch.md).
 
 The **Agent monitor** switch only controls this widget's monitor views and CLI
 polling. Turning it on does **not** enroll backend collection; enable the
@@ -143,6 +149,7 @@ collection there.
 | `hermes quota status --version-json` | Installed build stamp (update self-check) |
 | `hermes quota refresh` | Force a re-fetch of all providers |
 | `hermes quota provider <name>` | One provider, e.g. `hermes quota provider anthropic` |
+| `hermes quota switch <provider> on\|off\|status` | Read/write a provider's backend polling switch; currently Antigravity's `antigravityEnabled` |
 | `hermes quota <provider-id>` | Shortcut, e.g. `hermes quota grok` |
 
 ### Bundled skill

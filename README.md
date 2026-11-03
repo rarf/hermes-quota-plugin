@@ -115,6 +115,7 @@ decryption. App-Bound `v20` cookies remain unsupported and are reported as
 - [Installation, profiles and updates](docs/installation.md)
 - [Usage, settings and commands](docs/usage.md)
 - [Providers and their limitations](docs/providers.md)
+- [Antigravity's backend switch in Enabled providers](docs/antigravity-switch.md)
 - [Claude accounts and friendly names](docs/claude-accounts.md)
 - [Codex special-reset announcements and source limitations](docs/codex-special-reset.md)
 - [Troubleshooting—including remote names/icons](docs/troubleshooting.md)
