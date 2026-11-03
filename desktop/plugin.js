@@ -1452,6 +1452,10 @@ function QuotaChipWithBar() {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
 				children: valueText,
 			}),
+			// Layout A: a multi-account winner counts its other saved accounts.
+			worstProvider?.display_accounts?.length > 1
+				? jsx("span", { "data-chip-more": worstProvider.display_accounts.length - 1, className: "text-[0.6875rem]", style: { color: "var(--ui-text-quaternary)" }, children: `+${worstProvider.display_accounts.length - 1}` })
+				: null,
 			jsx(ChipAlert, { alert }),
 		],
 	});
@@ -1581,6 +1585,11 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
+				// Layout A: other saved Codex accounts are counted, never hidden;
+				// all of them stay reachable from the quota popover.
+				...(provider?.display_accounts?.length > 1
+					? [jsx("span", { "data-chip-more": provider.display_accounts.length - 1, style: { color: "var(--ui-text-quaternary)" }, children: `+${provider.display_accounts.length - 1}` }, "more")]
+					: []),
 				// No alert -> no child at all: a plain chip keeps exactly
 				// [dot/ring, name, value].
 				...(alert ? [jsx(ChipAlert, { alert })] : []),
@@ -1590,23 +1599,50 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 	return jsx(ChipPopover, { tip, kind: "quota", width: 300, card: (close) => jsx(QuotaCard, { close }), children: button });
 }
 
-// One status-bar cell for a provider whose saved pool has several sibling
-// rows: one light per card, in row order, tinted by that card's remaining
-// quota, followed by the base provider name. No value text, and the cell
-// never wraps — it stays a single compact line.
+// The limiting known window of one row: its account, label and remaining %.
+// Unknown/failed rows never rank (unknown is not zero).
+function limitingWindow(pid, provider) {
+	if (!provider || provider.unavailable_reason) return null;
+	let best = null;
+	for (const w of asWindowList(provider.windows)) {
+		const r = remainingPct(w);
+		if (r == null) continue;
+		if (!best || r < best.r) best = { r, label: w.label || tr("windowFallback") };
+	}
+	return best;
+}
+
+// Layout A: one status-bar cell for a provider whose saved pool has several
+// sibling rows. One light per account in row order (tinted by that account's
+// remaining quota), the provider name, then the limiting account, its window
+// and remaining value, and an explicit "+N" for the other saved accounts.
+// Every account stays reachable from the quota popover; nothing is selected.
+// The cell never wraps — it stays a single compact line.
 function ProviderGroupChip({ base, entries, alert = null, special }) {
 	const name = providerMeta(base).name;
 	const baseTip = providerGroupTip(entries);
 	const tip = special ? `${baseTip}\n\n${specialTipLines(special).join("\n")}` : baseTip;
+	let limit = null;
+	for (const [pid, provider] of entries) {
+		const w = limitingWindow(pid, provider);
+		if (w && (!limit || w.r < limit.r)) {
+			const account = typeof provider.account_label === "string" ? provider.account_label.trim() : "";
+			limit = { ...w, account: account || providerDisplayName(pid, provider) };
+		}
+	}
+	const more = entries.length - 1;
+	const value = limit ? fmtPct(limit.r) : tr("valueUnknown");
+	const summary = limit ? `${limit.account} · ${limit.label} ${value}` : value;
 	const button = jsxs(
 		"button",
 		{
 			type: "button",
-			"aria-label": `${name} · ${entries.length} cards${chipAlertAria(alert)} · Open Quota pane`,
+			"aria-label": `${name} · ${summary} · +${more}${chipAlertAria(alert)} · ${tr("chipQuotaOpen")}`,
 			className: cn(
-				"inline-flex h-full items-center gap-1 whitespace-nowrap px-1.5 text-[0.6875rem]",
+				"qm-sb-chip inline-flex h-full items-center gap-1 whitespace-nowrap px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
 			),
+			style: CHIP_NOWRAP,
 			children: [
 				...entries.map(([pid, provider], index) =>
 					jsx("span", {
@@ -1614,11 +1650,17 @@ function ProviderGroupChip({ base, entries, alert = null, special }) {
 						style: { background: toneColor(providerTone(provider)) },
 					}, `${pid}-light-${index}`),
 				),
-				jsx("span", { children: name }),
+				jsx("span", { children: name }, "name"),
+				limit
+					? jsx("span", { "data-chip-account": limit.account, style: { ...UI.ellipsis, maxWidth: 96, color: "var(--ui-text-secondary)" }, children: limit.account }, "account")
+					: null,
+				limit ? jsx("span", { "data-chip-window": limit.label, children: limit.label }, "window") : null,
+				jsx("span", { className: "tabular-nums", children: value }, "value"),
+				jsx("span", { "data-chip-more": more, style: { color: "var(--ui-text-quaternary)" }, children: `+${more}` }, "more"),
 				// The cell owns every sibling's countdown/forecast: the merged
 				// alert uses the fullest reset and the earliest fill, exactly
 				// like worst mode, so no card's warning is lost in the merge.
-				...(alert ? [jsx(ChipAlert, { alert })] : []),
+				...(alert ? [jsx(ChipAlert, { alert }, "alert")] : []),
 			],
 		},
 	);
@@ -2029,8 +2071,19 @@ function QuotaBar({ value, tone }) {
 	});
 }
 
-/** One quota window as a ring tile: % left in the centre, label + reset under it. */
-function WindowTile({ w, size, resetFormat }) {
+// Layout A: a quota window is one compact row: label, exact value and a thin
+// remaining bar. Unknown stays an empty track with "—", never 0%.
+function WindowBar({ r, tone }) {
+	return jsx("span", {
+		"aria-hidden": true,
+		style: { display: "block", height: 4, borderRadius: 2, background: "var(--ui-stroke-tertiary)", overflow: "hidden", minWidth: 0 },
+		children: r == null
+			? null
+			: jsx("span", { style: { display: "block", height: "100%", width: `${r}%`, background: toneColor(tone), borderRadius: 2 } }),
+	});
+}
+
+function WindowTile({ w, resetFormat }) {
 	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
@@ -2039,29 +2092,25 @@ function WindowTile({ w, size, resetFormat }) {
 	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
 	return jsxs("div", {
 		"data-window": label,
+		"data-window-bar": r,
 		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
-		style: { ...UI.col, alignItems: "center", gap: 3 },
+		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
-			jsx(Ring, {
-				value: r,
-				tone,
-				size,
-				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
-				children: [
-					jsx("span", { style: { fontSize: Math.round(size * 0.26), fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }, "v"),
-					r == null ? null : jsx("span", { style: { fontSize: Math.max(8, Math.round(size * 0.17)), color: "var(--ui-text-tertiary)" }, children: t("left") }, "l"),
-				],
-			}),
-			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflowWrap: "anywhere" }, children: label }),
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", overflowWrap: "anywhere" }, children: label }, "label"),
+			jsx("span", {
+				style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)", textAlign: "end", whiteSpace: "nowrap" },
+				children: r == null ? "—" : `${fmtPct(r)} ${t("left")}`,
+			}, "value"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
 			// Shown in both pane-detail modes: "% left" is hard to act on
 			// without knowing when the window refills (#77).
-			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", ...UI.ellipsis }, children: reset }, "reset") : null,
 		],
 	});
 }
 
-// One provider card: header (logo, name, health dot, plan pill), a row of ring
-// tiles — one per window — then forecasts, the used-% history chart and detail
+// One provider card: header (logo, name, health dot, plan pill), one compact
+// bar row per window, then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
 function ProviderRow({ id, provider, monitor, page = false, headerExtra, special }) {
 	const t = useQT();
@@ -2127,7 +2176,6 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	}
 
 	const tone = providerTone(provider);
-	const ringSize = page ? 62 : 50;
 	const forecasts = monitor
 		? windows
 				.map((w) => ({ w, forecast: forecastFor(burnFor(monitor.burnMap, id, provider, w.label), w, monitor.nowSec) }))
@@ -2178,9 +2226,9 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				: null,
 			windows.length
 				? jsx("div", {
-						"data-rings": true,
-						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
+						"data-windows": true,
+						style: { display: "grid", gridTemplateColumns: page ? "repeat(auto-fill, minmax(180px, 1fr))" : "minmax(0, 1fr)", gap: "8px 16px" },
+						children: windows.map((w, i) => jsx(WindowTile, { w, resetFormat }, `${id}-w-${i}`)),
 					})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
@@ -2267,49 +2315,26 @@ function SettingsCard({ icon, title, children, footer }) {
 	});
 }
 
-// One group of rows that share a base provider (saved pool accounts): the
-// per-card buttons live inside the selected card's own header, right of the
-// provider name — the row's own label plus its status tone. The card below
-// is still rendered by the same ProviderRow as every single-card provider,
-// so the detail keeps the full single-card completeness. A lone row never
-// reaches this component; the pane keeps its plain card path as-is.
+// One group of rows that share a base provider (saved pool accounts).
+// Layout A: no selection — every saved account renders its own complete
+// ProviderRow card in backend priority order, so every account and window is
+// visible at once. Showing an account never switches it. The provider-level
+// special notice stays nested in a card, attached once to the first account.
+// A lone row never reaches this component; the pane keeps its plain card path.
 function ProviderCardGroup({ entries, monitor, page = false, special }) {
-	const [selected, setSelected] = useState(0);
-	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
-	const index = Math.max(0, Math.min(selected, entries.length - 1));
-	const [selectedId, selectedProvider] = entries[index];
-	const headerExtra = jsx("div", {
-		className: "flex items-center gap-1.5",
-		style: { flexWrap: "wrap" },
+	return jsx("div", {
+		"data-account-group": baseProviderId(entries[0][0]),
+		style: { ...UI.col, gap: 6 },
 		children: entries.map(([pid, provider], i) => {
-			const account =
-				provider && typeof provider.account_label === "string"
-					? provider.account_label.trim()
-					: "";
-			return jsxs(
-				"button",
-				{
-					type: "button",
-					"aria-pressed": i === index,
-					className: cn(
-						"inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-0.5 font-normal",
-						"text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
-					),
-					style:
-						i === index
-							? { background: "var(--ui-control-hover-background)" }
-							: undefined,
-					onClick: () => setSelected(i),
-					children: [
-						jsx("span", { children: account || providerDisplayName(pid, provider) }),
-						jsx(StatusDot, { tone: providerTone(provider) }),
-					],
-				},
-				`${pid}-${i}`,
-			);
+			const account = provider && typeof provider.account_label === "string" ? provider.account_label.trim() : "";
+			return jsx("div", {
+				"data-account": account || providerDisplayName(pid, provider),
+				"data-account-tone": providerTone(provider),
+				style: { minWidth: 0 },
+				children: jsx(ProviderRow, { id: pid, provider, monitor, page, special: i === 0 ? special : null }),
+			}, `${pid}-${i}`);
 		}),
 	});
-	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra, monitor, page, special }, selectedId);
 }
 
 function ResetFormatControl() {
@@ -5349,21 +5374,17 @@ function QuotaCardWindow({ w, nowMs }) {
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	// Same compact-row grammar as the pane: label · exact value · bar · reset.
 	return jsxs("div", {
 		"data-card-window": label,
+		"data-window-bar": r,
 		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
-		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
+		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
-			jsx(Ring, {
-				value: r,
-				tone,
-				size: 32,
-				stroke: 3,
-				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
-				children: jsx("span", { style: { fontSize: 9, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }),
-			}),
-			jsx("span", { style: { ...UI.tiny, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", ...UI.ellipsis }, children: label }),
-			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, lineHeight: 1.1 }, children: `↻ ${reset}` }) : null,
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }, "label"),
+			jsx("span", { style: { ...UI.num, fontSize: "0.6875rem", fontWeight: 600, color: "var(--ui-text-primary)", whiteSpace: "nowrap" }, children: r == null ? "—" : fmtPct(r) }, "value"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
+			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", lineHeight: 1.1 }, children: `↻ ${reset}` }, "reset") : null,
 		],
 	});
 }
@@ -5377,8 +5398,12 @@ function QuotaCard({ close }) {
 	const forecastOn = useValue(quotaForecastAtom);
 	const nowMs = useNow(30_000);
 	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
+	// Same visibility rule as the status bar: a failed saved account keeps its
+	// slot (with its reason) so every account is reachable here without any
+	// selection; only never-configured rows stay hidden.
 	const entries = providerEntries(data && data.providers).filter(
-		([pid, p]) => isProviderEnabled(pid) && isConfigured(p) && (asWindowList(p.windows).length || accountFacts(p).balances.length),
+		([pid, p]) => isProviderEnabled(pid) && p && !isUnconfigured(p)
+			&& (isNoData(p) || asWindowList(p.windows).length || accountFacts(p).balances.length),
 	);
 	const toQuota = () => {
 		close();
@@ -5415,8 +5440,11 @@ function QuotaCard({ close }) {
 									p.plan ? jsx(Pill, { color: "var(--ui-text-tertiary)", children: p.plan }) : null,
 								],
 							}),
+							p.unavailable_reason
+								? jsx("span", { "data-card-unavailable": "", style: { ...UI.meta, overflowWrap: "anywhere" }, children: t("unavailable", p.unavailable_reason) })
+								: null,
 							windows.length
-								? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
 							...forecasts.map(({ w, f }, j) =>
@@ -6079,6 +6107,33 @@ function AccountRing({ windows, size = 30 }) {
 
 const ACCOUNT_STATUS_COLOR = { active: "var(--ui-green)", cooldown: "var(--ui-yellow)", exhausted: "var(--ui-red)" };
 
+// Layout A: every quota window of a saved account, in the pane's compact
+// bar grammar. Display only — showing an account never switches it.
+function AccountWindows({ windows }) {
+	const t = useQT();
+	const list = asList(windows).filter((w) => w && w.label);
+	if (!list.length) return null;
+	return jsx("div", {
+		"data-account-windows": true,
+		style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", gap: "3px 10px", minWidth: 0 },
+		children: list.map((w, i) => {
+			const used = finiteNumber(w.used);
+			const left = used == null ? null : Math.max(0, Math.min(100, Math.round(100 - used)));
+			return jsxs("div", {
+				"data-account-window": w.label,
+				"data-window-bar": left,
+				title: left == null ? `${w.label}: —` : t("accountsRingLabel", w.label, left),
+				style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "1px 6px", minWidth: 0 },
+				children: [
+					jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, children: w.label }, "l"),
+					jsx("span", { style: { ...UI.tiny, ...UI.num, color: left == null ? "var(--ui-text-quaternary)" : "var(--ui-text-secondary)" }, children: left == null ? "—" : `${left}%` }, "v"),
+					jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r: left, tone: toneForRemaining(left) }) }, "b"),
+				],
+			}, `${w.label}-${i}`);
+		}),
+	});
+}
+
 function AccountStatus({ row, nowSec }) {
 	const t = useQT();
 	const until = finiteNumber(row.status_until);
@@ -6186,7 +6241,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "end" }, children: String(index + 1) }, "n"),
 			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28 }, "ring"),
 			jsxs("div", {
-				style: { ...UI.col, gap: 3, flex: "1 1 auto" },
+				style: { ...UI.col, gap: 3, flex: "1 1 auto", minWidth: 0 },
 				children: [
 					jsxs("div", {
 						style: { ...UI.row, gap: 6, flexWrap: "wrap" },
@@ -6204,6 +6259,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 							page && row.id ? jsx("span", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)" }, children: row.id }, "id") : null,
 						],
 					}, "meta"),
+					jsx(AccountWindows, { windows: row.windows }, "windows"),
 				],
 			}, "body"),
 			jsxs("div", {

@@ -614,21 +614,18 @@ class CodexWidgetTests(unittest.TestCase):
             {"label": "Synthetic Amber", "windows": [{"label": "Session", "used_percent": 21}]},
             {"label": "Synthetic Blue", "windows": [{"label": "Weekly", "used_percent": 42}]}]}}}
         pane = render(data=data)
-        # CHANGED (multi-card feature): codex's saved accounts are sibling
-        # rows, so the pane now groups them like any multi-row provider —
-        # every account stays visible as its labelled button, and the card
-        # below shows the selected (first) account with the provider icon.
-        # The full button/click contract lives in tests/test_multicard_pane.py.
+        # CHANGED (layout A, 2026-11-03): codex's saved accounts are sibling
+        # rows and every one renders its own complete card at once (no
+        # selection), each with the provider icon and its own windows.
         self.assertIn("Synthetic Amber", text(pane))
         self.assertIn("Synthetic Blue", text(pane))
         self.assertIn("Synthetic Amber", json.dumps(pane))
-        # Agent Bar look: the card's windows are ring gauges (SVGs too), so
-        # count the provider badge icon specifically instead of every <svg>.
+        # Count the provider badge icon specifically instead of every <svg>.
         badge_icons = [n for n in nodes(pane) if n.get("type") == "svg"
                        and n.get("props", {}).get("className") == "text-[0.875rem]"]
-        self.assertEqual(len(badge_icons), 1)
-        self.assertIn("79% left", text(pane))     # the selected account's detail
-        self.assertNotIn("58% left", text(pane))  # the other account is a button
+        self.assertEqual(len(badge_icons), 2)
+        self.assertIn("79% left", text(pane))  # Synthetic Amber · Session
+        self.assertIn("58% left", text(pane))  # Synthetic Blue · Weekly, no click needed
         worst = render(component="status", statusMode="worst", data=data)
         self.assertIn("Synthetic Amber", text(worst))
         self.assertIn("79%", text(worst))

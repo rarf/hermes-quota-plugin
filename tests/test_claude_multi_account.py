@@ -906,13 +906,10 @@ class WidgetAccountRenderTests(unittest.TestCase):
         tree = render(data=data)
         primary_logo = self._logos(render(component="row", id="anthropic", provider=self.PRIMARY))
         logos = self._logos(tree)
-        # CHANGED (multi-card feature): multi-row providers render as a card
-        # group (buttons + the selected row's card), so exactly one card — the
-        # selected first row — carries the provider logo and the second row
-        # stays visible as its own labelled button. The shared harness cannot
-        # click (its useState is initial-only); the click-through contract
-        # lives in tests/test_multicard_pane.py.
-        self.assertEqual(len(logos), 1)
+        # CHANGED (layout A, 2026-11-03): every saved account renders its own
+        # complete card at once — no selection tab bar — so each row carries
+        # the same provider logo as the primary card.
+        self.assertEqual(len(logos), 2)
         self.assertEqual(set(logos), set(primary_logo))
         self.assertIn("Account 2", text(tree))
         self.assertNotIn("anthropic:account2", text(tree))

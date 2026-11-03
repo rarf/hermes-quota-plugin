@@ -182,25 +182,24 @@ class MultiCardPaneTests(unittest.TestCase):
         out = render(data=pool_data((59.0, 60.0, 84.0, 85.0)))
         self.assertEqual(out['tones'], ['good', 'warn', 'warn', 'bad'])
 
-    def test_clicking_a_card_button_switches_the_detail_card(self):
-        out = render(data=pool_data((50.0, 70.0, 90.0, None)), click='gamma.gmail')
-        self.assertIsNotNone(out['after'])
-        before, after = json.dumps(out['before']), json.dumps(out['after'])
-        # Default selection is the first card; the click moves the detail to
-        # the clicked card (its window value appears; the first one goes).
-        self.assertIn('50% left', before)
-        self.assertNotIn('10% left', before)
-        self.assertIn('10% left', after)
-        self.assertNotIn('50% left', after)
-        self.assertEqual(out['pressed'], [True, False, False, False])
-        self.assertEqual(out['pressedAfter'], [False, False, True, False])
+    def test_every_account_is_visible_at_once_without_a_click(self):
+        # CHANGED (layout A, 2026-11-03): replaces the click-to-switch test.
+        # There is no selection; every card's window value is rendered.
+        out = render(data=pool_data((50.0, 70.0, 90.0, None)))
+        before = json.dumps(out['before'])
+        for value in ('50% left', '30% left', '10% left'):
+            self.assertIn(value, before)
+        self.assertEqual(card_buttons(out['before']), [])
+        self.assertEqual(out['pressed'], [])
 
-    def test_a_read_failure_stays_a_clickable_muted_card(self):
-        out = render(data=pool_data((50.0, 70.0, 90.0, None)), click='delta.mail')
-        after = json.dumps(out['after'])
-        self.assertIn('fetch-error:OSError', after)
-        # The failed card's detail is shown instead of the first card's value.
-        self.assertNotIn('50% left', after)
+    def test_a_read_failure_stays_a_visible_muted_card(self):
+        # CHANGED (layout A): the failed card is shown next to the healthy
+        # ones instead of replacing them after a click.
+        out = render(data=pool_data((50.0, 70.0, 90.0, None)))
+        before = json.dumps(out['before'])
+        self.assertIn('fetch-error:OSError', before)
+        self.assertIn('50% left', before)
+        self.assertEqual(out['tones'][-1], 'muted')
 
     def test_single_card_provider_keeps_the_plain_card_path(self):
         data = {'fetched_at': '2026-01-02T03:04:05Z', 'age_s': 3, 'providers': {
@@ -237,7 +236,11 @@ class MultiCardPaneTests(unittest.TestCase):
         # remaining 50/30/10/5% -> good/warn/bad/bad, row order.
         self.assertEqual(light_colors(lights), [GOOD, WARN, BAD, BAD])
         self.assertIn('CommandCode', text(cell))
-        self.assertNotIn('%', text(cell))
+        # CHANGED (layout A, 2026-11-03): the cell now names the limiting
+        # account, its window and remaining value, plus "+N" for the others.
+        self.assertIn('delta.mail', text(cell))
+        self.assertIn('5%', text(cell))
+        self.assertIn('+3', text(cell))
         self.assertIn('whitespace-nowrap', cell['props']['className'])
         seq = flat(cell)
         name_at = seq.index('CommandCode')
@@ -293,7 +296,10 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(light_colors(lights), [GOOD, WARN])
         self.assertIn('Anthropic', text(buttons[0]))
-        self.assertNotIn('%', text(buttons[0]))
+        # CHANGED (layout A): limiting account + value + "+N" overflow.
+        self.assertIn('Work', text(buttons[0]))
+        self.assertIn('40%', text(buttons[0]))
+        self.assertIn('+1', text(buttons[0]))
 
     def test_status_bar_merge_keeps_a_failed_row_as_a_grey_light(self):
         # Round 2 rewrites the round-1 expectation: the failed row used to be
@@ -305,42 +311,30 @@ class MultiCardPaneTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(light_colors(lights), [GOOD, WARN, BAD, GREY])
 
-    def test_group_card_buttons_live_inside_the_selected_card_header(self):
-        # Fix round (2/5): the per-card buttons moved into the selected card
-        # frame, right of the provider name; compact classes keep them light.
+    def test_every_group_account_renders_its_own_card_frame(self):
+        # CHANGED (layout A, 2026-11-03): replaces the in-header tab buttons.
+        # Each account is a complete card frame of its own, in row order.
         out = render(data=pool_data((50.0, 70.0, 90.0, None)))
         tree = out['before']
-        box = box_with_text(tree, 'CommandCode')
-        buttons = card_buttons(tree)
-        self.assertEqual(len(buttons), 4)
-        in_box = [n for n in flat(box) if isinstance(n, dict)]
-        for button in buttons:
-            self.assertTrue(any(button is n for n in in_box),
-                            'card button rendered outside the card frame')
-            cls = button['props']['className']
-            for part in ('rounded-md', 'px-2', 'py-0.5', 'text-[0.6875rem]'):
-                self.assertIn(part, cls)
-        seq = flat(box)
-        name_at = next(i for i, n in enumerate(seq)
-                       if isinstance(n, str) and n.startswith('CommandCode'))
-        button_at = [i for i, n in enumerate(seq) if any(n is b for b in buttons)]
-        self.assertTrue(button_at and all(name_at < i for i in button_at),
-                        'buttons must sit right of the provider name')
+        self.assertEqual(card_buttons(tree), [])
+        # Account rows in backend order; healthy rows are elevated card
+        # frames, the failed one keeps its muted transparent frame.
+        self.assertEqual(out['labels'], list(LABELS))
+        for label in LABELS[:3]:
+            self.assertIn('CommandCode', text(box_with_text(tree, label)))
+        self.assertIn('delta.mail', text(tree))
+        seq = text(tree)
+        positions = [seq.index(label) for label in LABELS]
+        self.assertEqual(positions, sorted(positions))
 
-    def test_switching_a_group_only_changes_that_provider(self):
-        # Guard-plus (green before and after the fix): a click inside one
-        # provider's group never re-renders another provider's card.
+    def test_other_providers_are_unaffected_by_a_group(self):
+        # Guard: a group never changes another provider's card.
         data = pool_data((50.0, 70.0, 90.0, None))
         data['providers']['deepseek'] = {'windows': [{'label': 'Weekly', 'used_percent': 10.0}]}
-        out = render(data=data, click='gamma.gmail')
-        self.assertIsNotNone(out['after'])
-        before_cc = box_with_text(out['before'], 'CommandCode')
-        after_cc = box_with_text(out['after'], 'CommandCode')
-        self.assertNotEqual(before_cc, after_cc)
-        self.assertIn('10% left', json.dumps(after_cc))
-        self.assertEqual(box_with_text(out['before'], 'DeepSeek'),
-                         box_with_text(out['after'], 'DeepSeek'),
-                         'another provider was re-rendered by the click')
+        alone = {'fetched_at': data['fetched_at'], 'age_s': data['age_s'],
+                 'providers': {'deepseek': data['providers']['deepseek']}}
+        self.assertEqual(box_with_text(render(data=data)['before'], 'DeepSeek'),
+                         box_with_text(render(data=alone)['before'], 'DeepSeek'))
 
     # ---- correction round 2: no-data rows keep a grey light ----------------
 
@@ -430,7 +424,8 @@ class MultiCardPaneTests(unittest.TestCase):
         # BOTH surfaces; the pane keeps only the two real cards.
         data = pool_data_with_unconfigured_sibling()
         pane = render(data=data)
-        self.assertEqual(len(card_buttons(pane['before'])), 2)
+        # CHANGED (layout A): two account rows instead of two tab buttons.
+        self.assertEqual(len(pane['labels']), 2)
         self.assertEqual(pane['tones'], ['good', 'bad'])
         status = render(component='status', data=data)
         buttons, lights = status_parts(status['before'])

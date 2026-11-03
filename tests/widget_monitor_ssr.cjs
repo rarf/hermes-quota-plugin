@@ -80,13 +80,23 @@ const sdk = {
   Popover: ({children}) => React.createElement(React.Fragment, null, children),
   PopoverTrigger: ({children}) => children,
   PopoverContent: props => React.createElement('div', {'data-chip-card': props['data-chip-card']}, props.children),
+  // Layout matrix (Accounts): a closed dialog renders nothing, like the host's.
+  ConfirmDialog: props => (props && props.open ? React.createElement('div', {role: 'dialog'}, props.title, props.description) : null),
   useMutation: () => ({mutate: () => {}, isPending: false}),
   usePluginI18n: () => translate,
   useQuery: opts => {
     const key = opts.queryKey || [];
     if (key[1] === 'monitor') {
       if (key[2] === 'snapshot') return {data: options.monitor, isError: false, isLoading: false};
+      // Opt-in (layout matrix): a synthetic `quota monitor accounts` payload.
+      if (key[2] === 'accounts' && options.accounts !== undefined) {
+        return {data: opts.enabled === false ? undefined : options.accounts, isError: false, isLoading: false};
+      }
       return {data: opts.enabled === false ? undefined : options.history, isError: false};
+    }
+    // Opt-in (layout matrix): a failed quota read, with or without a cache.
+    if (options.quotaError) {
+      return {data: options.data, isError: true, error: new Error(options.quotaError), isLoading: false, isPlaceholderData: false};
     }
     return {data: options.data, isError: false, isLoading: false, isPlaceholderData: false};
   },
@@ -141,6 +151,44 @@ try {
   html.settings = ReactDOMServer.renderToStaticMarkup(React.createElement(vm.runInContext('QuotaSettings', context)));
 } catch (e) {
   errors.push('render settings: ' + (e && e.stack || e));
+}
+// Opt-in (layout matrix): the docked pane, the status-bar items and the four
+// chip popover cards (ChipPopover only mounts its card once opened).
+if (options.surfaces) {
+  const snap = options.monitor && options.monitor.monitor_version ? options.monitor : null;
+  const scope = {connectionId: 'local', profile: 'work'};
+  const extra = {
+    dock: () => React.createElement(vm.runInContext('QuotaPane', context), {page: false}),
+    statusbar: () => React.createElement(React.Fragment, null,
+      ...['context', 'agents', 'statusbar', 'cost'].map(id => React.createElement('span', {key: id, 'data-sb-item': id},
+        items.find(i => i.id === id).render()))),
+    popQuota: () => React.createElement(vm.runInContext('QuotaCard', context), {close() {}}),
+    popAgents: () => React.createElement(vm.runInContext('AgentsCard', context), {snapshot: snap, scope, close() {}}),
+    popContext: () => React.createElement(vm.runInContext('ContextCard', context), {snapshot: snap, scope, close() {}}),
+    popCost: () => React.createElement(vm.runInContext('CostCard', context), {snapshot: snap, close() {}}),
+  };
+  storage.set('paneView', 'quota');
+  vm.runInContext('applyStoredMonitor && applyStoredMonitor()', context);
+  for (const [id, make] of Object.entries(extra)) {
+    try {
+      html[id] = ReactDOMServer.renderToStaticMarkup(make());
+    } catch (e) {
+      errors.push('render ' + id + ': ' + (e && e.stack || e));
+    }
+  }
+  // The docked (narrow) pane for every monitor view. Settings is pane-local
+  // state (useState), so the dock's settings body is QuotaSettings itself.
+  for (const view of options.dockViews || []) {
+    storage.set('paneView', view);
+    vm.runInContext('applyStoredMonitor && applyStoredMonitor()', context);
+    try {
+      html['dock_' + view] = ReactDOMServer.renderToStaticMarkup(view === 'settings'
+        ? React.createElement(vm.runInContext('QuotaSettings', context))
+        : React.createElement(vm.runInContext('QuotaPane', context), {page: false}));
+    } catch (e) {
+      errors.push('render dock_' + view + ': ' + (e && e.stack || e));
+    }
+  }
 }
 console.error = origError;
 process.stdout.write(JSON.stringify({html, errors}));
