@@ -312,7 +312,11 @@ class LiveAndNavTest(unittest.TestCase):
         self.assertEqual(sorted(attr(tree, 'data-ctx-pct')), [2, 84, 91])
         levels = dict(zip(attr(tree, 'data-ctx-pct'), attr(tree, 'data-ctx-level')))
         self.assertEqual(levels, {91: 'danger', 84: 'warn', 2: 'ok'})
-        titles = [text(n) for n in nodes(tree) if n.get('type') == 'span'
+        # CHANGED (layout A, 2026-11-03): the attention row now leads with the
+        # session title too (approved design), so the ordering contract is
+        # asserted on the session rows only (data-session-head), not on every span.
+        titles = [text(n) for h in nodes(tree) if (h.get('props') or {}).get('data-session-head')
+                  for n in nodes(h) if n.get('type') == 'span'
                   and text(n) in ('Refactor the parser', 'Deploy preview', 'Small chore')]
         self.assertEqual(titles, ['Deploy preview', 'Refactor the parser', 'Small chore'],
                          'approval first, then the over-threshold working row before a newer calm one')

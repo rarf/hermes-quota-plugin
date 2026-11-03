@@ -62,6 +62,18 @@ UTIL_CSS = r"""
 .h-1\.5{height:6px}.w-1\.5{width:6px}.h-3\.5{height:14px}.w-3\.5{width:14px}.h-6{height:24px}.border{border:1px solid var(--ui-stroke-secondary)}
 .border-dashed{border-style:dashed}.opacity-60{opacity:.6}.text-right{text-align:right}.select-none{user-select:none}
 .text-\(--ui-text-tertiary\){color:var(--ui-text-tertiary)}.text-\(--ui-text-secondary\){color:var(--ui-text-secondary)}
+/* Harness stand-ins for host Switch / SegmentedControl (tests/widget_monitor_ssr.cjs):
+   approximate only, so owner screenshots show state; not the host's real styling. */
+button[aria-checked]{width:26px;height:15px;border-radius:999px;background:var(--ui-stroke-secondary)!important;position:relative;flex-shrink:0}
+button[aria-checked]::after{content:"";position:absolute;top:2px;inset-inline-start:2px;width:11px;height:11px;border-radius:999px;background:var(--ui-bg-editor)}
+button[aria-checked="true"]{background:var(--ui-accent)!important}
+button[aria-checked="true"]::after{inset-inline-start:13px}
+[role=tablist]:has(> button[aria-pressed]){display:inline-flex;gap:1px;padding:1px;border-radius:6px;background:var(--ui-bg-tertiary)}
+[role=tablist] > button[aria-pressed]{font-size:11px;padding:2px 7px;border-radius:5px;color:var(--ui-text-secondary)}
+[role=tablist] > button[aria-pressed="true"]{background:var(--ui-bg-elevated);color:var(--ui-text-primary);font-weight:600}
+input{font:inherit;font-size:12px;color:var(--ui-text-primary);background:var(--ui-bg-tertiary);border:1px solid var(--ui-stroke-secondary);border-radius:5px;padding:1px 6px;width:64px;text-align:end}
+summary::-webkit-details-marker{display:none}
+summary{list-style:none}.qm-sb-chev{display:inline-block}details[open]>summary .qm-sb-chev{transform:rotate(90deg)}
 """
 
 METRICS_JS = r"""
@@ -139,6 +151,9 @@ def ssr(opts, mode):
     storage = {'monitorEnabled': True, 'budgetDaily': 10, 'budgetMonthly': 40, 'statusbarMode': mode,
                **NOTIFY_STORAGE_DEFAULTS}
     payload = {**opts, 'storage': storage, 'views': ROUTE_VIEWS, 'surfaces': True, 'dockViews': DOCK_VIEWS}
+    # Optional: render another plugin.js (e.g. the base commit) with the same harness.
+    if os.environ.get('LAYOUT_SOURCE'):
+        payload['source'] = os.environ['LAYOUT_SOURCE']
     p = subprocess.run(['node', str(SSR)], input=json.dumps(payload), text=True, capture_output=True, timeout=120,
                        env={**os.environ, 'TZ': 'UTC', 'LANG': 'en_US.UTF-8'})
     if p.returncode:
@@ -153,6 +168,11 @@ def surfaces_for(state):
     out = {f'route_{v}': h.get(v) for v in ROUTE_VIEWS}
     out['route_settings'] = h.get('settings')
     out.update({f'dock_{v}': h.get(f'dock_{v}') for v in DOCK_VIEWS})
+    # The pane's own padding wraps Settings in the product (QuotaPane); the SSR
+    # harness renders QuotaSettings bare, so add the same inset here for review.
+    for key, pad in (('route_settings', '14px 20px 10px'), ('dock_settings', '10px 12px 8px')):
+        if out.get(key):
+            out[key] = f'<div style="padding:{pad};box-sizing:border-box">{out[key]}</div>'
     out['statusbar_all'] = h.get('statusbar')
     out['statusbar_worst'] = worst_run['html'].get('statusbar')
     out.update({p: h.get(p) for p in POPOVERS})
@@ -170,7 +190,7 @@ def page(theme, width, surfaces):
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:">
 <style>:root{{{tokens};color-scheme:{theme}}}body{{margin:8px;background:var(--ui-bg-tertiary);color:var(--ui-text-primary);
 font:13px/1.4 system-ui,sans-serif}}section{{margin:0 0 14px}}h6{{margin:0 0 3px;font:600 10px monospace;color:var(--ui-text-quaternary)}}
-button{{font:inherit;color:inherit;background:none;border:0}}svg{{width:1em;height:1em}}{UTIL_CSS}</style></head>
+button{{font:inherit;color:inherit;background:none;border:0}}svg[width="1em"]{{width:1em;height:1em}}{UTIL_CSS}</style></head>
 <body>{''.join(blocks)}<pre id="metrics" hidden></pre><script>{METRICS_JS}</script></body></html>"""
 
 
