@@ -654,17 +654,23 @@ class KimiFetcherTests(unittest.TestCase):
         """Kimi's edge rejects urllib's default User-Agent with HTTP 403/1010."""
         from quota_providers import kimi
 
-        for method, body in (("GET", None), ("POST", b"{}")):
-            with self.subTest(method=method):
+        cases = (
+            ("https://api.kimi.ai/coding/v1/usages", "GET", None),
+            ("https://api.kimi.com/coding/v1/usages", "GET", None),
+            (kimi._WEB_URL, "POST", b"{}"),
+        )
+        for url, method, body in cases:
+            with self.subTest(url=url, method=method):
                 headers = {"Authorization": "Bearer test-only"}
                 with mock.patch.object(kimi, "urlopen_no_redirect",
                                        side_effect=lambda req, **kw: _FakeResponse(
                                            json.dumps(_KIMI_LIVE_PAYLOAD).encode())) as opener:
                     result = kimi._fetch_with(
-                        headers, "https://api.kimi.ai/coding/v1/usages", method, body)
+                        headers, url, method, body)
                 assert result is not None
                 self.assertIsNone(result.unavailable_reason)
                 request = opener.call_args.args[0]
+                self.assertEqual(request.full_url, url)
                 self.assertEqual(request.get_header("User-agent"), "HermesAgent")
                 self.assertEqual(request.get_header("Authorization"), "Bearer test-only")
                 self.assertEqual(request.get_method(), method)
