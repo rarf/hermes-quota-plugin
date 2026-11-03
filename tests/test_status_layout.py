@@ -106,6 +106,26 @@ class QuotaLayoutTests(unittest.TestCase):
         self.assertIn("██░░░░░░░░", text)
         self.assertIn("24% left", text)
 
+    def test_long_window_labels_keep_one_bar_column(self):
+        # Argon's label is the longest known window label.  The shared column
+        # must fit it rather than letting that row's bar start three columns
+        # later than the others.
+        text = render(self.cache({
+            "antigravity": record("antigravity", [
+                window("Gemini · 5h"),
+                window("Claude/GPT · Weekly"),
+                window("Gemini 4 Argon · Weekly"),
+            ]),
+        }))
+        bar_columns = []
+        for line in text.splitlines():
+            for index, char in enumerate(line):
+                if char in "█░":
+                    bar_columns.append(index)
+                    break
+        self.assertEqual(len(bar_columns), 3)
+        self.assertEqual(len(set(bar_columns)), 1)
+
     def test_worst_quota_first(self):
         text = render(self.cache({
             "anthropic": record("anthropic", [window(used=10.0)], plan="Max"),
@@ -168,18 +188,39 @@ class QuotaLayoutTests(unittest.TestCase):
         cmd, _plugin = _modules()
         cache = self.cache({"anthropic": record("anthropic", [window()])})
         with mock.patch.object(cmd, "read_quota_cache", return_value=cache), \
-                mock.patch.object(cmd, "quota_cache_age_seconds", return_value=7.0):
+                mock.patch.object(cmd, "quota_cache_age_seconds", return_value=7.0), \
+                mock.patch.object(cmd.antigravity_switch, "_settings", return_value={}), \
+                mock.patch.object(cmd.antigravity_switch, "_env_flag", return_value=None):
             payload = json.loads(cmd._render_quota_json())
         # `codex_special_reset` is the additive announcement channel the
-        # Desktop/TUI reset notice reads; the dashboard keys must not drift.
+        # Desktop/TUI reset notice reads; `provider_switches` is the additive
+        # backend-switch channel the Antigravity Settings switch reads. The
+        # dashboard keys must not drift.
         self.assertEqual(
             set(payload),
             {
                 "fetched_at", "providers", "age_s", "plugin_version", "installed_sha",
-                "codex_special_reset", "timezone",
+                "codex_special_reset", "timezone", "provider_switches",
             },
         )
         self.assertEqual(payload["providers"], cache["providers"])
+        # The switch is a real backend gate, not client-local visibility: it
+        # reads and writes the same `antigravityEnabled` key the fetcher uses,
+        # and is off by default.
+        self.assertEqual(
+            payload["provider_switches"]["antigravity"],
+            {
+                "provider": "antigravity",
+                "setting": "antigravityEnabled",
+                "enabled": False,
+                "config": None,
+                "config_explicit": False,
+                "env": None,
+                "env_override": False,
+                "source": "default",
+                "warning": None,
+            },
+        )
 
     def special(self, **overrides):
         entry = {

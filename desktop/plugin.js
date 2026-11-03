@@ -263,15 +263,54 @@ function setResetFormat(fmt) {
 // Cherry-picker: list of disabled provider IDs (persisted).
 const DISABLED_PROVIDERS_KEY = "disabledProviders";
 const DISABLED_PROVIDERS_DEFAULT = []; // empty = all enabled
+// Antigravity's visibility and backend polling are one setting now: its pill
+// in the Enabled providers group writes the backend gate. Older builds let the
+// generic cherry-picker hide it locally, so that orphaned local flag is cleared.
+const ANTIGRAVITY_PROVIDER_ID = "antigravity";
+// Last effective Antigravity switch state this surface learned or asked for,
+// keyed by profile scope (see `quotaScopeKey`). A boolean is the optimistic
+// state of a flip, so an Antigravity card can disappear before the backend
+// cache catches up; a missing key means "not read yet" and the payload's own
+// `provider_switches` remains authoritative. The map is per profile on purpose:
+// the switch writes a per-profile backend setting, so an optimistic flip in one
+// profile must never repaint another profile's cards after a profile switch.
+const antigravitySwitchAtom = atom({});
+// The last failed switch write per profile, as a human-readable detail. Kept
+// outside the settings component so a remount still explains the failure that
+// just happened, and keyed so one profile's failure cannot explain another's.
+const antigravitySwitchErrorAtom = atom({});
+// One switch write in flight per profile, shared by every mounted settings
+// surface (route page and docked pane). The flag lives in module state because
+// a component-local `useState` gave each surface its own lock: both could start
+// a flip, and the two contradictory writes landed in whatever order the
+// backend happened to answer last.
+const antigravitySwitchBusyAtom = atom({});
+
+// Older widget builds stored Antigravity (and later account-scoped
+// `antigravity:<account>` rows) in the generic local hide list. The backend
+// switch is the only authoritative control now, so drop every Antigravity id
+// and leave the other providers' stored choices untouched.
+function withoutAntigravityFlags(list) {
+	return Array.isArray(list)
+		? list.filter((pid) => baseProviderId(pid) !== ANTIGRAVITY_PROVIDER_ID)
+		: DISABLED_PROVIDERS_DEFAULT;
+}
 
 const disabledProvidersAtom = atom(DISABLED_PROVIDERS_DEFAULT);
 
 function applyStoredDisabledProviders() {
 	try {
 		const v = CTX.storage.get(DISABLED_PROVIDERS_KEY);
-		disabledProvidersAtom.set(
-			Array.isArray(v) ? v : DISABLED_PROVIDERS_DEFAULT,
-		);
+		if (!Array.isArray(v)) {
+			disabledProvidersAtom.set(DISABLED_PROVIDERS_DEFAULT);
+			return;
+		}
+		const clean = withoutAntigravityFlags(v);
+		disabledProvidersAtom.set(clean);
+		// Persist the cleanup too: otherwise the orphaned flag survives every
+		// reload and a later build without this filter would hide Antigravity
+		// again. Other providers' entries are written back unchanged.
+		if (clean.length !== v.length) setStored(DISABLED_PROVIDERS_KEY, clean, disabledProvidersAtom);
 	} catch {
 		/* noop */
 	}
@@ -282,6 +321,12 @@ function setDisabledProviders(list) {
 }
 
 function isProviderEnabled(pid) {
+	// Antigravity is deliberately absent here: its visibility follows the
+	// backend switch, which `withAntigravityVisibility` applies to the payload
+	// for the focused profile (including the optimistic value of a flip). A
+	// global gate in this predicate would read one profile's flip while another
+	// profile's payload is being rendered, which is exactly the cross-profile
+	// leak this used to cause. Other providers keep the local hide list.
 	const disabled = disabledProvidersAtom.get();
 	return !disabled.includes(pid);
 }
@@ -1044,7 +1089,15 @@ function formatAgeSeconds(seconds) {
 const QUOTA_QUERY_KEY = ["quota", "widget"];
 const SNAPSHOT_KEY = "lastPayload";
 const CLI_TIMEOUT_MS = 15_000;
-const _refreshInFlight = new Set();
+// A `quota refresh` sweep is allowed to spend the backend's whole
+// `REFRESH_BUDGET_S` (20s) before it returns. Giving that command the same
+// 15s deadline as a status read kills healthy sweeps, which is what left the
+// card one switch behind. Extra headroom covers process spawn and import.
+const REFRESH_TIMEOUT_MS = 30_000;
+// One in-flight refresh per scope, plus at most one trailing refresh when a
+// switch flip needs a payload newer than the one already being fetched.
+const _refreshInFlight = new Map();
+const _refreshTrailing = new Set();
 
 function normalizeQuotaScope(owner) {
 	const connectionId = String(owner?.connectionId || "").trim();
@@ -1076,6 +1129,82 @@ function quotaQueryKey(scope) {
 
 function quotaSnapshotKey(scope) {
 	return `${SNAPSHOT_KEY}:${encodeURIComponent(scope.connectionId)}:${encodeURIComponent(scope.profile)}`;
+}
+
+// Stable key for one profile scope. The desktop plugin mounts several surfaces
+// over the same scope (route page, docked pane, status chips), so state that is
+// per profile has to be addressed by connection *and* profile.
+function quotaScopeKey(scope) {
+	return scope ? `${scope.connectionId}\u0000${scope.profile}` : "";
+}
+
+/** Optimistic Antigravity switch value for `scope`, or null when unread. */
+function antigravitySwitchState(scope, overrides) {
+	const key = quotaScopeKey(scope);
+	if (!key) return null;
+	const map = overrides === undefined ? antigravitySwitchAtom.get() : overrides;
+	const value = map && typeof map === "object" ? map[key] : null;
+	return typeof value === "boolean" ? value : null;
+}
+
+function setAntigravitySwitchState(scope, value) {
+	const key = quotaScopeKey(scope);
+	if (!key || typeof value !== "boolean") return;
+	const current = antigravitySwitchAtom.get();
+	if (current[key] === value) return;
+	antigravitySwitchAtom.set({ ...current, [key]: value });
+}
+
+/** Last failed switch write for `scope`, as a human-readable detail. */
+function antigravitySwitchError(scope, errors) {
+	const key = quotaScopeKey(scope);
+	if (!key) return "";
+	const map = errors === undefined ? antigravitySwitchErrorAtom.get() : errors;
+	const detail = map && typeof map === "object" ? map[key] : "";
+	return typeof detail === "string" ? detail : "";
+}
+
+function setAntigravitySwitchError(scope, detail) {
+	const key = quotaScopeKey(scope);
+	if (!key) return;
+	const text = String(detail || "");
+	const current = antigravitySwitchErrorAtom.get();
+	if (current[key] === text) return;
+	const next = { ...current };
+	if (text) next[key] = text;
+	else delete next[key];
+	antigravitySwitchErrorAtom.set(next);
+}
+
+/** Whether a switch write for `scope` is already in flight. */
+function antigravitySwitchBusy(scope, busy) {
+	const key = quotaScopeKey(scope);
+	if (!key) return false;
+	const map = busy === undefined ? antigravitySwitchBusyAtom.get() : busy;
+	return Boolean(map && typeof map === "object" && map[key]);
+}
+
+/** Claim the single switch write slot for `scope`.
+ *
+ * Returns false when another mounted surface (or an earlier click on this one)
+ * already owns it. The test and the claim happen in the same synchronous turn,
+ * before the first await, so two surfaces cannot both pass the gate.
+ */
+function beginAntigravitySwitchWrite(scope) {
+	const key = quotaScopeKey(scope);
+	if (!key || antigravitySwitchBusy(scope)) return false;
+	antigravitySwitchBusyAtom.set({ ...antigravitySwitchBusyAtom.get(), [key]: true });
+	return true;
+}
+
+function endAntigravitySwitchWrite(scope) {
+	const key = quotaScopeKey(scope);
+	if (!key) return;
+	const current = antigravitySwitchBusyAtom.get();
+	if (!current[key]) return;
+	const next = { ...current };
+	delete next[key];
+	antigravitySwitchBusyAtom.set(next);
 }
 
 // cli.exec currently joins stdout and stderr. Find a complete JSON value while
@@ -1306,29 +1435,98 @@ async function quotaCli(scope, argv, timeoutMs = CLI_TIMEOUT_MS, options) {
 	}
 }
 
-/** Out-of-band refresh: at most one in flight, never awaited by the UI. */
-async function refreshQuotaCache(scope) {
+/** One refresh at a time per scope; a switch may ask for a trailing one.
+ *
+ * The poll path must not pile up sweeps, so a plain call while one is in
+ * flight still reports `false`. A switch flip, however, may have landed
+ * after the in-flight sweep read the old config: dropping that follow-up
+ * leaves the card showing the previous state forever. `trailing: true` waits
+ * for the current sweep and then runs exactly one more, shared by every
+ * caller that asked for it.
+ */
+function startQuotaRefresh(scope, key) {
+	const run = (async () => {
+		try {
+			await quotaCli(scope, ["quota", "refresh"], REFRESH_TIMEOUT_MS);
+			return true;
+		} catch {
+			return false;
+		}
+	})();
+	_refreshInFlight.set(key, run);
+	run.then(() => {
+		if (_refreshInFlight.get(key) === run) _refreshInFlight.delete(key);
+	});
+	return run;
+}
+
+async function refreshQuotaCache(scope, options) {
 	if (!scope) return false;
 	const key = JSON.stringify([scope.connectionId, scope.profile]);
-	if (_refreshInFlight.has(key)) return false;
-	_refreshInFlight.add(key);
-	try {
-		await quotaCli(scope, ["quota", "refresh"]);
-		return true;
-	} catch {
-		return false;
-	} finally {
-		_refreshInFlight.delete(key);
+	const current = _refreshInFlight.get(key);
+	if (!current) return startQuotaRefresh(scope, key);
+	if (!(options && options.trailing === true)) return false;
+	if (_refreshTrailing.has(key)) return current;
+	_refreshTrailing.add(key);
+	const queued = current.then(() => {
+		_refreshTrailing.delete(key);
+		// Another explicit refresh may have started between the old run
+		// finishing and this callback; follow it instead of running a third.
+		const latest = _refreshInFlight.get(key);
+		if (latest && latest !== queued) return latest;
+		return startQuotaRefresh(scope, key);
+	});
+	_refreshInFlight.set(key, queued);
+	return queued;
+}
+
+/** Apply the effective Antigravity switch to the payload used for rendering.
+ *
+ * `override` is the optimistic/current UI state; when absent, the payload's
+ * own `provider_switches` value decides. Turning the switch off hides every
+ * Antigravity row (including account-scoped ones) immediately, without
+ * touching any other provider or the switch metadata.
+ */
+function withAntigravityVisibility(data, override) {
+	if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+	const switchState =
+		data.provider_switches &&
+		typeof data.provider_switches === "object" &&
+		!Array.isArray(data.provider_switches)
+			? data.provider_switches[ANTIGRAVITY_PROVIDER_ID]
+			: null;
+	const effective =
+		typeof override === "boolean"
+			? override
+			: switchState && typeof switchState.enabled === "boolean"
+				? switchState.enabled
+				: null;
+	if (effective !== false) return data;
+	const providers = data.providers;
+	if (!providers || typeof providers !== "object" || Array.isArray(providers)) return data;
+	const kept = {};
+	let removed = false;
+	for (const [pid, provider] of Object.entries(providers)) {
+		if (baseProviderId(pid) === ANTIGRAVITY_PROVIDER_ID) {
+			removed = true;
+			continue;
+		}
+		kept[pid] = provider;
 	}
+	return removed ? { ...data, providers: kept } : data;
 }
 function useQuota() {
 	const qc = useQueryClient();
 	const intervalSec = useValue(refreshIntervalAtom);
 	const owner = useValue(host.state.focusedSessionOwner);
+	// Subscribe to the per-profile switch map: a flip on any surface repaints
+	// this one, but only the focused profile's value may filter its payload.
+	const switchOverrides = useValue(antigravitySwitchAtom);
 	const scope = normalizeQuotaScope(owner);
+	const antigravitySwitch = antigravitySwitchState(scope, switchOverrides);
 	const queryKey = quotaQueryKey(scope);
 	const intervalMs = Math.max(5, intervalSec) * 1000;
-	return useQuery({
+	const query = useQuery({
 		queryKey,
 		queryFn: async () => {
 			const result = await quotaCli(scope, [
@@ -1375,6 +1573,21 @@ function useQuota() {
 		staleTime: Math.max(5_000, Math.floor(intervalMs / 2)),
 		retry: 1,
 	});
+	// Render the payload with the switch's effective state applied. Doing it
+	// here covers every surface (pane, cards, status chips) at once, and an
+	// optimistic flip repaints before the next `--cached` read can serve the
+	// pre-switch snapshot back.
+	//
+	// Memoize on the raw payload and the effective switch. `query.data` is
+	// stable between reads, so while the switch is off this must return the
+	// same filtered object instead of rebuilding it on every repaint: effects
+	// that depend on `data` (the cache-age timer, the monitor notifier) would
+	// otherwise reset or re-run each time an unrelated setting changed.
+	const data = useMemo(
+		() => withAntigravityVisibility(query.data, antigravitySwitch),
+		[query.data, antigravitySwitch],
+	);
+	return data === query.data ? query : { ...query, data };
 }
 
 // The bar is a clipped single line: a chip must never wrap or get squeezed.
@@ -2391,54 +2604,251 @@ function StatusbarModeControl() {
 	});
 }
 
-// Cherry-picker: toggle list of providers
+// One pill in the Enabled providers group. It is shared so the Antigravity
+// button that writes the backend gate looks and behaves like the local
+// visibility toggles around it.
+function ProviderToggleButton({ pid, provider, enabled, disabled, title, onClick }) {
+	return jsx(
+		"button",
+		{
+			type: "button",
+			"data-provider-toggle": pid,
+			"aria-pressed": enabled,
+			disabled: Boolean(disabled),
+			className: "inline-flex items-center gap-1.5 rounded-full text-xs transition-colors hover:bg-(--chrome-action-hover)",
+			style: {
+				height: 24,
+				padding: "0 9px 0 7px",
+				border: `1px solid ${enabled ? tint("var(--ui-accent)", 40) : "var(--ui-stroke-secondary)"}`,
+				background: enabled ? tint("var(--ui-accent)", 12) : "transparent",
+				color: enabled ? "var(--ui-text-primary)" : "var(--ui-text-tertiary)",
+				opacity: disabled ? 0.55 : 1,
+				cursor: disabled ? "not-allowed" : undefined,
+			},
+			onClick,
+			title,
+			children: jsxs("span", {
+				className: "inline-flex items-center gap-1.5",
+				children: [
+					jsx(Dot, { color: enabled ? "var(--ui-accent)" : "var(--ui-stroke-tertiary)", size: 6 }),
+					jsx(ProviderBadge, { pid }),
+					jsx("span", { children: providerDisplayName(pid, provider) }),
+				],
+			}),
+		},
+		pid,
+	);
+}
+
+/** One human-readable line from a failed switch CLI call.
+ *
+ * `cli.exec` surfaces the whole JSON error envelope as the Error message. Turn
+ * that into the stable `error` field when possible, keep a plain diagnostic
+ * otherwise, and cap it so a traceback cannot flood the settings card.
+ */
+function antigravitySwitchFailureDetail(error) {
+	const raw = String(error && error.message ? error.message : error || "").trim();
+	if (!raw) return "";
+	let detail = raw;
+	try {
+		// `cli.exec` may glue gateway diagnostics onto the JSON body. Reuse the
+		// same tolerant scanner the status poll uses instead of JSON.parse on
+		// the whole string, so the stable `error` field still wins.
+		const parsed = parseJsonOutput(raw, "error");
+		if (parsed && typeof parsed === "object" && typeof parsed.error === "string") {
+			detail = parsed.error;
+		}
+	} catch {
+		/* not the CLI's JSON envelope: use the first diagnostic line */
+	}
+	detail = String(detail || "")
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.find(Boolean) || "";
+	detail = detail.replace(/\s+/g, " ");
+	return detail.length > 240 ? `${detail.slice(0, 237)}...` : detail;
+}
+
+// Cherry-picker: toggle list of providers. Antigravity stays in this group, but
+// its pill is not a client-local hide flag: it is the same backend switch the
+// CLI writes (`antigravityEnabled`). Turning it on fires a sweep so the first
+// fetch starts immediately; turning it off stops the next sweep before it
+// resolves or runs the `agy` CLI.
 function DisabledProvidersControl() {
 	const t = useQT();
+	const qc = useQueryClient();
 	const { data } = useQuota();
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const disabled = useValue(disabledProvidersAtom);
-	const allProviders =
-		data && data.providers ? Object.entries(data.providers) : [];
-	if (allProviders.length === 0) return null;
+	const owner = useValue(host.state.focusedSessionOwner);
+	const scope = normalizeQuotaScope(owner);
+	const scopeKey = quotaScopeKey(scope);
+	// Every mounted settings surface (route page and docked pane) subscribes to
+	// the same per-profile maps, so a flip, a failure or an in-flight write on
+	// one of them repaints the pill on all of them -- for that profile only.
+	const switchOverrides = useValue(antigravitySwitchAtom);
+	const switchErrors = useValue(antigravitySwitchErrorAtom);
+	const switchWrites = useValue(antigravitySwitchBusyAtom);
+	const switchOverride = antigravitySwitchState(scope, switchOverrides);
+	const error = antigravitySwitchError(scope, switchErrors);
+	const busy = antigravitySwitchBusy(scope, switchWrites);
+	const allProviders = data && data.providers ? Object.entries(data.providers) : [];
+	const switchState =
+		data && data.provider_switches ? data.provider_switches[ANTIGRAVITY_PROVIDER_ID] : null;
+	const serverEnabled = Boolean(switchState && switchState.enabled);
+	const envOverride = Boolean(switchState && switchState.env_override);
+	// The shared map is the one pill state: every mounted surface shows the same
+	// value for this profile, and an optimistic flip repaints all of them
+	// without a local copy drifting out of sync. A `null` override means this
+	// profile has no optimistic value yet, so the payload decides.
+	const antigravityOn =
+		typeof switchOverride === "boolean" ? switchOverride : serverEnabled;
+	// Only a *change* in the backend value may overwrite the optimistic state.
+	// The pre-switch `--cached` payload usually arrives unchanged after a flip;
+	// treating its first read as an update would bounce the pill back. The read
+	// is tagged with the profile it belongs to: a profile switch is not a
+	// backend change, and adopting the new profile's payload as if it were one
+	// would copy the old profile's value into the new profile's slot.
+	const lastServerEnabled = useRef({ key: scopeKey, enabled: serverEnabled });
+	useEffect(() => {
+		const previous = lastServerEnabled.current;
+		lastServerEnabled.current = { key: scopeKey, enabled: serverEnabled };
+		if (previous.key !== scopeKey || previous.enabled === serverEnabled) return;
+		setAntigravitySwitchState(scope, serverEnabled);
+		// A backend state change makes the last write failure obsolete.
+		setAntigravitySwitchError(scope, "");
+	}, [scopeKey, serverEnabled]);
+	// The switch is its own backend channel: keep the Antigravity pill even if
+	// an old or partial cache has no provider rows yet. After an optimistic
+	// off flip the filtered row list is empty, but the pill must stay so the
+	// user can turn the provider back on.
+	if (
+		allProviders.length === 0 &&
+		!switchState &&
+		typeof switchOverride !== "boolean"
+	) {
+		return null;
+	}
+	// One Antigravity pill even when the payload carries account rows: the
+	// backend setting is provider-wide, not per account.
+	const antigravityProvider =
+		(allProviders.find(([pid]) => pid === ANTIGRAVITY_PROVIDER_ID) || [])[1] ||
+		(allProviders.find(([pid]) => baseProviderId(pid) === ANTIGRAVITY_PROVIDER_ID) || [])[1] ||
+		{ label: ANTIGRAVITY_PROVIDER_ID };
+	const rows = [];
+	let antigravitySeen = false;
+	for (const [pid, provider] of allProviders) {
+		if (baseProviderId(pid) === ANTIGRAVITY_PROVIDER_ID) {
+			if (antigravitySeen) continue;
+			rows.push([ANTIGRAVITY_PROVIDER_ID, antigravityProvider]);
+			antigravitySeen = true;
+		} else {
+			rows.push([pid, provider]);
+		}
+	}
+	if (!antigravitySeen) rows.unshift([ANTIGRAVITY_PROVIDER_ID, antigravityProvider]);
+	const toggleAntigravity = async () => {
+		if (envOverride) return;
+		// Cross-surface lock: this control is mounted once per surface (route
+		// page and docked pane), so component-local busy state let both start a
+		// write and the two flips raced the backend. The claim happens before
+		// the first await, so the other surface's click is a no-op until this
+		// write settles.
+		if (!beginAntigravitySwitchWrite(scope)) return;
+		// Decide from the shared state, not from the render closure: the other
+		// surface may have flipped it since this tree painted.
+		const currentSwitch = antigravitySwitchState(scope);
+		const next = !(typeof currentSwitch === "boolean" ? currentSwitch : serverEnabled);
+		// Repaint both the pill and every quota surface before the first
+		// await. Turning off must hide the card now, not after the sweep.
+		setAntigravitySwitchState(scope, next);
+		setAntigravitySwitchError(scope, "");
+		if (next) {
+			// Drop every old client-only hide flag for this provider, including
+			// account-scoped `antigravity:<account>` ids left by an older build.
+			// Other providers' local choices are preserved.
+			const stale = disabledProvidersAtom.get();
+			if (
+				Array.isArray(stale) &&
+				stale.some((pid) => baseProviderId(pid) === ANTIGRAVITY_PROVIDER_ID)
+			) {
+				setDisabledProviders(withoutAntigravityFlags(stale));
+			}
+		}
+		try {
+			await quotaCli(scope, [
+				"quota",
+				"switch",
+				ANTIGRAVITY_PROVIDER_ID,
+				next ? "on" : "off",
+				"--json",
+			]);
+			setAntigravitySwitchState(scope, next);
+			setAntigravitySwitchError(scope, "");
+			// Do not wait for this read: it serves the pre-switch cache for a
+			// moment, and the switch state above keeps the pill truthful.
+			qc.invalidateQueries({ queryKey: quotaQueryKey(scope) });
+			// Activate (or quiesce) the backend now, without a manual config
+			// command. `trailing` matters here: the poll path may already be
+			// sweeping with the old setting, so this flip must not be dropped.
+			void refreshQuotaCache(scope, { trailing: true }).then((refreshed) => {
+				if (refreshed) qc.invalidateQueries({ queryKey: quotaQueryKey(scope) });
+			});
+		} catch (caught) {
+			setAntigravitySwitchState(scope, !next);
+			setAntigravitySwitchError(scope, antigravitySwitchFailureDetail(caught));
+		} finally {
+			endAntigravitySwitchWrite(scope);
+		}
+	};
+	const errorText = error
+		? `${t("antigravitySwitchError")} ${error}`
+		: "";
+	const switchHint = errorText || (
+		envOverride
+			? t("antigravityEnvHint", Boolean(switchState && switchState.env))
+			: antigravityOn
+				? ""
+				: t("antigravitySwitchHint")
+	);
+	const antigravityTitle = errorText || (
+		envOverride
+			? t("antigravityEnvHint", Boolean(switchState && switchState.env))
+			: antigravityOn
+				? t("disableTooltip")
+				: t("antigravitySwitchLabel")
+	);
 	return jsx(SettingsCard, {
 		icon: "Plug",
 		title: t("disabledProvidersLabel"),
+		footer: switchHint || undefined,
 		children: jsx("div", {
 			style: { display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 0 10px" },
-			children: allProviders.map(([pid, p]) => {
+			children: rows.map(([pid, p]) => {
+				if (pid === ANTIGRAVITY_PROVIDER_ID) {
+					return jsx(ProviderToggleButton, {
+						pid,
+						provider: p,
+						enabled: antigravityOn,
+						disabled: busy || envOverride,
+						title: antigravityTitle,
+						onClick: toggleAntigravity,
+					}, pid);
+				}
 				const enabled = !disabled.includes(pid);
-				return jsx(
-					"button",
-					{
-						type: "button",
-						"aria-pressed": enabled,
-						className: "inline-flex items-center gap-1.5 rounded-full text-xs transition-colors hover:bg-(--chrome-action-hover)",
-						style: {
-							height: 24,
-							padding: "0 9px 0 7px",
-							border: `1px solid ${enabled ? tint("var(--ui-accent)", 40) : "var(--ui-stroke-secondary)"}`,
-							background: enabled ? tint("var(--ui-accent)", 12) : "transparent",
-							color: enabled ? "var(--ui-text-primary)" : "var(--ui-text-tertiary)",
-						},
-						onClick: () => {
-							const next = enabled
-								? [...disabled, pid]
-								: disabled.filter((x) => x !== pid);
-							setDisabledProviders(next);
-						},
-						title: enabled ? t("disableTooltip") : t("enableTooltip"),
-						children: jsxs("span", {
-							className: "inline-flex items-center gap-1.5",
-							children: [
-								jsx(Dot, { color: enabled ? "var(--ui-accent)" : "var(--ui-stroke-tertiary)", size: 6 }),
-								jsx(ProviderBadge, { pid }),
-								jsx("span", { children: providerDisplayName(pid, p) }),
-							],
-						}),
-					},
+				return jsx(ProviderToggleButton, {
 					pid,
-				);
+					provider: p,
+					enabled,
+					title: enabled ? t("disableTooltip") : t("enableTooltip"),
+					onClick: () => {
+						const next = enabled
+							? [...disabled, pid]
+							: disabled.filter((x) => x !== pid);
+						setDisabledProviders(next);
+					},
+				}, pid);
 			}),
 		}),
 	});
@@ -2604,7 +3014,7 @@ function QuotaPane({ page = false } = {}) {
 	const refresh = useMutation({
 		mutationFn: async () => {
 			const scope = normalizeQuotaScope(host.state.focusedSessionOwner.get());
-			await quotaCli(scope, ["quota", "refresh"], CLI_TIMEOUT_MS, {
+			await quotaCli(scope, ["quota", "refresh"], REFRESH_TIMEOUT_MS, {
 				spawnPriority: "foreground",
 			});
 			return scope;
@@ -7074,6 +7484,13 @@ const I18N_EN = {
 	disabledProvidersLabel: "Enabled providers",
 	disableTooltip: "Disable this provider",
 	enableTooltip: "Enable this provider",
+	antigravitySwitchLabel: "Poll Antigravity quota",
+	antigravitySwitchHint:
+		"Off by default. When on, the backend runs the Antigravity CLI (`agy`) to read quota in the background. Requires agy 1.1.11 or newer.",
+	antigravityEnvHint: (on) =>
+		`Controlled by HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. Unset it to use this switch.`,
+	antigravitySwitchError:
+		"Could not save the Antigravity switch — the previous setting is kept.",
 
 	// ---- agent monitor ----
 	tab_quota: "Quota",
@@ -7507,6 +7924,13 @@ const I18N_TR = {
 	disabledProvidersLabel: "Açık sağlayıcılar",
 	disableTooltip: "Bu sağlayıcıyı kapat",
 	enableTooltip: "Bu sağlayıcıyı aç",
+	antigravitySwitchLabel: "Antigravity kotasını yokla",
+	antigravitySwitchHint:
+		"Varsayılan olarak kapalı. Açıkken arka uç, kotayı arka planda okumak için Antigravity CLI'sını (`agy`) çalıştırır. agy 1.1.11 veya üstü gerekir.",
+	antigravityEnvHint: (on) =>
+		`HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"} tarafından kontrol ediliyor. Bu anahtarı kullanmak için değişkeni kaldırın.`,
+	antigravitySwitchError:
+		"Antigravity anahtarı kaydedilemedi — önceki ayar korunuyor.",
 
 	tab_quota: "Kota",
 	tab_live: "Canlı",
@@ -7961,6 +8385,13 @@ const I18N_DE = {
 	disabledProvidersLabel: "Aktive Anbieter",
 	disableTooltip: "Diesen Anbieter deaktivieren",
 	enableTooltip: "Diesen Anbieter aktivieren",
+	antigravitySwitchLabel: "Antigravity-Kontingent abfragen",
+	antigravitySwitchHint:
+		"Standardmäßig aus. Wenn an, führt das Backend die Antigravity-CLI (`agy`) aus, um das Kontingent im Hintergrund zu lesen. Erfordert agy 1.1.11 oder neuer.",
+	antigravityEnvHint: (on) =>
+		`Gesteuert durch HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. Entferne die Variable, um diesen Schalter zu verwenden.`,
+	antigravitySwitchError:
+		"Der Antigravity-Schalter konnte nicht gespeichert werden — die vorherige Einstellung bleibt erhalten.",
 
 	tab_quota: "Kontingent",
 	tab_live: "Live",
@@ -8393,6 +8824,13 @@ const I18N_ES = {
 	disabledProvidersLabel: "Proveedores activos",
 	disableTooltip: "Desactivar este proveedor",
 	enableTooltip: "Activar este proveedor",
+	antigravitySwitchLabel: "Consultar la cuota de Antigravity",
+	antigravitySwitchHint:
+		"Desactivado por defecto. Al activarlo, el backend ejecuta la CLI de Antigravity (`agy`) para leer la cuota en segundo plano. Requiere agy 1.1.11 o posterior.",
+	antigravityEnvHint: (on) =>
+		`Controlado por HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. Elimina la variable para usar este interruptor.`,
+	antigravitySwitchError:
+		"No se pudo guardar el interruptor de Antigravity; se mantiene la configuración anterior.",
 
 	tab_quota: "Cuota",
 	tab_live: "En vivo",
@@ -8825,6 +9263,13 @@ const I18N_FR = {
 	disabledProvidersLabel: "Fournisseurs activés",
 	disableTooltip: "Désactiver ce fournisseur",
 	enableTooltip: "Activer ce fournisseur",
+	antigravitySwitchLabel: "Interroger le quota Antigravity",
+	antigravitySwitchHint:
+		"Désactivé par défaut. Une fois activé, le backend exécute la CLI Antigravity (`agy`) pour lire le quota en arrière-plan. Nécessite agy 1.1.11 ou version ultérieure.",
+	antigravityEnvHint: (on) =>
+		`Contrôlé par HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. Supprimez la variable pour utiliser cet interrupteur.`,
+	antigravitySwitchError:
+		"Impossible d’enregistrer l’interrupteur Antigravity — le réglage précédent est conservé.",
 
 	tab_quota: "Quota",
 	tab_live: "En direct",
@@ -9257,6 +9702,13 @@ const I18N_RU = {
 	disabledProvidersLabel: "Включённые провайдеры",
 	disableTooltip: "Отключить этого провайдера",
 	enableTooltip: "Включить этого провайдера",
+	antigravitySwitchLabel: "Запрашивать квоту Antigravity",
+	antigravitySwitchHint:
+		"По умолчанию выключено. Когда включено, бэкенд запускает Antigravity CLI (`agy`) для чтения квоты в фоне. Требуется agy 1.1.11 или новее.",
+	antigravityEnvHint: (on) =>
+		`Управляется HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. Удалите переменную, чтобы использовать этот переключатель.`,
+	antigravitySwitchError:
+		"Не удалось сохранить переключатель Antigravity — предыдущая настройка сохранена.",
 
 	tab_quota: "Квоты",
 	tab_live: "Сейчас",
@@ -9689,6 +10141,13 @@ const I18N_JA = {
 	disabledProvidersLabel: "有効なプロバイダー",
 	disableTooltip: "このプロバイダーを無効にする",
 	enableTooltip: "このプロバイダーを有効にする",
+	antigravitySwitchLabel: "Antigravity のクォータを取得",
+	antigravitySwitchHint:
+		"既定ではオフです。オンにすると、バックエンドが Antigravity CLI（`agy`）を実行し、バックグラウンドでクォータを読み取ります。agy 1.1.11 以降が必要です。",
+	antigravityEnvHint: (on) =>
+		`HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"} によって制御されています。このスイッチを使うには変数を削除してください。`,
+	antigravitySwitchError:
+		"Antigravity スイッチを保存できませんでした — 以前の設定を維持します。",
 
 	tab_quota: "クォータ",
 	tab_live: "ライブ",
@@ -10121,6 +10580,13 @@ const I18N_ZH = {
 	disabledProvidersLabel: "已启用的提供方",
 	disableTooltip: "停用此提供方",
 	enableTooltip: "启用此提供方",
+	antigravitySwitchLabel: "轮询 Antigravity 配额",
+	antigravitySwitchHint:
+		"默认关闭。开启后，后端会运行 Antigravity CLI（`agy`）在后台读取配额。需要 agy 1.1.11 或更高版本。",
+	antigravityEnvHint: (on) =>
+		`由 HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"} 控制。取消该变量才能使用此开关。`,
+	antigravitySwitchError:
+		"无法保存 Antigravity 开关 — 已保留之前的设置。",
 
 	tab_quota: "额度",
 	tab_live: "实时",
@@ -10553,6 +11019,13 @@ const I18N_ZH_HANT = {
 	disabledProvidersLabel: "已啟用的提供方",
 	disableTooltip: "停用此提供方",
 	enableTooltip: "啟用此提供方",
+	antigravitySwitchLabel: "輪詢 Antigravity 配額",
+	antigravitySwitchHint:
+		"預設關閉。開啟後，後端會執行 Antigravity CLI（`agy`）在背景下讀取配額。需要 agy 1.1.11 或更新版本。",
+	antigravityEnvHint: (on) =>
+		`由 HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"} 控制。取消該變數才能使用此開關。`,
+	antigravitySwitchError:
+		"無法儲存 Antigravity 開關 — 已保留先前的設定。",
 
 	tab_quota: "額度",
 	tab_live: "即時",
@@ -10985,6 +11458,13 @@ const I18N_AR = {
 	disabledProvidersLabel: "المزوّدون المفعّلون",
 	disableTooltip: "تعطيل هذا المزوّد",
 	enableTooltip: "تفعيل هذا المزوّد",
+	antigravitySwitchLabel: "جلب حصة Antigravity",
+	antigravitySwitchHint:
+		"متوقف افتراضيًا. عند تشغيله، يشغّل الخادم واجهة سطر أوامر Antigravity ‏(`agy`) لقراءة الحصة في الخلفية. يتطلب agy 1.1.11 أو أحدث.",
+	antigravityEnvHint: (on) =>
+		`يتحكم به HERMES_QUOTA_ANTIGRAVITY_ENABLED=${on ? "1" : "0"}. أزل المتغير لاستخدام هذا المفتاح.`,
+	antigravitySwitchError:
+		"تعذّر حفظ مفتاح Antigravity — تم الاحتفاظ بالإعداد السابق.",
 
 	tab_quota: "الحصة",
 	tab_live: "مباشر",

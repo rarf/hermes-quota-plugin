@@ -97,9 +97,24 @@ class ProviderBudgetTests(unittest.TestCase):
     def test_antigravity_fits(self):
         mod = importlib.import_module("quota_providers.antigravity")
         self.assertLessEqual(mod._FETCH_BUDGET_S, REFRESH_BUDGET_S)
-        self.assertLessEqual(mod._PLAN_BUDGET_S, mod._FETCH_BUDGET_S)
-        # Three serial calls at the request timeout is what this replaces.
-        self.assertLess(mod._FETCH_BUDGET_S, 3 * mod._TIMEOUT_S)
+        self.assertLessEqual(mod._USAGE_TIMEOUT_S, mod._FETCH_BUDGET_S)
+        # The version gate and /usage are serial and share one deadline.
+        self.assertLess(mod._VERSION_TIMEOUT_S, mod._USAGE_TIMEOUT_S)
+        self.assertLess(mod._FETCH_BUDGET_S,
+                        mod._VERSION_TIMEOUT_S + mod._USAGE_TIMEOUT_S)
+
+    def test_antigravity_process_cleanup_grace_fits(self):
+        mod = importlib.import_module("quota_providers.antigravity")
+        # Each bounded call may spend one small grace period killing and
+        # draining, plus a final allowance for a cancelled reader; both serial
+        # calls must still fit the sweep budget.
+        self.assertLessEqual(
+            mod._FETCH_BUDGET_S
+            + 2 * (mod._KILL_GRACE_S + mod._READER_EXIT_S),
+            REFRESH_BUDGET_S,
+        )
+        self.assertLessEqual(mod._DRAIN_GRACE_S, mod._KILL_GRACE_S)
+        self.assertLessEqual(mod._READER_EXIT_S, mod._KILL_GRACE_S)
 
     def test_cursor_fits(self):
         mod = importlib.import_module("quota_providers.cursor")
@@ -115,10 +130,11 @@ class ProviderBudgetTests(unittest.TestCase):
         self.assertLess(worst, REFRESH_BUDGET_S)
 
 
-def _antigravity_buckets():
-    return {"groups": [{"buckets": [
-        {"bucketId": "gemini-5h", "window": "5h", "remainingFraction": 0.5,
-         "resetTime": "2026-10-01T00:00:00Z"}]}]}
+def _antigravity_usage():
+    return json.dumps({"status": "SUCCESS", "command": {"name": "usage", "data": {
+        "groups": [{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.5,
+             "reset_time": "2026-10-01T00:00:00Z"}]}]}}}).encode("utf-8")
 
 
 class DeadlineIsActuallyUsedTests(unittest.TestCase):
@@ -180,46 +196,92 @@ class DeadlineIsActuallyUsedTests(unittest.TestCase):
             result = mod.fetch_usage("SYNTHETIC_KEY")
         self.assertIsNone(result.unavailable_reason)
 
-    def test_antigravity_clamps_its_quota_call(self):
+    def test_antigravity_clamps_its_usage_call(self):
         mod = importlib.import_module("quota_providers.antigravity")
         seen = []
 
-        def _post(path, access_token, **kwargs):
-            seen.append(kwargs.get("timeout"))
-            return (_antigravity_buckets() if path.endswith(mod._QUOTA_PATH)
-                    else {"currentTier": {"id": "g1-pro-tier"}}, None)
+        def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+                 log_name=None):
+            seen.append(timeout)
+            if tuple(args) == ("--version",):
+                return mod._CliRun(b"1.4.12\n", 0)
+            return mod._CliRun(_antigravity_usage(), 0)
 
+        with mock.patch.object(mod, "_agy_lookup",
+                               return_value=("/fake/agy", None)), \
+             mock.patch.object(mod, "_run_cli", side_effect=_run):
+            result = mod.fetch_antigravity_quota()
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(seen), 2)
+        for timeout in seen:
+            self.assertLessEqual(timeout, mod._FETCH_BUDGET_S)
+
+    def test_antigravity_usage_time_is_clamped_after_the_version_gate(self):
+        """The version probe and /usage share one provider deadline."""
+        mod = importlib.import_module("quota_providers.antigravity")
         clock = FakeClock()
-        with mock.patch.object(mod, "_load_credential", return_value={"token": {}}), \
-             mock.patch.object(mod, "_access_token", return_value=("t", None)), \
-             mock.patch.object(mod, "_post", side_effect=_post), \
+        seen = []
+
+        def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+                 log_name=None):
+            if tuple(args) == ("--version",):
+                # The gate spends 10s of the 18s budget.
+                clock.advance(10.0)
+                return mod._CliRun(b"1.4.12\n", 0)
+            seen.append(timeout)
+            return mod._CliRun(_antigravity_usage(), 0)
+
+        with mock.patch.object(mod, "_agy_lookup",
+                               return_value=("/fake/agy", None)), \
+             mock.patch.object(mod, "_run_cli", side_effect=_run), \
              mock.patch.object(base_mod.time, "monotonic", clock):
             result = mod.fetch_antigravity_quota()
         self.assertIsNone(result.unavailable_reason)
         self.assertTrue(seen)
-        for timeout in seen:
-            self.assertLessEqual(timeout, mod._FETCH_BUDGET_S)
+        # 18s budget - 10s already spent = 8s left for the usage call.
+        self.assertLessEqual(max(seen), mod._FETCH_BUDGET_S - 10.0)
 
     def test_antigravity_reports_timeout_when_the_budget_runs_out(self):
         """The budget starts with the fetcher, so it must be spent mid-flight."""
         mod = importlib.import_module("quota_providers.antigravity")
         clock = FakeClock()
 
-        def _slow_post(path, access_token, **kwargs):
-            # Every call uses its whole slice, so the budget goes in the first
-            # one or two and the next gets a zero-length slice.
-            clock.advance(kwargs.get("timeout", 0.0))
-            return None, None
+        def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+                 log_name=None):
+            if tuple(args) == ("--version",):
+                clock.advance(10.0)
+                return mod._CliRun(b"1.4.12\n", 0)
+            # The usage call uses its whole remaining slice.
+            clock.advance(timeout)
+            return mod._CliRun(b"", None, timed_out=True)
 
-        with mock.patch.object(mod, "_load_credential", return_value={"token": {}}), \
-             mock.patch.object(mod, "_access_token",
-                               side_effect=lambda *a, **k: (clock.advance(mod._TIMEOUT_S),
-                                                             ("t", None))[1]), \
-             mock.patch.object(mod, "_post", side_effect=_slow_post), \
+        with mock.patch.object(mod, "_agy_lookup",
+                               return_value=("/fake/agy", None)), \
+             mock.patch.object(mod, "_run_cli", side_effect=_run), \
              mock.patch.object(base_mod.time, "monotonic", clock):
             result = mod.fetch_antigravity_quota()
         self.assertEqual(result.unavailable_reason, "timeout")
         self.assertGreaterEqual(clock.now, mod._FETCH_BUDGET_S)
+
+    def test_antigravity_cli_failure_is_not_reported_as_timeout(self):
+        """A nonzero exit is a CLI fact, even when the budget is also spent."""
+        mod = importlib.import_module("quota_providers.antigravity")
+        clock = FakeClock()
+
+        def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+                 log_name=None):
+            if tuple(args) == ("--version",):
+                clock.advance(10.0)
+                return mod._CliRun(b"1.4.12\n", 0)
+            clock.advance(timeout)      # the failure arrives at the edge
+            return mod._CliRun(b"", 1)
+
+        with mock.patch.object(mod, "_agy_lookup",
+                               return_value=("/fake/agy", None)), \
+             mock.patch.object(mod, "_run_cli", side_effect=_run), \
+             mock.patch.object(base_mod.time, "monotonic", clock):
+            result = mod.fetch_antigravity_quota()
+        self.assertEqual(result.unavailable_reason, "agy-error")
 
     def test_cursor_clamps_its_rpc(self):
         mod = importlib.import_module("quota_providers.cursor")
@@ -345,20 +407,22 @@ class UrllibSocketTimeoutLimitationsTests(unittest.TestCase):
 class HappyPathsUnchangedTests(unittest.TestCase):
     """A deadline must not change what a healthy account reports."""
 
-    def test_antigravity_still_returns_its_plan_and_windows(self):
+    def test_antigravity_still_returns_its_windows_without_inventing_a_plan(self):
         mod = importlib.import_module("quota_providers.antigravity")
 
-        def _post(path, access_token, **kwargs):
-            if path.endswith(mod._QUOTA_PATH):
-                return _antigravity_buckets(), None
-            return {"paidTier": "g1-pro-tier"}, None
+        def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+                 log_name=None):
+            if tuple(args) == ("--version",):
+                return mod._CliRun(b"1.4.12\n", 0)
+            return mod._CliRun(_antigravity_usage(), 0)
 
-        with mock.patch.object(mod, "_load_credential", return_value={"token": {}}), \
-             mock.patch.object(mod, "_access_token", return_value=("t", None)), \
-             mock.patch.object(mod, "_post", side_effect=_post):
+        with mock.patch.object(mod, "_agy_lookup",
+                               return_value=("/fake/agy", None)), \
+             mock.patch.object(mod, "_run_cli", side_effect=_run):
             result = mod.fetch_antigravity_quota()
         self.assertIsNone(result.unavailable_reason)
-        self.assertEqual(result.plan, "g1-pro-tier")
+        # The CLI has no plan field; the response text must not be mined.
+        self.assertIsNone(result.plan)
         self.assertEqual([w.used_percent for w in result.windows], [50.0])
 
     def test_cursor_still_returns_its_plan_and_windows(self):
@@ -391,42 +455,6 @@ class HappyPathsUnchangedTests(unittest.TestCase):
         self.assertIn("timeout", seen,
                       "_plan_name called without a deadline slice")
         self.assertLessEqual(seen["timeout"], mod._FETCH_BUDGET_S)
-
-
-    def test_a_definitive_http_status_is_not_reported_as_timeout(self):
-        """A status the server returned is a fact; a budget is our own.
-
-        add-provider.md: "unavailable_reason must be truthful." Reporting
-        http-500 as `timeout` points the reader at the sweep rather than at a
-        server that is actually failing.
-        """
-        mod = importlib.import_module("quota_providers.antigravity")
-        for status, expected in ((500, "http-500"), (404, "http-404"),
-                                 (503, "http-503"), (429, "http-429")):
-            with self.subTest(status=status):
-                with mock.patch.object(mod, "_load_credential",
-                                       return_value={"token": "tok"}), \
-                     mock.patch.object(mod, "_access_token",
-                                       return_value=("tok", None)), \
-                     mock.patch.object(mod, "_post", return_value=(None, status)), \
-                     mock.patch.object(mod, "Deadline") as dl:
-                    dl.return_value.expired.return_value = True   # also out of budget
-                    dl.return_value.slice.return_value = 0.0
-                    result = mod.fetch_antigravity_quota()
-                self.assertEqual(result.unavailable_reason, expected)
-
-    def test_a_genuine_exhausted_budget_is_still_timeout(self):
-        """Control: no status at all is a zero-length slice, i.e. a timeout."""
-        mod = importlib.import_module("quota_providers.antigravity")
-        with mock.patch.object(mod, "_load_credential",
-                               return_value={"token": "tok"}), \
-             mock.patch.object(mod, "_access_token", return_value=("tok", None)), \
-             mock.patch.object(mod, "_post", return_value=(None, None)), \
-             mock.patch.object(mod, "Deadline") as dl:
-            dl.return_value.expired.return_value = True
-            dl.return_value.slice.return_value = 0.0
-            result = mod.fetch_antigravity_quota()
-        self.assertEqual(result.unavailable_reason, "timeout")
 
 
     def test_opencode_go_live_shape_still_parses(self):

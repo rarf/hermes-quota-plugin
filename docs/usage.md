@@ -24,10 +24,15 @@ Anthropic · Conta 2 (Team)
 xAI Grok
   Weekly Limit       ██░░░░░░░░   16% left · resets in 20h 12m
 
-Antigravity (Google AI Pro)
-  Gemini · 5h        ██████████   97% left · resets in 2h 12m
-  Claude/GPT · week  ███░░░░░░░   31% left · resets in 5d 20h
+Antigravity
+  Gemini · 5h              ██████████   97% left · resets in 2h 12m
+  Claude/GPT · Weekly      ███░░░░░░░   31% left · resets in 5d 20h
+  Gemini 4 Argon · Weekly  ██████████   99% left · resets in 6d 2h
 ```
+
+The Argon row is conditional: it appears only when `agy` reports that separate
+pool.  The shared label column widens to fit the longest known window label (up
+to a 24-character guard), so the bars stay aligned with or without it.
 
 - Friendly provider names and account labels, mirroring the Desktop/TUI tables.
 - A one-line **Codex special-reset announcement** when one is published — the
@@ -98,7 +103,7 @@ icon).
 
 ### Settings
 
-Everything lives in the pane's **Quota Settings** view and persists locally:
+Most settings live in the pane's **Quota Settings** view and persist locally:
 
 | Setting | Values | Default |
 | --- | --- | --- |
@@ -107,9 +112,15 @@ Everything lives in the pane's **Quota Settings** view and persists locally:
 | Pane detail | `clean` — rings with their reset times · `dense` — adds forecasts, history and detail lines | `dense` |
 | Reset format | `relative` (`2h 15m (14:30)`) · `absolute` (`14:30`) | `relative` |
 | Refresh interval | 15–600 s | `600` |
-| Enabled providers | toggle any provider on/off (cherry-pick) | all on |
+| Enabled providers | provider pills: local visibility toggle, except Antigravity's pill, which is its backend polling switch | all on; Antigravity off |
 | Show docked quota pane | on · off | on |
 | Agent monitor | on · off (widget-local views and polling; backend enrollment is separate) | off |
+
+The **Enabled providers** group is one list of pills. Most are client-local
+visibility toggles; **Antigravity**'s pill is its backend `antigravityEnabled`
+gate, the same setting `hermes quota switch antigravity` writes. It is off by
+default and has no separate settings card. See
+[Antigravity switch](antigravity-switch.md).
 
 The **Agent monitor** switch only controls this widget's monitor views and CLI
 polling. Turning it on does **not** enroll backend collection; enable the
@@ -138,6 +149,7 @@ collection there.
 | `hermes quota status --version-json` | Installed build stamp (update self-check) |
 | `hermes quota refresh` | Force a re-fetch of all providers |
 | `hermes quota provider <name>` | One provider, e.g. `hermes quota provider anthropic` |
+| `hermes quota switch <provider> on\|off\|status` | Read/write a provider's backend polling switch; currently Antigravity's `antigravityEnabled` |
 | `hermes quota <provider-id>` | Shortcut, e.g. `hermes quota grok` |
 
 ### Bundled skill
