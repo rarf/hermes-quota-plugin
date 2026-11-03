@@ -50,7 +50,7 @@ jobs:
           done
 
       - name: Offline TUI widget tests
-        run: node --test tests/tui-panel.test.mjs
+        run: node --test tests/tui-panel.test.mjs tests/special-reset-expiry.test.mjs
 
       - name: Biome lint (format gate intentionally off)
         run: npx --yes @biomejs/biome lint desktop/

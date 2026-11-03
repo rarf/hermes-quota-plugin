@@ -307,7 +307,7 @@ test('special reset announcement is a validated provider-level model, not a fore
   assert.equal(model.stale, false);
 
   const recorded = specialResetModel(specialCache({ ...base, status: 'recorded' }));
-  assert.equal(recorded.status, 'recorded');
+  assert.equal(recorded, null);
 
   for (const bad of [
     { ...base, status: 'executing' },
@@ -383,12 +383,8 @@ test('special reset line keeps quota at 80 cols and shows announced date, state 
   }
   const wide = lineModel(specialCache({ id: 'r1', status: 'recorded', reset_type: 'banked',
     announced_at: '2026-10-20T06:33:48Z', source_url: SPECIAL_SOURCE }), 'openai-codex', 120, now).text;
-  assert.match(wide, /Banked/);
-  assert.match(wide, /recorded/);
-  assert.match(wide, /✨/);
-  assert.match(wide, /✨ Banked reset \d{2}\/10 \d{2}:\d{2}/);
-  assert.doesNotMatch(wide, /happened|for you|executed/i);
-  // Account renewal stays visibly separate from the announcement date.
+  assert.doesNotMatch(wide, /Banked|recorded|✨/);
+  // Account renewal stays visible when the historical notice is hidden.
   assert.match(wide, /reset 27\/10/);
 });
 
@@ -439,7 +435,7 @@ test('special reset never hides unavailable, stale or refresh-error quota state'
 test('special reset hides malformed root data, marks stale, and barely styles as a warning', async () => {
   const { lineModel, renderLine } = await import(source);
   const now = Date.parse('2026-10-22T12:00:00Z');
-  const good = specialCache({ id: 'r1', status: 'recorded', reset_type: 'regular',
+  const good = specialCache({ id: 'r1', status: 'scheduled', reset_type: 'regular',
     announced_at: '2026-10-22T06:55:54Z', source_url: SPECIAL_SOURCE }, { stale: true });
   const stale = lineModel(good, 'openai-codex', 120, now);
   assert.match(stale.text, /STALE/);

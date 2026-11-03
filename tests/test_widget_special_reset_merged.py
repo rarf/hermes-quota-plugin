@@ -110,11 +110,11 @@ class SpecialResetTranslatedTest(unittest.TestCase):
         self.assertNotIn("Oct", pane)
 
     def test_banked_stale_strings_are_translated(self):
-        root = special_root(reset_type="banked", status="recorded")
+        root = special_root(reset_type="banked", status="scheduled")
         root["stale"] = True
         tip = tooltip_text(run(component="status", data=payload(codex_special_reset=root),
                                monitor=snapshot(), locale="de")["tree"])
-        self.assertIn("Angesparter Reset · Erfasst", tip)
+        self.assertIn("Angesparter Reset · Geplant", tip)
         self.assertIn("Veraltet · geprüft", tip)
         self.assertNotIn("Banked", tip)
 

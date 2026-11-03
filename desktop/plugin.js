@@ -872,6 +872,11 @@ function codexSpecial(data) {
 		noteDataTimeZone(data);
 		const announced = announcedDate(value.announced_at, zone);
 		if (!announced) return null;
+		const scheduledText = typeof value.scheduled_for === "string" ? value.scheduled_for.trim() : "";
+		// Match the CLI parser: a legacy timestamp without an offset means UTC.
+		const scheduledMs = scheduledText ? Date.parse(/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledText) ? scheduledText : `${scheduledText}Z`) : NaN;
+		// Recheck on each render: cached notices can expire without a fetch.
+		if (status === "recorded" || (Number.isFinite(scheduledMs) && scheduledMs <= Date.now())) return null;
 		const scheduled = typeof value.scheduled_for === "string"
 			? announcedDate(value.scheduled_for, zone) : "";
 		if (typeof value.source_url !== "string" || !SPECIAL_RESET_SOURCE.test(value.source_url)) return null;

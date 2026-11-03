@@ -96,16 +96,29 @@ class SpecialResetDesktopTests(unittest.TestCase):
                 self.assertNotIn("happened", rendered.lower())
                 self.assertNotIn("for you", rendered.lower())
 
+    def test_unknown_schedule_stays_visible(self):
+        data = payload(root=special_root(announcement(scheduled_for=None)))
+        self.assertIn("Special reset announcement", self.pane(data))
+        self.assertIn("Special reset announcement", tooltip_text(self.status(data)))
+
+    def test_elapsed_notice_is_hidden_in_pane_and_status_without_losing_quota(self):
+        for scheduled in ("2000-01-01T00:00:00Z", "2000-01-01T01:00:00+01:00"):
+            data = payload(root=special_root(announcement(scheduled_for=scheduled)))
+            for mode in ("dense", "detailed", "ring"):
+                self.assertNotIn("Special reset announcement", self.pane(data, mode=mode))
+            self.assertNotIn("Special reset announcement", tooltip_text(self.status(data)))
+            self.assertIn("Codex", self.pane(data))
+
     def test_announcement_hour_follows_the_payload_timezone(self):
         rendered = self.pane(payload(root=special_root(), timezone="Asia/Tokyo"))
         self.assertRegex(rendered, r"0?3:55")  # 06:55Z -> 15:55 Tokyo
         self.assertNotIn("06:55", rendered)
 
     def test_scheduled_estimate_is_shown_next_to_the_announcement(self):
-        root = special_root(announcement(scheduled_for="2026-10-22T17:00:00Z"))
+        root = special_root(announcement(scheduled_for="2099-10-22T17:00:00Z"))
         data = payload(root=root, timezone="Europe/Lisbon")
         rendered = self.pane(data)
-        self.assertIn("Scheduled for Oct 22, 2026", rendered)
+        self.assertIn("Scheduled for Oct 22, 2099", rendered)
         self.assertRegex(rendered, r"0?6:00")  # 17:00Z -> 18:00 Lisbon
         self.assertIn("Scheduled for", tooltip_text(self.status(data)))
 
@@ -113,9 +126,9 @@ class SpecialResetDesktopTests(unittest.TestCase):
         root = special_root(announcement(reset_type="banked", status="recorded",
                                         announced_at="2026-10-20T06:33:48Z"))
         rendered = self.pane(payload(root=root))
-        self.assertIn("Banked reset", rendered)
-        self.assertIn("Recorded", rendered)
-        self.assertIn("Announced Oct 20, 2026", rendered)
+        self.assertNotIn("Special reset announcement", rendered)
+        self.assertNotIn("Banked reset", rendered)
+        self.assertNotIn("Recorded", rendered)
         self.assertNotIn("executed", rendered.lower())
         self.assertNotIn("happened", rendered.lower())
         self.assertNotIn("for you", rendered.lower())

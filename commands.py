@@ -274,6 +274,10 @@ def _special_reset_line(cache: dict[str, Any]) -> str:
     zone = local_tz()
     announced_local = announced.astimezone(zone)
     scheduled = _parse_iso(announcement.get("scheduled_for"))
+    # Hide history at render time, including when a cached estimate expires.
+    if announcement.get("status") == "recorded" or (
+            scheduled is not None and scheduled <= datetime.now(timezone.utc)):
+        return ""
     scheduled_local = scheduled.astimezone(zone) if scheduled is not None else None
     parts = [f"✨ **{title}**"]
     if scheduled_local is not None:

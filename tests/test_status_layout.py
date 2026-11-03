@@ -211,8 +211,9 @@ class QuotaLayoutTests(unittest.TestCase):
         from datetime import datetime
         cache = self.cache({"openai-codex": record("openai-codex", [window()])})
         cache["codex_special_reset"] = self.special()
+        cmd, _plugin = _modules()
         expected = datetime.fromisoformat(
-            "2026-10-22T06:55:54+00:00").astimezone().strftime("%b %d %H:%M")
+            "2026-10-22T06:55:54+00:00").astimezone(cmd.local_tz()).strftime("%b %d %H:%M")
         self.assertIn(f"announced {expected}", render(cache))
 
     def test_special_reset_uses_the_configured_zone_not_the_process_zone(self):
@@ -238,7 +239,9 @@ class QuotaLayoutTests(unittest.TestCase):
         entry = self.special()
         entry["announcement"]["scheduled_for"] = "2026-10-22T17:00:00+00:00"
         cache["codex_special_reset"] = entry
-        with mock.patch.object(cmd, "local_tz", return_value=ZoneInfo("Europe/Lisbon")):
+        with mock.patch.object(cmd, "local_tz", return_value=ZoneInfo("Europe/Lisbon")), \
+                mock.patch.object(cmd, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime.fromisoformat("2026-10-22T12:00:00+00:00")
             line = cmd._special_reset_line(cache)
         self.assertIn("scheduled Oct 22 18:00", line)
         self.assertIn("announced 07:55", line)
