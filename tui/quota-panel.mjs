@@ -175,8 +175,12 @@ export function specialResetModel(cache, now = Date.now()) {
   const zone = safeZone(cache?.timezone);
   // The publisher's scheduled estimate is the actionable time; the announced
   // timestamp only says when the post appeared.
-  const scheduledMs = typeof announcement.scheduled_for === 'string'
-    ? Date.parse(announcement.scheduled_for) : NaN;
+  const scheduledText = typeof announcement.scheduled_for === 'string' ? announcement.scheduled_for.trim() : '';
+  // Match the CLI parser: a legacy timestamp without an offset means UTC.
+  const scheduledMs = scheduledText
+    ? Date.parse(/(?:Z|[+-]\d{2}:\d{2})$/i.test(scheduledText) ? scheduledText : `${scheduledText}Z`) : NaN;
+  // Recorded events are history; an elapsed estimate is no longer actionable.
+  if (status === 'recorded' || (Number.isFinite(scheduledMs) && scheduledMs <= now)) return null;
   const primary = Number.isFinite(scheduledMs) ? scheduledMs : time;
   const fields = zoneParts(new Date(primary), zone);
   const nowFields = zoneParts(new Date(now), zone);
@@ -476,6 +480,8 @@ export default function register(sdk) {
   }
 
   function Picker({ state, t, cols, rows }) {
+    const [noticeCache, setNoticeCache] = React.useState(null);
+    const [now, setNow] = React.useState(Date.now());
     React.useEffect(() => {
       let mounted = true;
       // Start on the remembered provider so a restart does not silently move
@@ -484,14 +490,16 @@ export default function register(sdk) {
         if (!mounted) return;
         const options = pickerOptions(cache);
         const remembered = chosen || saved.selected || null;
+        setNoticeCache(cache);
         sdk.updateWidget(picker, current => ({ ...current, phase: 'ready', options, current: remembered,
-          index: rememberedIndex(options, remembered), stale: panelModel(cache).stale,
-          special: specialNoticeText(cache, Date.now(), cols) }));
+          index: rememberedIndex(options, remembered), stale: panelModel(cache).stale }));
       }, () => {
         if (mounted) sdk.updateWidget(picker, current => ({ ...current, phase: 'error' }));
       });
-      return () => { mounted = false; };
+      const timer = setInterval(() => setNow(Date.now()), 15000);
+      return () => { mounted = false; clearInterval(timer); };
     }, []);
+    const special = specialNoticeText(noticeCache, now, cols);
     const count = Math.max(1, Math.min(7, rows - 14));
     const start = Math.max(0, Math.min(state.index - Math.floor(count / 2), state.options.length - count));
     const visible = state.options.slice(start, start + count);
@@ -499,7 +507,7 @@ export default function register(sdk) {
       h(Dialog, { width: Math.max(12, Math.min(76, cols)), title: 'Quota · choose provider / account', hint: '↑↓ choose · Enter confirm · Esc cancel' },
         h(Box, { flexDirection: 'column' },
           h(Text, { color: t.color.muted, wrap: 'truncate-end' }, 'From quota cache · no key scan · display only'),
-          state.special ? h(Text, { key: 'special', color: t.color.muted, wrap: 'truncate-end' }, state.special) : null,
+          special ? h(Text, { key: 'special', color: t.color.muted, wrap: 'truncate-end' }, special) : null,
           ...(state.phase === 'loading' ? [h(Text, { key: 'loading' }, 'Reading cache…')]
             : state.phase === 'error' ? [h(Text, { key: 'error', color: t.color.error }, 'Cache unavailable. Run /quota refresh first.')]
               : !visible.length ? [h(Text, { key: 'empty' }, 'No configured providers in cache. Run /quota refresh.')]
