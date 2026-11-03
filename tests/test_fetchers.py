@@ -650,6 +650,27 @@ _KIMI_LIVE_PAYLOAD = {
 
 
 class KimiFetcherTests(unittest.TestCase):
+    def test_requests_identify_application_without_mutating_caller_headers(self):
+        """Kimi's edge rejects urllib's default User-Agent with HTTP 403/1010."""
+        from quota_providers import kimi
+
+        for method, body in (("GET", None), ("POST", b"{}")):
+            with self.subTest(method=method):
+                headers = {"Authorization": "Bearer test-only"}
+                with mock.patch.object(kimi, "urlopen_no_redirect",
+                                       side_effect=lambda req, **kw: _FakeResponse(
+                                           json.dumps(_KIMI_LIVE_PAYLOAD).encode())) as opener:
+                    result = kimi._fetch_with(
+                        headers, "https://api.kimi.ai/coding/v1/usages", method, body)
+                assert result is not None
+                self.assertIsNone(result.unavailable_reason)
+                request = opener.call_args.args[0]
+                self.assertEqual(request.get_header("User-agent"), "HermesAgent")
+                self.assertEqual(request.get_header("Authorization"), "Bearer test-only")
+                self.assertEqual(request.get_method(), method)
+                self.assertEqual(request.data, body)
+                self.assertEqual(headers, {"Authorization": "Bearer test-only"})
+
     def test_no_credentials_anywhere(self):
         """Neither Hermes auth nor the legacy session file -> no-credentials."""
         from quota_providers import kimi

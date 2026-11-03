@@ -177,6 +177,8 @@ def _parse_usage_entry(key: str, entry: dict) -> Optional[QuotaWindow]:
 
 def _fetch_with(headers: dict, url: str, method: str = "GET", body: Optional[bytes] = None) -> Optional[QuotaResult]:
     req = urllib.request.Request(url, headers=headers, method=method, data=body)
+    # Kimi's edge rejects urllib's default User-Agent with HTTP 403/1010.
+    req.add_header("User-Agent", "HermesAgent")
     try:
         with urlopen_no_redirect(req, timeout=15) as resp:
             raw = resp.read()
