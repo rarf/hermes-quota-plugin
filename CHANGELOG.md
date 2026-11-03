@@ -3,6 +3,22 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 3.0.1 — 2026-11-03
+
+- Desktop: keep the last successfully fetched quota data visible when polling
+  fails (#87, thanks @iauramchyk).
+- Desktop: show each quota ring's reset time in clean pane mode (#88).
+- CLI, Desktop and TUI: hide expired scheduled Codex special-reset notices at
+  render time without deleting history or changing quota/credit values. Notices
+  without a scheduled time remain visible (#97).
+- Kimi: send an explicit plugin User-Agent for quota requests; offline regression
+  coverage includes the default, .ai and legacy POST endpoints (#92, #98).
+- CI: include special-reset JavaScript regressions and retain Python 3.9 coverage
+  on Ubuntu 24.04, where the required runtime is available.
+- Catalog limitation: existing provider credential readers and OAuth handling do
+  not meet current Hermes catalog rule 11. This patch does not migrate them or
+  establish eligibility for a new catalog pin. Antigravity PR #95 is not included.
+
 ## 3.0.0 — 2026-10-23
 
 - Agent Monitor inside Desktop: live Hermes sessions, attention and context

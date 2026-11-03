@@ -95,7 +95,7 @@ Additional accounts are explicitly configured by directory and display label. La
 
 ## Privacy and security
 
-Extra Claude accounts are opt-in and read-only: no refresh-token exchange, credential write-back or tokens in the display cache. Requests identify this plugin rather than Claude Code. Primary-account resolution remains Hermes-core behavior. Other providers may use opt-in browser/OS credential-store reads and vendor client identities; see [provider disclosures](docs/providers.md). Python plugins are trusted host code, not sandboxed applications. Third-party login reads require disclosure and maintainer judgment for catalog admission. [Security details and limitations](docs/security.md).
+Extra Claude accounts are opt-in and read-only: no refresh-token exchange, credential write-back or tokens in the display cache. Requests identify this plugin rather than Claude Code. Primary-account resolution remains Hermes-core behavior. Other providers may use opt-in browser/OS credential-store reads and vendor client identities; see [provider disclosures](docs/providers.md). Python plugins are trusted host code, not sandboxed applications. **Catalog limitation (3.0.1):** existing provider credential readers and OAuth handling do not meet current Hermes catalog rule 11, which requires Hermes-managed credential routes and prohibits direct credential-store reads, OAuth refresh and vendor-client impersonation. Disclosure or opt-in does not waive that rule. This bugfix release does not migrate those integrations or establish eligibility for a new catalog pin. [Security details and limitations](docs/security.md).
 
 ## Grok authentication
 
