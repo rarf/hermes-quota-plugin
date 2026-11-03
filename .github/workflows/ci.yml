@@ -8,7 +8,9 @@ on:
 jobs:
   python-tests:
     name: Python tests (${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # setup-python has no Python 3.9 build for Ubuntu 26.04.
+    # This expression uses only the repository-owned version matrix.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
