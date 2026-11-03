@@ -7,7 +7,7 @@
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
-| `antigravity` | Reads `gemini:antigravity` from Windows Credential Manager; the `gemini` / `antigravity` item from macOS Keychain; or `~/.gemini/antigravity-cli/antigravity-oauth-token` on Linux | **Opt-in, disabled by default.** Google AI Pro pools — Gemini and Claude/GPT each with a 5-hour and a weekly window; plan from `loadCodeAssist` (`paidTier` wins over `currentTier`). When enabled, refreshes with Antigravity's installed-app OAuth client identity and impersonates its `User-Agent: antigravity/2.8.0 windows/amd64`. Credential stores are read-only. |
+| `antigravity` | `agy` CLI (`agy -p /usage --output-format json`) | **Opt-in, disabled by default.** Requires agy 1.1.11+. Delegates login and credentials to `agy`; no credential-file/keyring reads, OAuth refresh, client impersonation, or direct API calls. Gemini and Claude/GPT windows, plus Gemini 4 Argon when the CLI returns that separate bucket. See below |
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
@@ -85,14 +85,135 @@ Antigravity quota collection is disabled unless you opt in:
 hermes config set plugins.entries.quota.settings.antigravityEnabled true
 ```
 
-Alternatively, set `HERMES_QUOTA_ANTIGRAVITY_ENABLED=1`. If enabled, the plugin
-reads Antigravity's token from Windows Credential Manager (`gemini:antigravity`),
-macOS Keychain (service `gemini`, account `antigravity`; `agy`'s `go-keyring-base64:`
-wrapper is unwrapped before parse), or Linux's
-`~/.gemini/antigravity-cli/antigravity-oauth-token` file. It refreshes the token
-with Antigravity's installed-app OAuth client identity, then calls Google's
-quota service using the spoofed `User-Agent: antigravity/2.8.0 windows/amd64`.
-Credential stores are read-only; refreshed tokens stay in memory.
+Alternatively, set `HERMES_QUOTA_ANTIGRAVITY_ENABLED=1`.
+
+**CLI-only.** The provider delegates login and network access to the vendor's
+`agy` CLI. It never reads Antigravity credential files or OS secret stores,
+never refreshes OAuth tokens, never calls Google's quota service, and never
+impersonates the Antigravity client. That direct credential/HTTP path is what
+Hermes catalog rule 11 does not admit; this invocation matches the accepted
+`antigravity-subscription-directsdk` catalog plugin.
+
+Requires `agy` on `PATH` and version **1.1.11 or newer** (`agy --version`).
+1.1.11 is the first release where print-mode read-only slash commands such as
+`/usage` emit a structured payload under `--output-format json`; older builds
+could treat the command as literal prompt text. The gate is strict and runs
+*before* `/usage`: a missing, unusable or older executable reports
+`agy-missing` / `agy-unsafe-path` / `agy-version-unknown` / `agy-too-old`
+without running the quota command. Pre-release builds such as `1.1.11-rc1` are
+not accepted as proof that the release contains that payload; build metadata
+(`1.1.11+build.7`) is. Update with `agy update`. An unusable proxy variable
+is rejected with `agy-unsafe-proxy` before any probe.
+
+The executable must resolve to an absolute path. A relative `PATH` hit (for
+example from `.` or an empty entry) is rejected. On POSIX, an `agy` that is
+group/world-writable, carries a set-user-ID or set-group-ID bit, is owned by
+neither root nor you, or sits below a directory owned by another user or a
+non-sticky writable directory is also rejected. Those ownership and mode
+checks are POSIX-only: on Windows the plugin requires an absolute, existing
+regular `.exe`/`.com` file (a `.cmd` shim is rejected). No platform verifies a
+signature, and the check is best-effort against other users; it does not defend
+against another process running as the same user. It fails closed rather than
+running a plainly hijackable binary, not as an OS sandbox.
+
+When enabled, the plugin runs:
+
+```sh
+agy -p /usage --output-format json
+```
+
+as a bounded, noninteractive subprocess: no shell, stdin closed, no
+permission-skipping flag, capped stdout, one wall-clock deadline covering the
+child, its process group and the output reader, and `AGY_CLI_DISABLE_AUTO_UPDATE=true`
+so polling cannot update the CLI. Each probe also gets `--log-file` inside its
+private temporary directory, so per-call CLI logs are removed with that
+directory instead of accumulating in the vendor's default log folder. The child
+runs in its own session/process group, so a timeout or an exited child that
+left a helper holding stdout cannot strand the reader; the group is killed and
+the wait is bounded by the same deadline. If a descendant escapes the group and
+keeps stdout open, the cancellable reader gives up after a bounded grace and
+closes its own descriptor, so a refresh cannot leak a thread or an fd; that
+escaped process itself cannot be killed portably. The child runs from a
+private empty temporary directory so `agy` cannot discover project instruction
+files.
+
+The environment is an allow-list of runtime locations plus validated standard
+proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and their
+lowercase forms). Proxy URLs containing whitespace, control characters or
+malformed percent escapes are rejected, as is a proxy URL with embedded
+userinfo, so a proxy password is never placed in the child environment. IPv6
+proxy hosts must be bracketed; `NO_PROXY` entries may be host names, IP/CIDR
+patterns, IPv6 literals (bracketed when a port is present) or wildcards.
+Spaces and tabs around comma-separated `NO_PROXY` entries are trimmed, while
+control characters inside an entry are rejected. If a standard proxy
+variable is present but cannot be validated, the provider returns
+`agy-unsafe-proxy` instead of running `agy` without it: silently dropping a
+configured proxy could send the request direct. The one exception is an
+unusable `NO_PROXY` when no proxy URL is configured: it cannot affect routing
+there, so it is withheld and the provider continues instead of failing on an
+irrelevant value. Ambient credential variables
+(`GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, `AGY_ADC_AUTH`, ...) are
+not forwarded either, so `agy` keeps using the login it already stored. On
+supported builds `/usage` is read-only and does not start an agent turn. The
+plugin itself emits no telemetry and no third-party usage reporting (catalog
+rule 13).
+`agy` is a vendor application, though: it may send its own telemetry and may
+create or update its own local state in its config directory (on Linux, for
+example, `~/.gemini/antigravity-cli/conversation_summaries.db`,
+`installation_id` and bundled skill files) even for a read-only probe. The
+plugin only controls the per-call log path; it does not read or alter that
+state. Windows process handling uses `CREATE_NO_WINDOW` and `taskkill /T`
+before a parent kill, but `taskkill /T` can enumerate descendants only while
+the parent is alive. If `agy` exits normally after leaving a descendant that
+holds stdout, that descendant is already detached from the exited parent and is
+not guaranteed to be cleaned up; the reader still stops after a bounded grace
+and closes the plugin's pipe, but the descendant process itself may survive.
+The Windows path is not covered by this project's verified test matrix (its
+process code is mock-tested only); Linux is verified.
+
+**What is shown.** Buckets are matched by ID, never by array position:
+`gemini-weekly` and `gemini-5h` (`Gemini · Weekly` / `Gemini · 5h`),
+`3p-weekly` and `3p-5h` (`Claude/GPT · Weekly` / `Claude/GPT · 5h`), and, when
+the CLI returns it, the separate `gemini-argon-wtu-weekly` pool
+(`Gemini 4 Argon · Weekly`). Argon availability is conditional: the provider
+shows that window only when `agy` actually returns a usable separate bucket.
+It never derives or duplicates Argon from the main Gemini bucket, and it does
+not infer a tier rule from the CLI's descriptive text. An account whose
+response has four buckets simply shows four windows. `agy` describes the Argon
+pool differently across plans, so treat a missing bucket as "not reported",
+not as a failed fetch.
+
+`remaining_fraction` is *remaining*, so the bar is `(1 - fraction) * 100`.
+`reset_time` is validated as an RFC3339 instant (`Z` or a numeric offset, at
+most 64 characters, a real calendar date) before display; a malformed reset is
+omitted rather than shown verbatim. A bucket that has a valid reset time but no
+fraction is shown with an unknown percentage — missing data is never reported
+as 100% used. An out-of-range fraction is a different unit and the bucket is
+dropped, not rescaled. The CLI publishes no plan name, so there is no plan
+badge rather than a guessed one.
+
+**Unstable output.** The `command.data.groups` JSON is an implementation
+detail, not a documented API; the shape was verified against `agy` 1.4.12 and
+can change without notice. Only that structured payload is read — the
+human-readable `response` TSV is deliberately not scraped. Unknown shapes
+produce `agy-bad-json` / `no-data` instead of invented quota. A missing or
+non-string `status` is a malformed envelope (`agy-bad-json`), not a refusal;
+only an explicit status other than the success spellings `SUCCESS` (current
+releases) or `OK` (older releases) is `agy-refused`. Those spellings are
+matched exactly, without case folding or trimming, so a malformed value is
+never inferred to mean success. Other failure reasons
+are `agy-error`, `agy-invalid-json`, `agy-output-too-large`, `agy-unsafe-path`,
+`agy-unsafe-proxy`, and `timeout`.
+
+**Policy and vendor automation.** `agy` is a vendor application, not a public
+quota API. Automating `/usage` may be subject to Google/Antigravity terms, and
+the vendor may change or restrict print mode at any time; review those terms
+before enabling this provider. This CLI path matches the accepted
+`antigravity-subscription-directsdk` catalog plugin and avoids third-party
+credential reads, OAuth refresh, client impersonation and direct API calls, but
+catalog admission and vendor authorization remain separate maintainer/vendor
+decisions. Sign in by running `agy` yourself; the plugin never handles that
+login.
 
 ### DeepSeek
 
