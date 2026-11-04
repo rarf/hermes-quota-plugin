@@ -24,10 +24,15 @@ Anthropic · Conta 2 (Team)
 xAI Grok
   Weekly Limit       ██░░░░░░░░   16% left · resets in 20h 12m
 
-Antigravity (Google AI Pro)
-  Gemini · 5h        ██████████   97% left · resets in 2h 12m
-  Claude/GPT · week  ███░░░░░░░   31% left · resets in 5d 20h
+Antigravity
+  Gemini · 5h              ██████████   97% left · resets in 2h 12m
+  Claude/GPT · Weekly      ███░░░░░░░   31% left · resets in 5d 20h
+  Gemini 4 Argon · Weekly  ██████████   99% left · resets in 6d 2h
 ```
+
+The Argon row is conditional: it appears only when `agy` reports that separate
+pool.  The shared label column widens to fit the longest known window label (up
+to a 24-character guard), so the bars stay aligned with or without it.
 
 - Friendly provider names and account labels, mirroring the Desktop/TUI tables.
 - A one-line **Codex special-reset announcement** when one is published — the

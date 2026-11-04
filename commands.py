@@ -86,6 +86,10 @@ _HIDDEN_REASON = "no-credentials"
 _BAR_WIDTH = 10
 _BAR_FILLED = "█"
 _BAR_EMPTY = "░"
+# The shared label column is capped so one pathological label cannot push every
+# bar off the line.  24 fits the longest known provider label, the optional
+# "Gemini 4 Argon · Weekly" (23), without truncating it.
+_LABEL_WIDTH_MAX = 24
 
 
 QUOTA_HELP = (
@@ -348,7 +352,7 @@ def _render_quota(provider_filter: Optional[str]) -> str:
         for window in rec.get("windows") or []:
             if isinstance(window, dict):
                 label_width = max(label_width, len(str(window.get("label") or "window")))
-    label_width = min(max(label_width, 6), 20)
+    label_width = min(max(label_width, 6), _LABEL_WIDTH_MAX)
 
     blocks: list[str] = []
     for _index, name, rec in rows:

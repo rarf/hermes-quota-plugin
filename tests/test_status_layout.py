@@ -106,6 +106,26 @@ class QuotaLayoutTests(unittest.TestCase):
         self.assertIn("██░░░░░░░░", text)
         self.assertIn("24% left", text)
 
+    def test_long_window_labels_keep_one_bar_column(self):
+        # Argon's label is the longest known window label.  The shared column
+        # must fit it rather than letting that row's bar start three columns
+        # later than the others.
+        text = render(self.cache({
+            "antigravity": record("antigravity", [
+                window("Gemini · 5h"),
+                window("Claude/GPT · Weekly"),
+                window("Gemini 4 Argon · Weekly"),
+            ]),
+        }))
+        bar_columns = []
+        for line in text.splitlines():
+            for index, char in enumerate(line):
+                if char in "█░":
+                    bar_columns.append(index)
+                    break
+        self.assertEqual(len(bar_columns), 3)
+        self.assertEqual(len(set(bar_columns)), 1)
+
     def test_worst_quota_first(self):
         text = render(self.cache({
             "anthropic": record("anthropic", [window(used=10.0)], plan="Max"),

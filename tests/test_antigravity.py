@@ -1,19 +1,26 @@
-"""Offline unit tests for the Antigravity quota fetcher (stdlib only).
+"""Offline unit tests for the CLI-backed Antigravity quota fetcher.
 
 Run from the repo root:  python tests/test_antigravity.py
-Every HTTP, credential and keychain boundary is mocked.
+Every subprocess boundary is faked except in ``RunnerTests`` (which runs this
+Python interpreter with synthetic programs) and ``LiveAgyTests`` (opt-in via
+``HERMES_QUOTA_LIVE_AGY=1``).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import signal
+import subprocess
 import sys
+import tempfile
+import threading
+import time
 import types
 import unittest
-import urllib.error
-from io import BytesIO
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,337 +28,1391 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from quota_providers import PROVIDER_FETCHERS, antigravity as mod  # noqa: E402
 
 
-class _FakeResponse(BytesIO):
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-
-def _urlopen_returning(payload):
-    def _opener(_req, timeout=None):  # noqa: ANN001, ARG001
-        return _FakeResponse(json.dumps(payload).encode("utf-8"))
-
-    return _opener
+def _payload(groups, *, status: Any = "SUCCESS", name="usage", response=""):
+    return {
+        "status": status,
+        "response": response,
+        "command": {"name": name, "data": {"groups": groups}},
+    }
 
 
-def _urlopen_raising(exc):
-    def _opener(_req, timeout=None):  # noqa: ANN001, ARG001
-        raise exc
-
-    return _opener
-
-
-def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://x", code, "err", {}, None)
-
-
-# Captured live 2026-09-26 from retrieveUserQuotaSummary.
-_LIVE = {
-    "groups": [
+def _live_payload():
+    """Captured shape from agy 1.4.12 (quota values are synthetic)."""
+    return _payload([
         {
-            "displayName": "Gemini Models",
+            "name": "Gemini Models",
             "buckets": [
-                {"bucketId": "gemini-weekly", "window": "weekly",
-                 "resetTime": "2026-10-01T02:48:55Z", "remainingFraction": 0.926965},
-                {"bucketId": "gemini-5h", "window": "5h",
-                 "resetTime": "2026-09-26T08:03:22Z", "remainingFraction": 0.8624975},
+                {"id": "gemini-weekly", "name": "Weekly Limit Remaining",
+                 "window": "weekly", "remaining_fraction": 0.75,
+                 "reset_time": "2026-11-10T12:37:08Z"},
+                {"id": "gemini-5h", "name": "Five Hour Limit Remaining",
+                 "window": "5h", "remaining_fraction": 0.5,
+                 "reset_time": "2026-11-03T17:37:08Z"},
             ],
         },
         {
-            "displayName": "Claude and GPT models",
+            "name": "Claude and GPT models",
             "buckets": [
-                {"bucketId": "3p-weekly", "window": "weekly",
-                 "resetTime": "2026-10-03T07:34:17Z", "remainingFraction": 1},
-                {"bucketId": "3p-5h", "window": "5h",
-                 "resetTime": "2026-09-26T12:34:17Z", "remainingFraction": 1},
+                {"id": "3p-weekly", "name": "Weekly Limit Remaining",
+                 "window": "weekly", "remaining_fraction": 1,
+                 "reset_time": "2026-11-10T12:37:08Z"},
+                {"id": "3p-5h", "name": "Five Hour Limit Remaining",
+                 "window": "5h", "remaining_fraction": 0.9,
+                 "reset_time": "2026-11-03T17:37:08Z"},
             ],
         },
-    ]
-}
-
-# Captured live 2026-09-26 from loadCodeAssist. currentTier is free-tier while
-# paidTier is the real subscription — the reason paidTier must win.
-_LOAD = {
-    "cloudaicompanionProject": "aicode-consumers",
-    "currentTier": {"id": "free-tier", "name": "Antigravity"},
-    "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"},
-}
-
-
-def _windows_for(payload):
-    """Windows the fetcher would build from a payload, without the fetcher."""
-    found = mod._buckets(payload)
-    return [w for w in (
-        mod._window(found[bucket_id], f"{group} · {label}")
-        for bucket_id, label, group in mod._BUCKETS if bucket_id in found
-    ) if w is not None]
+        {
+            "name": "Gemini 4 Argon",
+            "buckets": [
+                {"id": "gemini-argon-wtu-weekly",
+                 "name": "Gemini 4 Argon Weekly Limit", "window": "weekly",
+                 "remaining_fraction": 0.9990862607955933,
+                 "reset_time": "2026-11-09T11:02:28Z"},
+            ],
+        },
+    ], response="Gemini Models\tWeekly Limit Remaining\t75%\t2026-11-10T12:37:08Z\n")
 
 
-def _fetch(summary=None, load=None):
-    """Run the fetcher with every HTTP boundary mocked to the live shapes."""
-    def _post(path, access_token, **kwargs):  # noqa: ANN001, ANN003, ARG001
-        if path.endswith(mod._QUOTA_PATH):
-            return (_LIVE if summary is None else summary), None
-        return (_LOAD if load is None else load), None
+def _run_fake(*, version=b"1.4.12\n", usage=None, version_rc=0, usage_rc=0,
+              version_timed_out=False, usage_timed_out=False,
+              version_overflow=False, usage_overflow=False,
+              version_launch_error=False, usage_launch_error=False):
+    """Fake ``_run_cli`` that records (args, timeout) and returns canned data."""
+    calls = []
+    usage = json.dumps(_live_payload()).encode("utf-8") if usage is None else usage
 
-    with mock.patch.object(mod, "_load_credential", return_value={"token": {}}), \
-            mock.patch.object(mod, "_access_token", return_value=("ya29.fake", None)), \
-            mock.patch.object(mod, "_post", side_effect=_post):
-        return mod.fetch_antigravity_quota()
+    def _run(path, args, *, timeout, max_bytes=mod._MAX_OUTPUT_BYTES,
+             log_name=None):
+        calls.append((path, tuple(args), timeout, max_bytes, log_name))
+        if tuple(args) == ("--version",):
+            return mod._CliRun(
+                version, version_rc, version_timed_out, version_overflow,
+                version_launch_error,
+            )
+        return mod._CliRun(
+            usage, usage_rc, usage_timed_out, usage_overflow, usage_launch_error,
+        )
 
-
-def _fetch_with_post(post):
-    with mock.patch.object(mod, "_load_credential", return_value={"token": {}}), \
-            mock.patch.object(mod, "_access_token", return_value=("t", None)), \
-            mock.patch.object(mod, "_post", side_effect=post):
-        return mod.fetch_antigravity_quota()
-
-
-class CredentialTests(unittest.TestCase):
-    def test_no_credential_is_no_credentials(self):
-        with mock.patch.object(mod, "_load_credential", return_value=None):
-            self.assertEqual(
-                mod.fetch_antigravity_quota().unavailable_reason, "no-credentials")
-
-    def test_blob_parses_as_utf8_and_utf16(self):
-        for encoding in ("utf-8", "utf-16-le"):
-            blob = json.dumps({"token": {"access_token": "ya29.x"}}).encode(encoding)
-            with mock.patch.object(mod, "_windows_blob", return_value=blob), \
-                    mock.patch.object(mod, "_macos_blob", return_value=None):
-                cred = mod._load_credential()
-            self.assertEqual(cred["token"]["access_token"], "ya29.x", encoding)
-
-    def test_macos_go_keyring_wrapper_unwraps(self):
-        # agy stores the same JSON behind zalando/go-keyring's macOS prefix.
-        # Orca strips it before parse; a raw JSON blob must still parse.
-        import base64
-        payload = json.dumps({"token": {"access_token": "ya29.wrapped"}}).encode("utf-8")
-        wrapped = b"go-keyring-base64:" + base64.b64encode(payload)
-        legacy = b"go-keyring-encoded:" + payload.hex().encode("ascii")
-        for blob in (wrapped, legacy):
-            with mock.patch.object(mod, "_windows_blob", return_value=None), \
-                    mock.patch.object(mod, "_macos_blob", return_value=blob), \
-                    mock.patch.object(mod, "_linux_blob", return_value=None):
-                cred = mod._load_credential()
-            self.assertIsNotNone(cred)
-            assert cred is not None
-            self.assertEqual(cred["token"]["access_token"], "ya29.wrapped")
-
-    def test_broken_go_keyring_wrapper_is_no_credential(self):
-        with mock.patch.object(mod, "_windows_blob", return_value=None), \
-                mock.patch.object(mod, "_macos_blob", return_value=b"go-keyring-base64:!!!"), \
-                mock.patch.object(mod, "_linux_blob", return_value=None):
-            self.assertIsNone(mod._load_credential())
-
-    def test_garbage_blob_is_no_credential(self):
-        # Every reader must be stubbed: on Linux the real agy token file would
-        # otherwise leak into this assertion.
-        with mock.patch.object(mod, "_windows_blob", return_value=b"\x01not json"), \
-                mock.patch.object(mod, "_macos_blob", return_value=None), \
-                mock.patch.object(mod, "_linux_blob", return_value=None):
-            self.assertIsNone(mod._load_credential())
-
-    def test_reader_crash_falls_through(self):
-        # A faulting CredRead must degrade, never escape fail-open.
-        with mock.patch.object(mod, "_windows_blob", side_effect=RuntimeError("boom")), \
-                mock.patch.object(mod, "_macos_blob",
-                                  return_value=json.dumps({"token": {}}).encode("utf-8")):
-            self.assertEqual(mod._load_credential(), {"token": {}})
-
-    def test_linux_token_file_is_read(self):
-        # agy keeps the same dict in ~/.gemini/antigravity-cli on Linux.
-        blob = json.dumps({"token": {"access_token": "ya29.linux"}}).encode("utf-8")
-        with mock.patch.object(mod.sys, "platform", "linux"), \
-                mock.patch.object(mod, "_windows_blob", return_value=None), \
-                mock.patch.object(mod, "_macos_blob", return_value=None), \
-                mock.patch("builtins.open", mock.mock_open(read_data=blob)):
-            cred = mod._load_credential()
-        self.assertEqual(cred["token"]["access_token"], "ya29.linux")
-
-    def test_linux_reader_is_off_on_other_platforms(self):
-        with mock.patch.object(mod.sys, "platform", "darwin"):
-            self.assertIsNone(mod._linux_blob())
-
-    def test_unreadable_linux_file_is_no_credential(self):
-        with mock.patch.object(mod.sys, "platform", "linux"), \
-                mock.patch.object(mod, "_windows_blob", return_value=None), \
-                mock.patch.object(mod, "_macos_blob", return_value=None), \
-                mock.patch("builtins.open", side_effect=OSError("nope")):
-            self.assertIsNone(mod._load_credential())
+    return _run, calls
 
 
-class TokenTests(unittest.TestCase):
-    def test_refresh_runs_before_the_cached_token(self):
-        with mock.patch.object(mod, "_refresh", return_value="ya29.fresh") as refresh:
-            result = mod._access_token(
-                {"token": {"access_token": "stale", "refresh_token": "1//r"}})
-        # The refresh now carries the clamped timeout so the fetcher's shared
-        # deadline bounds it; assert the token, not the exact call shape.
-        self.assertEqual(refresh.call_args.args, ("1//r",))
-        self.assertIn("timeout", refresh.call_args.kwargs)
-        self.assertEqual(result, ("ya29.fresh", None))
-
-    def test_cached_token_used_when_no_refresh_token(self):
-        with mock.patch.object(mod, "_refresh") as refresh:
-            result = mod._access_token({"token": {"access_token": "ya29.only"}})
-        refresh.assert_not_called()
-        self.assertEqual(result, ("ya29.only", None))
-
-    def test_failed_refresh_is_auth_failed(self):
-        with mock.patch.object(mod, "_refresh", return_value=None):
-            self.assertEqual(
-                mod._access_token({"token": {"refresh_token": "1//r"}}),
-                (None, "auth-failed"))
-
-    def test_failed_refresh_keeps_a_usable_cached_token(self):
-        # The token endpoint can be briefly unreachable; that is not proof the
-        # credentials are dead. A dead one still ends as auth-failed on the 401.
-        with mock.patch.object(mod, "_refresh", return_value=None):
-            self.assertEqual(
-                mod._access_token({"token": {"refresh_token": "1//r",
-                                             "access_token": "ya29.cached"}}),
-                ("ya29.cached", None))
-
-    def test_empty_credential_is_no_credentials(self):
-        self.assertEqual(mod._access_token({"token": {}})[1], "no-credentials")
-        self.assertEqual(mod._access_token({"token": "nope"})[1], "no-credentials")
-
-    def test_refresh_sends_the_installed_app_client(self):
-        seen = {}
-
-        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
-            seen["body"] = req.data.decode("utf-8")
-            return _FakeResponse(json.dumps({"access_token": "ya29.new"}).encode())
-
-        with mock.patch.object(mod, "urlopen_no_redirect", _opener):
-            self.assertEqual(mod._refresh("1//r"), "ya29.new")
-        self.assertIn("grant_type=refresh_token", seen["body"])
-        self.assertIn("1071006060591", seen["body"])
-
-    def test_refresh_http_error_returns_none(self):
-        with mock.patch.object(
-                mod, "urlopen_no_redirect", _urlopen_raising(_http_error(401))):
-            self.assertIsNone(mod._refresh("1//r"))
+def _fetch(*, path="/fake/agy", run=None, env=None, **kwargs):
+    fake, calls = _run_fake(**kwargs)
+    if run is not None:
+        fake = run
+    # Run with a clean ambient environment so a developer/CI proxy cannot turn
+    # unrelated fetch tests into `agy-unsafe-proxy`.
+    with mock.patch.dict(os.environ, {} if env is None else env, clear=True), \
+            mock.patch.object(
+                mod, "_agy_lookup", return_value=(path, None)), \
+            mock.patch.object(mod, "_run_cli", side_effect=fake):
+        result = mod.fetch_antigravity_quota()
+    return result, calls
 
 
-class PlanTests(unittest.TestCase):
-    def test_paid_tier_wins_over_current_tier(self):
-        # Live payload: currentTier is free-tier even on a paid account.
-        with mock.patch.object(mod, "_post", return_value=(_LOAD, None)):
-            self.assertEqual(mod._plan("t"), "Google AI Pro")
+class VersionGateTests(unittest.TestCase):
+    def test_missing_agy_is_reported_without_running_anything(self):
+        with mock.patch.object(mod.shutil, "which", return_value=None), \
+                mock.patch.object(mod, "_run_cli") as run:
+            result = mod.fetch_antigravity_quota()
+        self.assertEqual(result.unavailable_reason, "agy-missing")
+        self.assertIn("1.1.11", " ".join(result.details))
+        run.assert_not_called()
 
-    def test_bare_string_tier_is_accepted(self):
-        with mock.patch.object(mod, "_post", return_value=({"currentTier": "free-tier"}, None)):
-            self.assertEqual(mod._plan("t"), "free-tier")
+    def test_found_but_unsafe_agy_is_not_reported_as_missing(self):
+        # A present-but-hijackable executable is a permission problem, not an
+        # installation problem, and must not get the "install agy" advice.
+        with tempfile.TemporaryDirectory() as td:
+            if os.name == "nt":
+                # Windows has no POSIX mode bits; its unsafe case is a file
+                # the provider refuses to spawn because it has no .exe/.com.
+                exe = _make_executable(td, name="agy")
+            else:
+                exe = _make_executable(td, 0o775)
+            with mock.patch.object(mod.shutil, "which", return_value=str(exe)), \
+                    mock.patch.object(mod, "_run_cli") as run:
+                result = mod.fetch_antigravity_quota()
+        self.assertEqual(result.unavailable_reason, "agy-unsafe-path")
+        self.assertNotIn("Install", " ".join(result.details))
+        run.assert_not_called()
 
-    def test_no_tier_is_none(self):
-        with mock.patch.object(mod, "_post", return_value=({}, None)):
-            self.assertIsNone(mod._plan("t"))
+    def test_old_version_never_runs_usage(self):
+        result, calls = _fetch(version=b"1.1.10\n")
+        self.assertEqual(result.unavailable_reason, "agy-too-old")
+        self.assertEqual([c[1] for c in calls], [("--version",)])
+        self.assertIn("1.1.10", " ".join(result.details))
+
+    def test_minimum_version_runs_usage(self):
+        result, calls = _fetch(version=b"1.1.11\n")
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual([c[1] for c in calls],
+                         [("--version",), mod._USAGE_ARGS])
+
+    def test_newer_version_runs_usage(self):
+        result, _calls = _fetch(version=b"1.4.12\n")
+        self.assertIsNone(result.unavailable_reason)
+
+    def test_version_must_be_a_bare_semver(self):
+        for text in (b"agy 1.4.12\n", b"1.4\n", b"1.4.12 extra\n", b"\xff"):
+            with self.subTest(text=text):
+                result, calls = _fetch(version=text)
+                self.assertEqual(result.unavailable_reason, "agy-version-unknown")
+                self.assertEqual(len(calls), 1)
+
+    def test_prereleases_are_not_a_proven_minimum(self):
+        # 1.1.11-rc does not prove the release has the structured payload.
+        for text in (b"1.1.11-rc.1\n", b"1.1.11-rc\n", b"1.4.12-beta.2\n",
+                     b"v1.1.11-alpha\n"):
+            with self.subTest(text=text):
+                result, calls = _fetch(version=text)
+                self.assertEqual(result.unavailable_reason, "agy-version-unknown")
+                self.assertEqual(len(calls), 1)
+
+    def test_build_metadata_does_not_change_the_release(self):
+        result, calls = _fetch(version=b"1.1.11+build.7\n")
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(calls), 2)
+
+    def test_version_timeout_is_timeout_and_never_usage(self):
+        result, calls = _fetch(version_timed_out=True)
+        self.assertEqual(result.unavailable_reason, "timeout")
+        self.assertEqual(len(calls), 1)
+
+    def test_version_failure_is_an_error_and_never_usage(self):
+        result, calls = _fetch(version_rc=1)
+        self.assertEqual(result.unavailable_reason, "agy-error")
+        self.assertEqual(len(calls), 1)
+
+    def test_version_launch_failure_is_an_execution_error(self):
+        # The path was accepted, so a spawn failure is not "not installed".
+        result, calls = _fetch(version_launch_error=True)
+        self.assertEqual(result.unavailable_reason, "agy-error")
+        self.assertEqual(len(calls), 1)
+
+    def test_usage_arguments_are_exact_and_read_only(self):
+        _result, calls = _fetch()
+        self.assertEqual(calls[0][1], ("--version",))
+        self.assertEqual(calls[1][1], ("-p", "/usage", "--output-format", "json"))
+        joined = " ".join(calls[1][1])
+        self.assertNotIn("dangerously", joined)
+        self.assertNotIn("permission", joined)
+        self.assertNotIn("shell", joined)
+        self.assertNotIn("--model", joined)
+        self.assertNotIn("--agent", joined)
+
+    def test_each_probe_confines_its_log_to_a_private_file(self):
+        _result, calls = _fetch()
+        self.assertEqual([call[4] for call in calls],
+                         ["agy-version.log", "agy-usage.log"])
+
+    def test_command_injects_the_log_file_before_the_probe_arguments(self):
+        workdir = os.path.join(tempfile.gettempdir(), "private")
+        command = mod._command(
+            "/fake/agy", mod._USAGE_ARGS, workdir, "agy-usage.log")
+        self.assertEqual(command, [
+            "/fake/agy", "--log-file", os.path.join(workdir, "agy-usage.log"),
+            "-p", "/usage", "--output-format", "json",
+        ])
+        self.assertEqual(mod._command("/fake/agy", ("--version",), "/w", None),
+                         ["/fake/agy", "--version"])
 
 
 class ParseTests(unittest.TestCase):
-    def test_live_payload_yields_four_windows(self):
-        windows = {w.label: w for w in _windows_for(_LIVE)}
-        self.assertEqual(len(windows), 4)
-        self.assertAlmostEqual(windows["Gemini · week"].used_percent, 7.30, places=2)
-        self.assertAlmostEqual(windows["Gemini · 5h"].used_percent, 13.75, places=2)
-        self.assertEqual(windows["Claude/GPT · 5h"].used_percent, 0.0)
-        self.assertEqual(windows["Gemini · week"].reset_at, "2026-10-01T02:48:55Z")
-
-    def test_response_wrapper_is_unwrapped(self):
-        self.assertEqual(len(_windows_for({"response": _LIVE})), 4)
-
-    def test_bucket_identity_is_by_id_not_position(self):
-        # Labels must follow bucketId, not array order.
-        payload = {"groups": [{"buckets": list(reversed(_LIVE["groups"][0]["buckets"]))}]}
-        windows = {w.label: w for w in _windows_for(payload)}
-        self.assertAlmostEqual(windows["Gemini · week"].used_percent, 7.30, places=2)
-        self.assertAlmostEqual(windows["Gemini · 5h"].used_percent, 13.75, places=2)
-
-    def test_exhausted_bucket_without_fraction_is_100_percent(self):
-        # A drained counter reports resetTime, no fraction.
-        payload = {"groups": [{"buckets": [
-            {"bucketId": "gemini-5h", "resetTime": "2026-09-26T08:03:22Z"}]}]}
-        windows = _windows_for(payload)
-        self.assertEqual(len(windows), 1)
-        self.assertEqual(windows[0].used_percent, 100.0)
-
-    def test_bucket_with_nothing_is_dropped(self):
-        self.assertEqual(
-            _windows_for({"groups": [{"buckets": [{"bucketId": "gemini-5h"}]}]}), [])
-
-    def test_out_of_range_fraction_is_not_rescaled(self):
-        payload = {"groups": [{"buckets": [
-            {"bucketId": "gemini-5h", "remainingFraction": 86.2}]}]}
-        self.assertEqual(_windows_for(payload), [])
-
-    def test_zero_fraction_is_fully_used(self):
-        payload = {"groups": [{"buckets": [
-            {"bucketId": "gemini-weekly", "remainingFraction": 0.0,
-             "resetTime": "2026-10-01T00:00:00Z"}]}]}
-        self.assertEqual(_windows_for(payload)[0].used_percent, 100.0)
-
-    def test_unknown_bucket_ids_are_ignored(self):
-        payload = {"groups": [{"buckets": [
-            {"bucketId": "mystery-pool", "remainingFraction": 0.5}]}]}
-        self.assertEqual(_windows_for(payload), [])
-
-    def test_garbage_payload_yields_nothing(self):
-        for payload in ({}, {"groups": "nope"}, {"groups": [{"buckets": "no"}]}):
-            self.assertEqual(_windows_for(payload), [])
-
-    def test_non_object_payload_is_not_buckets(self):
-        # HTTP 200 carrying a JSON array or string is a schema surprise, not an
-        # AttributeError.
-        for payload in ([], ["groups"], "nope", None, 7):
-            self.assertEqual(mod._buckets(payload), {})
-
-
-class FetchTests(unittest.TestCase):
-    def test_happy_path(self):
-        result = _fetch()
+    def test_live_shape_yields_five_windows_including_argon(self):
+        result, _calls = _fetch()
         self.assertIsNone(result.unavailable_reason)
-        self.assertEqual(result.label, "antigravity")
-        self.assertEqual(result.plan, "Google AI Pro")
-        self.assertEqual(len(result.windows), 4)
-        self.assertTrue(result.has_data())
+        self.assertEqual([w.label for w in result.windows], [
+            "Gemini · Weekly", "Gemini · 5h",
+            "Claude/GPT · Weekly", "Claude/GPT · 5h",
+            "Gemini 4 Argon · Weekly",
+        ])
+        self.assertAlmostEqual(result.windows[0].used_percent, 25.0, places=2)
+        self.assertAlmostEqual(result.windows[1].used_percent, 50.0, places=2)
+        self.assertEqual(result.windows[2].used_percent, 0.0)
+        self.assertAlmostEqual(result.windows[3].used_percent, 10.0, places=2)
+        self.assertAlmostEqual(result.windows[4].used_percent, 0.09, places=2)
+        self.assertEqual(result.windows[4].reset_at, "2026-11-09T11:02:28Z")
 
-    def test_401_is_auth_failed(self):
-        result = _fetch_with_post(lambda p, t, **kw: (None, 401))
-        self.assertEqual(result.unavailable_reason, "auth-failed")
-
-    def test_403_is_no_subscription(self):
-        result = _fetch_with_post(lambda p, t, **kw: (None, 403))
-        self.assertEqual(result.unavailable_reason, "no-subscription")
-
-    def test_other_http_is_reported(self):
-        result = _fetch_with_post(lambda p, t, **kw: (None, 500))
-        self.assertEqual(result.unavailable_reason, "http-500")
-
-    def test_transport_failure_is_fetch_error(self):
-        result = _fetch_with_post(lambda p, t, **kw: (None, None))
-        self.assertEqual(result.unavailable_reason, "fetch-error")
-
-    def test_no_usable_bucket_is_no_data(self):
-        self.assertEqual(_fetch(summary={"groups": []}).unavailable_reason, "no-data")
-
-    def test_json_array_payload_is_no_data(self):
+    def test_weekly_windows_use_capitalized_weekly_label(self):
+        # Cards read "Weekly", matching the other providers' weekly windows;
+        # the CLI's lowercase "week" wording must not leak into display labels,
+        # and the 5h labels stay untouched.
+        result, _calls = _fetch()
+        labels = [w.label for w in result.windows]
         self.assertEqual(
-            _fetch_with_post(lambda p, t, **kw: ([], None)).unavailable_reason, "no-data")
+            [label for label in labels if label.endswith("· Weekly")],
+            ["Gemini · Weekly", "Claude/GPT · Weekly",
+             "Gemini 4 Argon · Weekly"],
+        )
+        self.assertFalse([label for label in labels if label.endswith("· week")])
+        self.assertIn("Gemini · 5h", labels)
+        self.assertIn("Claude/GPT · 5h", labels)
 
-    def test_plan_failure_does_not_lose_the_quota(self):
-        def _post(path, token, **kwargs):  # noqa: ANN001, ANN003, ARG001
-            return (_LIVE, None) if path.endswith(mod._QUOTA_PATH) else (None, 500)
-
-        result = _fetch_with_post(_post)
-        self.assertIsNone(result.unavailable_reason)
-        self.assertEqual(len(result.windows), 4)
+    def test_plan_is_never_invented(self):
+        # The CLI payload has no plan field; response text must not be mined.
+        result, _calls = _fetch()
         self.assertIsNone(result.plan)
 
+    def test_missing_fraction_with_reset_is_unknown_not_exhausted(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "reset_time": "2026-11-03T17:37:08Z"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(result.windows), 1)
+        self.assertIsNone(result.windows[0].used_percent)
+        self.assertEqual(result.windows[0].reset_at, "2026-11-03T17:37:08Z")
 
-class AntigravityOptInTests(unittest.TestCase):
+    def test_bucket_with_no_fraction_and_no_reset_is_dropped(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_out_of_range_fraction_is_dropped_not_rescaled(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "remaining_fraction": 86.2,
+             "reset_time": "2026-11-03T17:37:08Z"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_zero_fraction_is_fully_used(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-weekly", "remaining_fraction": 0.0,
+             "reset_time": "2026-11-10T12:37:08Z"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.windows[0].used_percent, 100.0)
+
+    def test_unknown_bucket_ids_are_ignored(self):
+        payload = _payload([{"name": "Mystery", "buckets": [
+            {"id": "mystery-pool", "remaining_fraction": 0.5}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_absent_argon_is_not_duplicated_from_the_gemini_bucket(self):
+        # Argon is conditional.  A four-bucket response must stay four
+        # windows; the provider must not derive a fifth from Gemini's pool.
+        payload = _live_payload()
+        payload["command"]["data"]["groups"] = [
+            group for group in payload["command"]["data"]["groups"]
+            if group["name"] != "Gemini 4 Argon"
+        ]
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual([w.label for w in result.windows], [
+            "Gemini · Weekly", "Gemini · 5h",
+            "Claude/GPT · Weekly", "Claude/GPT · 5h",
+        ])
+        self.assertNotIn("Gemini 4 Argon · Weekly",
+                         [w.label for w in result.windows])
+
+    def test_returned_argon_is_shown_once_as_the_fifth_window(self):
+        result, _calls = _fetch()
+        argon = [w for w in result.windows
+                 if w.label == "Gemini 4 Argon · Weekly"]
+        self.assertEqual(len(argon), 1)
+        self.assertAlmostEqual(argon[0].used_percent or 0.0, 0.09, places=2)
+        self.assertEqual(result.windows[-1].label, "Gemini 4 Argon · Weekly")
+        self.assertEqual(len(result.windows), 5)
+
+    def test_returned_argon_without_fraction_is_unknown_not_exhausted(self):
+        payload = _payload([{"name": "Gemini 4 Argon", "buckets": [
+            {"id": "gemini-argon-wtu-weekly",
+             "reset_time": "2026-11-09T11:02:28Z"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(result.windows), 1)
+        self.assertEqual(result.windows[0].label, "Gemini 4 Argon · Weekly")
+        self.assertIsNone(result.windows[0].used_percent)
+
+    def test_duplicate_bucket_id_uses_the_first(self):
+        payload = _payload([
+            {"name": "Gemini Models", "buckets": [
+                {"id": "gemini-5h", "remaining_fraction": 0.25}]},
+            {"name": "Duplicate", "buckets": [
+                {"id": "gemini-5h", "remaining_fraction": 0.75}]},
+        ])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.windows[0].used_percent, 75.0)
+
+    def test_camel_case_fields_are_tolerated(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"bucketId": "gemini-5h", "remainingFraction": 0.4,
+             "resetTime": "2026-11-03T17:37:08Z"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.windows[0].used_percent, 60.0)
+
+    def test_malformed_reset_time_is_omitted_not_displayed(self):
+        for reset in ("not-a-date", "2026-02-30T00:00:00Z",
+                      "2026-11-03 17:37:08Z", "2026-11-03T17:37:08+24:00"):
+            with self.subTest(reset=reset):
+                payload = _payload([{"name": "Gemini Models", "buckets": [
+                    {"id": "gemini-5h", "remaining_fraction": 0.5,
+                     "reset_time": reset}]}])
+                result, _calls = _fetch(usage=json.dumps(payload).encode())
+                self.assertIsNone(result.unavailable_reason)
+                self.assertEqual(result.windows[0].used_percent, 50.0)
+                self.assertIsNone(result.windows[0].reset_at)
+
+    def test_bucket_with_only_a_malformed_reset_is_dropped(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "reset_time": "soon"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_reset_time_is_length_capped(self):
+        with mock.patch.object(mod, "_MAX_RESET_CHARS", 10):
+            self.assertIsNone(mod._reset_time("2026-11-03T17:37:08Z"))
+
+    def test_reset_time_with_a_numeric_offset_is_preserved(self):
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "remaining_fraction": 0.5,
+             "reset_time": "2026-11-03T17:37:08.123+09:00"}]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.windows[0].reset_at,
+                         "2026-11-03T17:37:08.123+09:00")
+
+    def test_response_text_alone_is_not_scraped(self):
+        payload = _payload([], response=(
+            "Gemini Models\tWeekly Limit Remaining\t100%\t2026-11-10T12:37:08Z\n"))
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_non_object_groups_are_ignored(self):
+        payload = _payload([None, "nope", {"buckets": "no"}, {"buckets": [None]}])
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+
+class ErrorTests(unittest.TestCase):
+    def test_invalid_json_is_reported(self):
+        result, _calls = _fetch(usage=b"{not json")
+        self.assertEqual(result.unavailable_reason, "agy-invalid-json")
+
+    def test_non_object_json_is_bad_payload(self):
+        result, _calls = _fetch(usage=b"[]")
+        self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_non_success_status_is_refused(self):
+        result, _calls = _fetch(usage=json.dumps(_payload([], status="ERROR")).encode())
+        self.assertEqual(result.unavailable_reason, "agy-refused")
+
+    def test_ok_status_from_older_release_is_accepted(self):
+        # Older agy releases spell the successful command outcome "OK".
+        payload = _payload([{"name": "Gemini Models", "buckets": [
+            {"id": "gemini-5h", "remaining_fraction": 0.5,
+             "reset_time": "2026-11-03T17:37:08Z"}]}], status="OK")
+        result, calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.windows[0].used_percent, 50.0)
+        self.assertEqual(len(calls), 2)
+
+    def test_success_statuses_are_matched_exactly(self):
+        # No case folding, padding stripping or prefix inference: only the
+        # two observed spellings confirm success.
+        for status in ("ok", "Ok", "OK ", " OK", "SUCCESS ", " SUCCESS",
+                       "success", "OKAY", "SUCCESSFUL"):
+            with self.subTest(status=status):
+                payload = _payload([], status=status)
+                result, _calls = _fetch(usage=json.dumps(payload).encode())
+                self.assertEqual(result.unavailable_reason, "agy-refused")
+
+    def test_missing_status_with_valid_groups_is_not_inferred_as_ok(self):
+        payload = _live_payload()
+        del payload["status"]
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_missing_status_is_a_malformed_envelope(self):
+        # No status is not the CLI refusing; it is not a usable envelope.
+        payload = {"command": {"name": "usage", "data": {"groups": []}}}
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_non_string_status_is_a_malformed_envelope(self):
+        for status in (None, 1, True, [], {}):
+            with self.subTest(status=status):
+                payload = _payload([], status=status)
+                result, _calls = _fetch(usage=json.dumps(payload).encode())
+                self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_wrong_command_is_bad_payload(self):
+        result, _calls = _fetch(usage=json.dumps(_payload([], name="model")).encode())
+        self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_missing_groups_is_bad_payload(self):
+        payload = {"status": "SUCCESS", "command": {"name": "usage", "data": {}}}
+        result, _calls = _fetch(usage=json.dumps(payload).encode())
+        self.assertEqual(result.unavailable_reason, "agy-bad-json")
+
+    def test_empty_groups_is_no_data(self):
+        result, _calls = _fetch(usage=json.dumps(_payload([])).encode())
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_usage_nonzero_exit_is_error(self):
+        result, calls = _fetch(usage_rc=1)
+        self.assertEqual(result.unavailable_reason, "agy-error")
+        self.assertEqual(len(calls), 2)
+
+    def test_usage_timeout_is_timeout(self):
+        result, _calls = _fetch(usage_timed_out=True)
+        self.assertEqual(result.unavailable_reason, "timeout")
+
+    def test_oversized_usage_output_is_reported(self):
+        result, _calls = _fetch(usage_overflow=True)
+        self.assertEqual(result.unavailable_reason, "agy-output-too-large")
+
+    def test_usage_launch_failure_is_error(self):
+        result, _calls = _fetch(usage_launch_error=True)
+        self.assertEqual(result.unavailable_reason, "agy-error")
+
+
+class ProxyGateTests(unittest.TestCase):
+    """A configured proxy must never be silently dropped into a direct run."""
+
+    def test_unusable_proxy_fails_closed_before_running_agy(self):
+        with mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": "http://user:password@proxy.example:3128",
+        }, clear=True), \
+                mock.patch.object(mod, "_agy_lookup", return_value=("/fake/agy", None)), \
+                mock.patch.object(mod, "_run_cli") as run:
+            result = mod.fetch_antigravity_quota()
+        self.assertEqual(result.unavailable_reason, "agy-unsafe-proxy")
+        details = " ".join(result.details)
+        self.assertIn("HTTPS_PROXY", details)
+        self.assertNotIn("password", details)
+        run.assert_not_called()
+
+    def test_validated_proxy_does_not_block(self):
+        result, calls = _fetch(env={"HTTPS_PROXY": "http://proxy.example:3128"})
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(calls), 2)
+
+    def test_proxy_urls_the_cli_would_ignore_fail_closed(self):
+        cases = {
+            "HTTPS_PROXY": "http://proxy.example:8080\t",
+            "HTTP_PROXY": "http://proxy%zz:8080",
+        }
+        for key, value in cases.items():
+            with self.subTest(key=key), \
+                    mock.patch.dict(os.environ, {key: value}, clear=True), \
+                    mock.patch.object(
+                        mod, "_agy_lookup", return_value=("/fake/agy", None)), \
+                    mock.patch.object(mod, "_run_cli") as run:
+                result = mod.fetch_antigravity_quota()
+            self.assertEqual(result.unavailable_reason, "agy-unsafe-proxy")
+            self.assertIn(key, " ".join(result.details))
+            run.assert_not_called()
+
+    def test_malformed_no_proxy_with_a_proxy_fails_closed(self):
+        # Once a proxy is configured, dropping a bad NO_PROXY changes routing.
+        with mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": "http://proxy.example:3128",
+                "NO_PROXY": "localhost\n127.0.0.1",
+        }, clear=True), \
+                mock.patch.object(
+                    mod, "_agy_lookup", return_value=("/fake/agy", None)), \
+                mock.patch.object(mod, "_run_cli") as run:
+            result = mod.fetch_antigravity_quota()
+        self.assertEqual(result.unavailable_reason, "agy-unsafe-proxy")
+        self.assertIn("NO_PROXY", " ".join(result.details))
+        run.assert_not_called()
+
+
+class EnvironmentTests(unittest.TestCase):
+    def test_environment_is_an_allow_list_with_auto_update_disabled(self):
+        hostile = {
+            "HOME": "/home/test",
+            "PATH": "/usr/bin:/bin",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus",
+            "GEMINI_API_KEY": "secret-gemini",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/secret/adc.json",
+            "AGY_ADC_AUTH": "1",
+            "JETSKI_OAUTH_TOKEN": "secret-jetski",
+            "AWS_SECRET_ACCESS_KEY": "secret-aws",
+            "SOME_RANDOM_SECRET": "secret-random",
+        }
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            env = mod._cli_env()
+        self.assertEqual(env["HOME"], "/home/test")
+        self.assertEqual(env["PATH"], "/usr/bin:/bin")
+        self.assertIn("DBUS_SESSION_BUS_ADDRESS", env)
+        self.assertEqual(env["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")
+        for key in ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
+                    "AGY_ADC_AUTH", "JETSKI_OAUTH_TOKEN",
+                    "AWS_SECRET_ACCESS_KEY", "SOME_RANDOM_SECRET"):
+            self.assertNotIn(key, env)
+
+    def test_standard_proxy_variables_are_forwarded(self):
+        proxies = {
+            "HTTP_PROXY": "http://proxy.example:3128",
+            "HTTPS_PROXY": "https://proxy.example:8443/",
+            "ALL_PROXY": "socks5://proxy.example:1080",
+            "NO_PROXY": "localhost,127.0.0.1,.example",
+            "http_proxy": "http://lower.example:8080",
+        }
+        for key, value in proxies.items():
+            # Windows environment names are case-insensitive, so upper and
+            # lower forms cannot coexist with different values in one dict.
+            # Each form gets its own environment and must still be forwarded.
+            with self.subTest(key=key), \
+                    mock.patch.dict(os.environ, {key: value}, clear=True):
+                env = mod._cli_env()
+            if os.name == "nt":
+                # os.environ collapses case and _cli_env may forward both
+                # spellings with the same value; compare case-insensitively.
+                forwarded = {name.lower(): item for name, item in env.items()}
+                self.assertEqual(forwarded.get(key.lower()), value)
+            else:
+                self.assertEqual(env.get(key), value)
+
+    def test_common_no_proxy_spacing_is_accepted_and_trimmed(self):
+        cases = (
+            ("localhost, 127.0.0.1", "localhost,127.0.0.1"),
+            ("localhost,\t127.0.0.1", "localhost,127.0.0.1"),
+            ("  localhost  ,\t127.0.0.1\t", "localhost,127.0.0.1"),
+            ("localhost,  [::1], .example", "localhost,[::1],.example"),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(mod._proxy_value("NO_PROXY", value), expected)
+                self.assertIsNone(mod._proxy_problem({"NO_PROXY": value}))
+        with mock.patch.dict(os.environ,
+                             {"NO_PROXY": "localhost, 127.0.0.1"}, clear=True):
+            self.assertEqual(
+                mod._cli_env()["NO_PROXY"], "localhost,127.0.0.1")
+
+    def test_common_no_proxy_spacing_does_not_block_a_fetch(self):
+        result, calls = _fetch(env={"NO_PROXY": "localhost, 127.0.0.1"})
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(calls), 2)
+
+    def test_valid_ipv6_proxy_and_no_proxy_entries_are_forwarded(self):
+        proxies = {
+            "HTTPS_PROXY": "http://[::1]:8080",
+            "ALL_PROXY": "socks5://[2001:db8::1]:1080",
+            "NO_PROXY": "[::1],[2001:db8::1]:443,::1,10.0.0.0/8,localhost,.example",
+        }
+        with mock.patch.dict(os.environ, proxies, clear=True):
+            env = mod._cli_env()
+        for key, value in proxies.items():
+            self.assertEqual(env.get(key), value)
+        self.assertIsNone(mod._proxy_problem(proxies))
+
+    def test_proxy_urls_with_whitespace_or_control_are_not_forwarded(self):
+        values = (
+            "http://proxy.example:8080 ",
+            " http://proxy.example:8080",
+            "http://pro xy.example:8080",
+            "http://proxy.example:8080\t",
+            "http://proxy.example:8080\r\n",
+            "http://proxy.example:8080\x00",
+            "http://proxy.example:8080\x1b",
+            "http://proxy.example:8080\x7f",
+            "http://proxy.example:8080\u00a0",
+            "http://proxy.example:8080\u200b",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("HTTPS_PROXY", value))
+                self.assertEqual(
+                    mod._proxy_problem({"HTTPS_PROXY": value}), "HTTPS_PROXY")
+
+    def test_no_proxy_control_characters_inside_entries_are_rejected(self):
+        values = (
+            "localhost\n",
+            "localhost\n,127.0.0.1",
+            "local\thost",
+            "localhost,\x7f",
+            "localhost,\x1b[31m",
+            "localhost\u00a0",
+            "localhost,\u200b",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("NO_PROXY", value))
+                # With no proxy configured the bad list is withheld, not fatal:
+                # it cannot turn a request direct when there is no proxy.
+                self.assertIsNone(mod._proxy_problem({"NO_PROXY": value}))
+                with mock.patch.dict(os.environ,
+                                     {"NO_PROXY": value}, clear=True):
+                    self.assertNotIn("NO_PROXY", mod._cli_env())
+                # With a proxy configured, dropping it would change routing.
+                self.assertEqual(
+                    mod._proxy_problem({
+                        "HTTPS_PROXY": "http://proxy.example:3128",
+                        "NO_PROXY": value,
+                    }),
+                    "NO_PROXY",
+                )
+
+    def test_malformed_no_proxy_without_a_proxy_does_not_disable_the_fetch(self):
+        result, calls = _fetch(env={"NO_PROXY": "localhost\n127.0.0.1"})
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(len(calls), 2)
+
+    def test_invalid_percent_escapes_are_not_forwarded(self):
+        values = (
+            "http://proxy%zz:8080",
+            "http://proxy%2:8080",
+            "http://proxy%:8080",
+            "http://proxy%0g:8080",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("HTTPS_PROXY", value))
+                self.assertEqual(
+                    mod._proxy_problem({"HTTPS_PROXY": value}), "HTTPS_PROXY")
+
+    def test_percent_escaped_dns_host_is_rejected(self):
+        # Only an IPv6 zone may use a valid escape (%25); a DNS/IPv4 host may not.
+        values = (
+            "http://proxy%41:8080",
+            "http://proxy%2eexample:8080",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("HTTPS_PROXY", value))
+                self.assertEqual(
+                    mod._proxy_problem({"HTTPS_PROXY": value}), "HTTPS_PROXY")
+
+    def test_malformed_ipv6_proxy_is_rejected(self):
+        values = (
+            "http://::1:8080",
+            "http://[::1",
+            "http://[not:ipv6]:8080",
+            "http://[::1]suffix",
+            "http://[::1]:",
+            "http://[::1]:99999",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("HTTPS_PROXY", value))
+                self.assertEqual(
+                    mod._proxy_problem({"HTTPS_PROXY": value}), "HTTPS_PROXY")
+
+    def test_malformed_no_proxy_entries_are_rejected(self):
+        values = (
+            "bad entry",
+            "foo%zz",
+            "host:0",
+            "host:99999",
+            "10.0.0.0/99",
+            "a..b",
+            "-bad.example",
+            "*.example.com:bad",
+            "[not:ipv6]:80",
+        )
+        for value in values:
+            with self.subTest(value=value):
+                self.assertIsNone(mod._proxy_value("NO_PROXY", value))
+                self.assertIsNone(mod._proxy_problem({"NO_PROXY": value}))
+                self.assertEqual(
+                    mod._proxy_problem({
+                        "HTTPS_PROXY": "http://proxy.example:3128",
+                        "NO_PROXY": value,
+                    }),
+                    "NO_PROXY",
+                )
+
+    def test_proxy_urls_with_credentials_or_bad_shapes_are_not_forwarded(self):
+        hostile = {
+            "HTTP_PROXY": "http://user:password@proxy.example:3128",
+            "HTTPS_PROXY": "ftp://proxy.example:21",
+            "ALL_PROXY": "http://proxy.example:99999",
+            "http_proxy": "http://proxy.example/path",
+            "https_proxy": "http://proxy.example:8080\nGEMINI_API_KEY=oops",
+            "no_proxy": "localhost\nHTTP_PROXY=http://evil",
+        }
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            env = mod._cli_env()
+        self.assertFalse(set(hostile) & set(env))
+
+    def test_present_but_unusable_proxy_is_identified(self):
+        cases = {
+            "HTTP_PROXY": "http://user:password@proxy.example:3128",
+            "HTTPS_PROXY": "ftp://proxy.example:21",
+            "ALL_PROXY": "http://proxy.example:99999",
+            "http_proxy": "http://proxy.example/path",
+            "https_proxy": "http://proxy.example:8080\nGEMINI_API_KEY=oops",
+        }
+        for key, value in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(mod._proxy_problem({key: value}), key)
+
+    def test_absent_empty_or_valid_proxy_is_not_a_problem(self):
+        self.assertIsNone(mod._proxy_problem({}))
+        self.assertIsNone(mod._proxy_problem({"HTTPS_PROXY": ""}))
+        self.assertIsNone(mod._proxy_problem({
+            "HTTPS_PROXY": "http://proxy.example:3128",
+            "NO_PROXY": "localhost,127.0.0.1,.example",
+        }))
+
+    def test_proxy_support_does_not_admit_other_secret_variables(self):
+        environ = {
+            "HTTPS_PROXY": "http://proxy.example:3128",
+            "GEMINI_API_KEY": "secret-gemini",
+            "SOME_RANDOM_SECRET": "secret-random",
+        }
+        with mock.patch.dict(os.environ, environ, clear=True):
+            env = mod._cli_env()
+        self.assertEqual(env["HTTPS_PROXY"], "http://proxy.example:3128")
+        self.assertNotIn("GEMINI_API_KEY", env)
+        self.assertNotIn("SOME_RANDOM_SECRET", env)
+
+    def test_source_has_no_legacy_direct_credential_or_http_helpers(self):
+        """Coarse source guard, not a scanner verdict or proof of absence.
+
+        A hit means an old direct-read/HTTP marker survived the CLI rewrite;
+        a miss alone is not evidence that the module is safe.  The real
+        boundary is that no credential file, keyring or HTTP client is used.
+        """
+        source = Path(mod.__file__).read_text(encoding="utf-8")
+        for forbidden in (
+            "_load_credential", "_access_token", "_refresh_exchange", "_post(",
+            "retrieveUserQuotaSummary", "loadCodeAssist", "Authorization",
+            "CredRead", "find-generic-password", "refresh_token",
+            "client_secret", "_PUBLIC_CLIENT_ID", "urlopen",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("agy -p /usage --output-format json", source)
+        self.assertIn("shell=False", source)
+        self.assertNotIn("--dangerously-skip-permissions", source)
+
+    def test_no_secret_reaches_argv(self):
+        _result, calls = _fetch()
+        rendered = " ".join(" ".join(call[1]) for call in calls)
+        for needle in ("secret", "token", "GEMINI_API_KEY", "password"):
+            self.assertNotIn(needle.lower(), rendered.lower())
+
+
+def _exe_name(stem: str) -> str:
+    """Executable file name for this platform.
+
+    Windows resolves ``agy`` through ``PATHEXT`` and the provider only accepts
+    ``.exe``/``.com`` for a shell-free spawn, so a fake without an extension
+    would be rejected by the path check instead of exercising the test's rule.
+    """
+    return stem + (".exe" if os.name == "nt" else "")
+
+
+def _make_executable(directory, mode=0o755, name=None):
+    path = Path(directory) / (name if name is not None else _exe_name("agy"))
+    path.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+    path.chmod(mode)
+    return path
+
+
+class PathValidationTests(unittest.TestCase):
+    """The executable lookup must fail closed on hijackable paths."""
+
+    def test_relative_path_hits_are_rejected(self):
+        for found in ("agy", "./agy", "bin/agy", ""):
+            with self.subTest(found=found):
+                with mock.patch.object(mod.shutil, "which",
+                                       return_value=found or None):
+                    self.assertIsNone(mod._agy_path())
+
+    def test_absolute_safe_executable_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = _make_executable(td)
+            with mock.patch.object(mod.shutil, "which", return_value=str(exe)):
+                self.assertEqual(mod._agy_path(), str(exe.resolve()))
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not modeled on Windows")
+    def test_group_or_world_writable_and_set_id_executable_is_rejected(self):
+        for mode in (0o775, 0o757, 0o4755, 0o2755):
+            with self.subTest(mode=oct(mode)), \
+                    tempfile.TemporaryDirectory() as td:
+                exe = _make_executable(td, mode)
+                with mock.patch.object(mod.shutil, "which",
+                                       return_value=str(exe)):
+                    self.assertIsNone(mod._agy_path())
+
+    @unittest.skipIf(os.name == "nt",
+                     "Windows os.access has no POSIX execute bit")
+    def test_non_executable_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = _make_executable(td, 0o644)
+            with mock.patch.object(mod.shutil, "which", return_value=str(exe)):
+                self.assertIsNone(mod._agy_path())
+
+    def test_directory_named_agy_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / _exe_name("agy")
+            directory.mkdir()
+            with mock.patch.object(mod.shutil, "which",
+                                   return_value=str(directory)):
+                self.assertIsNone(mod._agy_path())
+
+    @unittest.skipIf(os.name == "nt",
+                     "Windows path check does not model directory ACLs")
+    def test_executable_in_a_writable_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            writable = Path(td) / "bin"
+            writable.mkdir()
+            writable.chmod(0o777)
+            exe = _make_executable(writable)
+            with mock.patch.object(mod.shutil, "which", return_value=str(exe)):
+                self.assertIsNone(mod._agy_path())
+
+    def test_symlink_to_a_safe_executable_is_accepted(self):
+        with tempfile.TemporaryDirectory() as td:
+            target = _make_executable(td, name=_exe_name("agy-real"))
+            link = Path(td) / _exe_name("agy")
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable on this host: {exc}")
+            with mock.patch.object(mod.shutil, "which", return_value=str(link)):
+                self.assertEqual(mod._agy_path(), str(target.resolve()))
+
+
+class WindowsPathTests(unittest.TestCase):
+    """The Windows branch of the path check, mocked on any host."""
+
+    def test_windows_accepts_only_exe_or_com_regular_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = _make_executable(td, name="agy.exe")
+            com = _make_executable(td, name="agy.com")
+            bare = _make_executable(td, name="agy")
+            with mock.patch.object(mod.os, "name", "nt"):
+                self.assertEqual(mod._safe_agy_path(str(exe)),
+                                 str(exe.resolve()))
+                self.assertEqual(mod._safe_agy_path(str(com)),
+                                 str(com.resolve()))
+                self.assertIsNone(mod._safe_agy_path(str(bare)),
+                                  "shell-free spawn cannot run a bare file")
+
+
+_GRANDCHILD_SCRIPT = (
+    "import subprocess, sys, time\n"
+    "pidfile, mode = sys.argv[1], sys.argv[2]\n"
+    "grand = subprocess.Popen(\n"
+    "    [sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+    "with open(pidfile, 'w', encoding='ascii') as fh:\n"
+    "    fh.write(str(grand.pid))\n"
+    "if mode == 'hold':\n"
+    "    time.sleep(60)\n"
+    "else:\n"
+    "    print('parent-exit', flush=True)\n"
+)
+
+# A descendant that does not hold stdout: normal-exit cleanup must still find
+# it in the child's process group.
+_DAEMON_CHILD_SCRIPT = (
+    "import subprocess, sys, time\n"
+    "daemon = subprocess.Popen(\n"
+    "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+    "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "with open(sys.argv[1], 'w', encoding='ascii') as fh:\n"
+    "    fh.write(str(daemon.pid))\n"
+    "print('parent-exit', flush=True)\n"
+)
+
+# A descendant that starts its own session: no signal to the child's process
+# group can reach it, and it still holds the inherited stdout pipe.
+_ESCAPED_CHILD_SCRIPT = (
+    "import subprocess, sys\n"
+    "escaped = subprocess.Popen(\n"
+    "    [sys.executable, '-c', 'import time; time.sleep(60)'],\n"
+    "    start_new_session=True)\n"
+    "with open(sys.argv[1], 'w', encoding='ascii') as fh:\n"
+    "    fh.write(str(escaped.pid))\n"
+    "print('parent-exit', flush=True)\n"
+)
+
+
+def _run_with_watchdog(call, seconds):
+    """Run ``call`` in a daemon thread so a deadlock fails instead of hanging."""
+    box = {}
+
+    def target():
+        try:
+            box["result"] = call()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the test
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    return thread, box
+
+
+def _stdout_text(run):
+    """Captured stdout with the child's text-mode newline mapping undone.
+
+    A Windows child writing through text-mode stdout emits ``\\r\\n``; the
+    contract under test is the exact content and line structure, not the host
+    newline convention.
+    """
+    return run.stdout.decode("utf-8").replace("\r\n", "\n")
+
+
+def _reader_threads():
+    """Live reader threads, so a cancelled reader leak is visible directly."""
+    return [t for t in threading.enumerate()
+            if t.name == "agy-stdout" and t.is_alive()]
+
+
+def _read_pid(pidfile, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        try:
+            text = Path(pidfile).read_text(encoding="ascii").strip()
+        except OSError:
+            text = ""
+        if text:
+            try:
+                return int(text)
+            except ValueError:
+                return None
+        time.sleep(0.01)
+    return None
+
+
+def _windows_pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is not running; never signals or terminates it.
+
+    ``os.kill(pid, 0)`` is not a liveness probe on Windows: every signal other
+    than ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` calls ``TerminateProcess``, and a
+    dead PID raises ``OSError`` with ``WinError 87`` rather than
+    ``ProcessLookupError``.  Holding a ``SYNCHRONIZE`` handle and polling it
+    observes exit without changing the target.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    error_invalid_parameter = 87
+    wait_object_0 = 0x0
+    # Not present on POSIX ctypes; this branch runs only under Windows.
+    WinDLL = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel32 = WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        # Only "no such process" is death; access denied means it is alive.
+        return get_last_error() == error_invalid_parameter
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_object_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_is_dead(pid):
+    if os.name == "nt":
+        return _windows_pid_is_dead(pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    # On Linux a killed but unreaped grandchild is a zombie; treat that as dead.
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        return stat_text[stat_text.rfind(")") + 2] == "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _wait_dead(pid, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if _pid_is_dead(pid):
+            return True
+        time.sleep(0.02)
+    return _pid_is_dead(pid)
+
+
+def _kill_pid(pid):
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+class RunnerTests(unittest.TestCase):
+    """Exercise the bounded subprocess helper with synthetic Python programs."""
+
+    def test_captures_stdout_without_a_shell(self):
+        run = mod._run_cli(
+            sys.executable, ("-c", "import sys; sys.stdout.write('ok')"),
+            timeout=10,
+        )
+        self.assertFalse(run.timed_out)
+        self.assertFalse(run.output_too_large)
+        self.assertEqual(run.returncode, 0)
+        self.assertEqual(run.stdout, b"ok")
+
+    def test_runs_in_an_empty_private_directory(self):
+        code = (
+            "import os; print(os.getcwd()); "
+            "print(oct(os.stat('.').st_mode & 0o777)); print(os.listdir('.'))"
+        )
+        run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
+        cwd, mode, entries = run.stdout.decode("utf-8").splitlines()
+        self.assertEqual(entries, "[]")
+        self.assertFalse(os.path.exists(cwd),
+                         "the neutral working directory must be removed")
+        self.assertNotEqual(os.path.realpath(cwd),
+                            os.path.realpath(os.getcwd()))
+        if os.name != "nt":
+            self.assertEqual(mode, "0o700")
+
+    @unittest.skipIf(os.name == "nt", "POSIX shebang executable")
+    def test_cli_log_file_is_inside_the_workdir_and_removed(self):
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "fake-agy"
+            script.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                "path = pathlib.Path(sys.argv[sys.argv.index('--log-file') + 1])\n"
+                "path.write_text('vendor log', encoding='ascii')\n"
+                "print(path)\n",
+                encoding="ascii",
+            )
+            script.chmod(0o755)
+            run = mod._run_cli(
+                str(script), ("--version",), timeout=10,
+                log_name="agy-version.log",
+            )
+        logged = Path(run.stdout.decode("utf-8").strip())
+        self.assertEqual(logged.name, "agy-version.log")
+        self.assertTrue(logged.parent.name.startswith("hermes-quota-agy-"))
+        self.assertFalse(logged.exists(),
+                         "the per-call log must be removed with the workdir")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_child_is_a_session_leader(self):
+        code = "import os; print(os.getpid()); print(os.getpgrp())"
+        run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
+        pid, pgid = (int(value) for value in run.stdout.split())
+        self.assertEqual(pid, pgid,
+                         "child must lead its own group so descendants die")
+
+    def test_zero_timeout_never_spawns(self):
+        with mock.patch.object(mod.subprocess, "Popen") as popen:
+            run = mod._run_cli("/fake/agy", ("--version",), timeout=0)
+        self.assertTrue(run.timed_out)
+        popen.assert_not_called()
+
+    def test_output_cap_kills_the_child(self):
+        run = mod._run_cli(
+            sys.executable,
+            ("-c", "import sys; sys.stdout.write('x' * 100000)"),
+            timeout=10, max_bytes=128,
+        )
+        self.assertTrue(run.output_too_large)
+        self.assertLessEqual(len(run.stdout), 128)
+
+    def test_unbounded_output_is_capped_and_killed(self):
+        """A writer that never stops must hit the byte cap, not the timeout."""
+        code = (
+            "import sys\n"
+            "while True:\n"
+            "    sys.stdout.write('x' * 4096)\n"
+            "    sys.stdout.flush()\n"
+        )
+        started = time.monotonic()
+        thread, box = _run_with_watchdog(
+            lambda: mod._run_cli(
+                sys.executable, ("-c", code), timeout=10, max_bytes=1024),
+            5.0,
+        )
+        elapsed = time.monotonic() - started
+        self.assertFalse(thread.is_alive(), "infinite output hung the reader")
+        self.assertIn("result", box, box.get("error"))
+        run = box["result"]
+        self.assertTrue(run.output_too_large)
+        self.assertLessEqual(len(run.stdout), 1024)
+        self.assertIsNotNone(run.returncode)
+        self.assertLess(elapsed, 3.0)
+        self.assertEqual(_reader_threads(), [],
+                         "the cap must not leave a reader thread behind")
+
+    def test_timeout_kills_the_child(self):
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "child.pid")
+            code = ("import os, sys, time\n"
+                    "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+                    "time.sleep(30)\n")
+            run = mod._run_cli(
+                sys.executable, ("-c", code, pidfile), timeout=0.3)
+            pid = _read_pid(pidfile)
+        self.assertTrue(run.timed_out)
+        self.assertIsNotNone(pid)
+        self.assertTrue(_wait_dead(pid),
+                        "a timed-out child must be killed and reaped")
+        self.assertEqual(_reader_threads(), [],
+                         "a timeout must not leave a reader thread behind")
+
+    def test_timeout_has_one_wall_clock_bound(self):
+        started = time.monotonic()
+        run = mod._run_cli(
+            sys.executable, ("-c", "import time; time.sleep(30)"),
+            timeout=0.2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertTrue(run.timed_out)
+        self.assertLess(elapsed, 3.0,
+                        "a timeout must not add a second full wait")
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_exited_child_with_grandchild_on_stdout_is_bounded_and_cleaned(self):
+        """The child exits, but its child still holds the inherited pipe."""
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "grand.pid")
+            started = time.monotonic()
+            thread, box = _run_with_watchdog(
+                lambda: mod._run_cli(
+                    sys.executable,
+                    ("-c", _GRANDCHILD_SCRIPT, pidfile, "exit"),
+                    timeout=10,
+                ),
+                5.0,
+            )
+            elapsed = time.monotonic() - started
+            pid = _read_pid(pidfile)
+            try:
+                if thread.is_alive() and pid is not None:
+                    _kill_pid(pid)
+                    thread.join(3.0)
+                self.assertFalse(thread.is_alive(),
+                                 "waiter deadlocked closing stdout")
+                self.assertIn("result", box, box.get("error"))
+                run = box["result"]
+                self.assertFalse(run.timed_out)
+                self.assertEqual(run.returncode, 0)
+                self.assertLess(elapsed, 3.0,
+                                "an exited child must not hold the call open")
+                self.assertIsNotNone(pid)
+                self.assertTrue(
+                    _wait_dead(pid),
+                    "the grandchild holding stdout must be killed",
+                )
+            finally:
+                if pid is not None and not _pid_is_dead(pid):
+                    _kill_pid(pid)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_escaped_descendant_does_not_leak_the_reader_or_an_fd(self):
+        """A descendant in its own session still holds stdout after the child exits.
+
+        No group signal can reach it, so the old reader blocked forever and
+        leaked one thread plus one fd per refresh.  The bounded cancellable
+        reader must give up and close its end without waiting for that process.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "escaped.pid")
+            fd_dir = "/proc/self/fd"
+            before_fds = (len(os.listdir(fd_dir))
+                          if os.path.isdir(fd_dir) else None)
+            started = time.monotonic()
+            thread, box = _run_with_watchdog(
+                lambda: mod._run_cli(
+                    sys.executable,
+                    ("-c", _ESCAPED_CHILD_SCRIPT, pidfile),
+                    timeout=5,
+                ),
+                5.0,
+            )
+            elapsed = time.monotonic() - started
+            pid = _read_pid(pidfile)
+            try:
+                if thread.is_alive() and pid is not None:
+                    _kill_pid(pid)
+                    thread.join(3.0)
+                self.assertFalse(thread.is_alive(),
+                                 "waiter blocked on an escaped descendant")
+                self.assertIn("result", box, box.get("error"))
+                run = box["result"]
+                self.assertFalse(run.timed_out)
+                self.assertEqual(run.returncode, 0)
+                self.assertLess(elapsed, 3.0,
+                                "the grace period must bound an escaped holder")
+                self.assertIsNotNone(pid)
+                self.assertFalse(_pid_is_dead(pid),
+                                 "test setup: the descendant must escape")
+                end = time.monotonic() + 1.0
+                while _reader_threads() and time.monotonic() < end:
+                    time.sleep(0.01)
+                self.assertEqual(_reader_threads(), [],
+                                 "the cancelled reader thread must exit")
+                if before_fds is not None:
+                    self.assertLessEqual(
+                        len(os.listdir(fd_dir)), before_fds,
+                        "the reader must close the stdout descriptor",
+                    )
+            finally:
+                if pid is not None and not _pid_is_dead(pid):
+                    _kill_pid(pid)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_exited_child_cleans_a_descendant_that_does_not_hold_stdout(self):
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "daemon.pid")
+            started = time.monotonic()
+            thread, box = _run_with_watchdog(
+                lambda: mod._run_cli(
+                    sys.executable,
+                    ("-c", _DAEMON_CHILD_SCRIPT, pidfile),
+                    timeout=10,
+                ),
+                5.0,
+            )
+            elapsed = time.monotonic() - started
+            pid = _read_pid(pidfile)
+            try:
+                if thread.is_alive() and pid is not None:
+                    _kill_pid(pid)
+                    thread.join(3.0)
+                self.assertFalse(thread.is_alive())
+                self.assertIn("result", box, box.get("error"))
+                run = box["result"]
+                self.assertFalse(run.timed_out)
+                self.assertEqual(run.returncode, 0)
+                self.assertLess(elapsed, 3.0)
+                self.assertIsNotNone(pid)
+                self.assertTrue(
+                    _wait_dead(pid),
+                    "a normal exit must not leave a descendant running",
+                )
+            finally:
+                if pid is not None and not _pid_is_dead(pid):
+                    _kill_pid(pid)
+
+    @unittest.skipIf(os.name == "nt", "POSIX process groups")
+    def test_timeout_kills_grandchild_holding_stdout(self):
+        with tempfile.TemporaryDirectory() as td:
+            pidfile = os.path.join(td, "grand.pid")
+            started = time.monotonic()
+            thread, box = _run_with_watchdog(
+                lambda: mod._run_cli(
+                    sys.executable,
+                    ("-c", _GRANDCHILD_SCRIPT, pidfile, "hold"),
+                    timeout=1.0,
+                ),
+                5.0,
+            )
+            elapsed = time.monotonic() - started
+            pid = _read_pid(pidfile)
+            try:
+                if thread.is_alive() and pid is not None:
+                    _kill_pid(pid)
+                    thread.join(3.0)
+                self.assertFalse(thread.is_alive(),
+                                 "waiter deadlocked closing stdout")
+                self.assertIn("result", box, box.get("error"))
+                run = box["result"]
+                self.assertTrue(run.timed_out)
+                self.assertLess(elapsed, 3.0)
+                self.assertIsNotNone(pid)
+                self.assertTrue(
+                    _wait_dead(pid),
+                    "the timeout must clean up the whole process group",
+                )
+            finally:
+                if pid is not None and not _pid_is_dead(pid):
+                    _kill_pid(pid)
+
+
+    def test_secret_environment_is_not_inherited_by_the_child(self):
+        code = (
+            "import os; "
+            "print(os.environ.get('GEMINI_API_KEY', 'absent')); "
+            "print(os.environ.get('AGY_CLI_DISABLE_AUTO_UPDATE', 'missing'))"
+        )
+        with mock.patch.dict(os.environ,
+                             {"GEMINI_API_KEY": "secret-value", "PATH": os.environ.get("PATH", "")},
+                             clear=False):
+            run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
+        self.assertEqual(_stdout_text(run), "absent\ntrue\n")
+
+    def test_validated_proxy_reaches_the_child_but_other_secrets_do_not(self):
+        code = (
+            "import os; "
+            "print(os.environ.get('HTTPS_PROXY', 'absent')); "
+            "print(os.environ.get('GEMINI_API_KEY', 'absent'))"
+        )
+        with mock.patch.dict(os.environ, {
+                "HTTPS_PROXY": "http://proxy.example:3128",
+                "GEMINI_API_KEY": "secret-value",
+                "PATH": os.environ.get("PATH", ""),
+        }, clear=False):
+            run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
+        self.assertEqual(
+            _stdout_text(run), "http://proxy.example:3128\nabsent\n")
+
+    def test_stdin_is_closed_for_noninteractive_runs(self):
+        code = "import sys; print(repr(sys.stdin.read()))"
+        run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
+        self.assertEqual(_stdout_text(run), "''\n")
+
+    def test_a_cancelled_reader_returns_without_touching_the_pipe(self):
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+        cancel = threading.Event()
+        cancel.set()
+        try:
+            self.assertIsNone(mod._read_chunk(stream, cancel))
+        finally:
+            stream.close()
+            os.close(write_fd)
+
+
+class WindowsProcessTests(unittest.TestCase):
+    """Mock-only Windows process handling; the Windows runtime is unverified."""
+
+    def test_spawn_uses_a_new_process_group_and_no_console_window(self):
+        expected = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        )
+        with mock.patch.object(mod.os, "name", "nt"):
+            kwargs = mod._spawn_kwargs()
+        self.assertEqual(kwargs, {"creationflags": expected})
+        self.assertTrue(kwargs["creationflags"] & 0x08000000)
+
+    def test_taskkill_tree_runs_before_the_parent_kill(self):
+        events = []
+        proc = mock.Mock(pid=4242)
+        proc.kill.side_effect = lambda: events.append(("kill", None, None))
+
+        def fake_run(argv, **kwargs):
+            events.append(("taskkill", tuple(argv), kwargs))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(mod.os, "name", "nt"), \
+                mock.patch.object(mod.subprocess, "run", side_effect=fake_run):
+            mod._kill_tree(proc)
+
+        self.assertEqual([event[0] for event in events],
+                         ["taskkill", "kill"],
+                         "taskkill /T must enumerate children before exit")
+        argv = events[0][1]
+        self.assertTrue(str(argv[0]).endswith("taskkill.exe"))
+        self.assertEqual(list(argv[1:]), ["/PID", "4242", "/T", "/F"])
+        self.assertEqual(events[0][2]["creationflags"], 0x08000000)
+        proc.kill.assert_called_once_with()
+
+    def test_taskkill_failure_still_falls_back_to_killing_the_parent(self):
+        proc = mock.Mock(pid=4242)
+        with mock.patch.object(mod.os, "name", "nt"), \
+                mock.patch.object(mod.subprocess, "run", side_effect=OSError):
+            mod._kill_tree(proc)
+        proc.kill.assert_called_once_with()
+
+
+class OptInTests(unittest.TestCase):
     def _enabled_via_config(self, value):
         config = types.ModuleType("hermes_cli.config")
         config.load_config_readonly = lambda: {
@@ -362,124 +1423,97 @@ class AntigravityOptInTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=True):
                 return mod._antigravity_enabled()
 
-    def test_antigravity_config_uses_a_strict_opt_in(self):
+    def test_config_uses_a_strict_opt_in(self):
         for value in ("false", "False", "no", "0", "off", 0, None):
             with self.subTest(value=value):
                 self.assertFalse(self._enabled_via_config(value))
-        self.assertTrue(self._enabled_via_config(True))
-        self.assertTrue(self._enabled_via_config("true"))
+        for value in (True, "true", "yes", "on", 1):
+            with self.subTest(value=value):
+                self.assertTrue(self._enabled_via_config(value))
 
-    def test_registered_fetcher_does_not_read_credentials_or_call_network_by_default(self):
+    def test_disabled_provider_never_runs_agy(self):
         config = types.ModuleType("hermes_cli.config")
-        config.load_config_readonly = lambda: {"plugins": {"entries": {"quota": {"settings": {}}}}}
+        config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"quota": {"settings": {}}}}}
         cli = types.ModuleType("hermes_cli")
         cli.config = config
-        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}):
-            with mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(mod, "_load_credential") as load_credential, \
-                    mock.patch.object(mod, "_post") as post:
-                result = PROVIDER_FETCHERS["antigravity"]()
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(mod, "_agy_lookup") as path, \
+                mock.patch.object(mod, "_run_cli") as run:
+            result = PROVIDER_FETCHERS["antigravity"]()
         self.assertEqual(result.unavailable_reason, "opt-in-disabled")
-        load_credential.assert_not_called()
-        post.assert_not_called()
+        path.assert_not_called()
+        run.assert_not_called()
 
-    def test_explicit_config_opt_in_reaches_the_provider(self):
+    def test_explicit_config_opt_in_reaches_the_cli(self):
         config = types.ModuleType("hermes_cli.config")
         config.load_config_readonly = lambda: {
             "plugins": {"entries": {"quota": {"settings": {"antigravityEnabled": True}}}}}
         cli = types.ModuleType("hermes_cli")
         cli.config = config
-        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}):
-            with mock.patch.dict(os.environ, {}, clear=True), \
-                    mock.patch.object(mod, "_load_credential", return_value=None) as load_credential:
-                result = PROVIDER_FETCHERS["antigravity"]()
-        self.assertEqual(result.unavailable_reason, "no-credentials")
-        load_credential.assert_called_once_with()
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}), \
+                mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(mod, "_agy_lookup",
+                                  return_value=("/fake/agy", None)), \
+                mock.patch.object(mod, "_run_cli", side_effect=_run_fake()[0]) as run:
+            result = PROVIDER_FETCHERS["antigravity"]()
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(run.call_count, 2)
+
+    def test_env_off_overrides_config_on(self):
+        config = types.ModuleType("hermes_cli.config")
+        config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"quota": {"settings": {"antigravityEnabled": True}}}}}
+        cli = types.ModuleType("hermes_cli")
+        cli.config = config
+        with mock.patch.dict(sys.modules, {"hermes_cli": cli, "hermes_cli.config": config}), \
+                mock.patch.dict(os.environ, {"HERMES_QUOTA_ANTIGRAVITY_ENABLED": "off"}):
+            self.assertFalse(mod._antigravity_enabled())
 
 
 class RegistrationTests(unittest.TestCase):
-    def test_provider_is_registered(self):
-        from quota_providers import PROVIDER_FETCHERS
-
+    def test_provider_is_registered_through_the_opt_in_gate(self):
         self.assertIn("antigravity", PROVIDER_FETCHERS)
-        # Registered through the opt-in gate, like grok. The
-        # registry stores register()'s fail-open wrapper, so compare against
-        # the function it wraps rather than the wrapper's identity.
         registered = PROVIDER_FETCHERS["antigravity"]
         self.assertIs(getattr(registered, "__wrapped__", registered),
                       mod._fetch_antigravity_optin)
 
-    def test_public_installed_app_client_uses_plain_documented_constants(self):
-        source = Path(mod.__file__).read_text(encoding="utf-8")
-        self.assertEqual(
-            mod._PUBLIC_CLIENT_ID,
-            "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-        )
-        self.assertEqual(mod._PUBLIC_CLIENT_CREDENTIAL,
-                         "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")
-        # Still one greppable literal each -- no splitting, no indirection.
-        self.assertIn(f'_PUBLIC_CLIENT_ID = "{mod._PUBLIC_CLIENT_ID}"', source)
-        self.assertIn(
-            f'_PUBLIC_CLIENT_CREDENTIAL = "{mod._PUBLIC_CLIENT_CREDENTIAL}"', source)
-        self.assertIn("public installed-app oauth client credentials", source.lower())
 
-    def test_renamed_constants_reach_the_token_request(self):
-        """The other antigravity tests stub the client constants, so nothing
-        proved the renamed pair still lands in the exchange body -- a swap
-        would post id-as-secret and fail only against Google. Drive _refresh
-        with no stubbing of the constants and inspect the request."""
-        seen = {}
+@unittest.skipUnless(os.environ.get("HERMES_QUOTA_LIVE_AGY") == "1",
+                     "set HERMES_QUOTA_LIVE_AGY=1 for the read-only live agy check")
+class LiveAgyTests(unittest.TestCase):
+    """One explicit, read-only fetch against the installed agy.
 
-        class _Resp:
-            def read(self):
-                return b'{"access_token":"fresh","expires_in":3600}'
+    The user authorized this on their own machine.  It prints labels, remaining
+    percentages and reset times only; no raw CLI output, environment or
+    credential material is displayed.  It does not change config or restart
+    anything.
+    """
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        def opener(req, timeout=None):  # noqa: ANN001, ARG001
-            seen["body"] = req.data.decode("utf-8")
-            return _Resp()
-
-        with mock.patch.object(mod, "urlopen_no_redirect", opener):
-            token = mod._refresh("synthetic-refresh-token")
-        self.assertEqual(token, "fresh")
-        body = seen["body"]
-        self.assertIn(f"client_id={mod._PUBLIC_CLIENT_ID}", body)
-        self.assertIn(f"client_secret={mod._PUBLIC_CLIENT_CREDENTIAL}", body)
-        self.assertIn("refresh_token=synthetic-refresh-token", body)
-
-    def test_no_constant_name_reads_as_an_embedded_secret(self):
-        """A name containing secret/token/key/password + a 20+ char literal is
-        what Hermes' scanner reports as credential_exposure, and that verdict
-        blocks install with no --force override. Keep the names accurate so the
-        plugin stays installable without splitting the literal.
-        """
-        source = Path(mod.__file__).read_text(encoding="utf-8")
-        for name in ("_PUBLIC_CLIENT_ID", "_PUBLIC_CLIENT_CREDENTIAL"):
-            line = next(ln for ln in source.splitlines() if ln.startswith(name))
-            varname = line.split("=", 1)[0].strip()
-            for trigger in ("secret", "token", "password", "key"):
-                self.assertNotIn(
-                    trigger, varname.lower(),
-                    f"{varname} would trip the credential_exposure scan")
-
-    def test_no_credential_write_back(self):
-        # Reading someone else's login must never mutate their store, and this
-        # must never write to disk. Reading the Linux CLI token file is the one
-        # legitimate filesystem read, so the guard is write-freedom, not the
-        # absence of open().
-        import re
-
-        src = Path(mod.__file__).read_text(encoding="utf-8")
-        for forbidden in ("CredWrite", "CredDelete", "pathlib", "tempfile", "shutil"):
-            self.assertNotIn(forbidden, src)
-        for line in src.splitlines():
-            if re.search(r"(?<!url)(?<!urllib\.)\bopen\(", line):
-                self.assertRegex(line, r"[\"']r[b]?[\"']", f"non-read open(): {line.strip()}")
+    def test_live_usage(self):
+        self.assertIsNotNone(shutil.which("agy"))
+        result = mod.fetch_antigravity_quota()
+        print("live antigravity:", result.unavailable_reason, "plan=", result.plan)
+        for window in result.windows:
+            print(" ", window.label, window.used_percent, window.reset_at)
+        self.assertIsNone(result.unavailable_reason)
+        self.assertIsNone(result.plan)
+        labels = [window.label for window in result.windows]
+        for expected in ("Gemini · Weekly", "Gemini · 5h",
+                         "Claude/GPT · Weekly", "Claude/GPT · 5h"):
+            self.assertIn(expected, labels)
+        # Argon is conditional: the live account may or may not return it.
+        # When present it must be the separate bucket, never fabricated.
+        if "Gemini 4 Argon · Weekly" in labels:
+            argon = [w for w in result.windows
+                     if w.label == "Gemini 4 Argon · Weekly"]
+            self.assertEqual(len(argon), 1)
+            self.assertIsNotNone(argon[0].used_percent)
+        for window in result.windows:
+            self.assertIsNotNone(window.used_percent)
+            self.assertGreaterEqual(window.used_percent or 0.0, 0.0)
+            self.assertLessEqual(window.used_percent or 0.0, 100.0)
 
 
 if __name__ == "__main__":
