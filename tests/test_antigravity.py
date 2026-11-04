@@ -123,7 +123,12 @@ class VersionGateTests(unittest.TestCase):
         # A present-but-hijackable executable is a permission problem, not an
         # installation problem, and must not get the "install agy" advice.
         with tempfile.TemporaryDirectory() as td:
-            exe = _make_executable(td, 0o775)
+            if os.name == "nt":
+                # Windows has no POSIX mode bits; its unsafe case is a file
+                # the provider refuses to spawn because it has no .exe/.com.
+                exe = _make_executable(td, name="agy")
+            else:
+                exe = _make_executable(td, 0o775)
             with mock.patch.object(mod.shutil, "which", return_value=str(exe)), \
                     mock.patch.object(mod, "_run_cli") as run:
                 result = mod.fetch_antigravity_quota()
@@ -201,10 +206,11 @@ class VersionGateTests(unittest.TestCase):
                          ["agy-version.log", "agy-usage.log"])
 
     def test_command_injects_the_log_file_before_the_probe_arguments(self):
+        workdir = os.path.join(tempfile.gettempdir(), "private")
         command = mod._command(
-            "/fake/agy", mod._USAGE_ARGS, "/tmp/private", "agy-usage.log")
+            "/fake/agy", mod._USAGE_ARGS, workdir, "agy-usage.log")
         self.assertEqual(command, [
-            "/fake/agy", "--log-file", "/tmp/private/agy-usage.log",
+            "/fake/agy", "--log-file", os.path.join(workdir, "agy-usage.log"),
             "-p", "/usage", "--output-format", "json",
         ])
         self.assertEqual(mod._command("/fake/agy", ("--version",), "/w", None),
@@ -546,10 +552,20 @@ class EnvironmentTests(unittest.TestCase):
             "NO_PROXY": "localhost,127.0.0.1,.example",
             "http_proxy": "http://lower.example:8080",
         }
-        with mock.patch.dict(os.environ, proxies, clear=True):
-            env = mod._cli_env()
         for key, value in proxies.items():
-            self.assertEqual(env.get(key), value)
+            # Windows environment names are case-insensitive, so upper and
+            # lower forms cannot coexist with different values in one dict.
+            # Each form gets its own environment and must still be forwarded.
+            with self.subTest(key=key), \
+                    mock.patch.dict(os.environ, {key: value}, clear=True):
+                env = mod._cli_env()
+            if os.name == "nt":
+                # os.environ collapses case and _cli_env may forward both
+                # spellings with the same value; compare case-insensitively.
+                forwarded = {name.lower(): item for name, item in env.items()}
+                self.assertEqual(forwarded.get(key.lower()), value)
+            else:
+                self.assertEqual(env.get(key), value)
 
     def test_common_no_proxy_spacing_is_accepted_and_trimmed(self):
         cases = (
@@ -771,8 +787,18 @@ class EnvironmentTests(unittest.TestCase):
             self.assertNotIn(needle.lower(), rendered.lower())
 
 
-def _make_executable(directory, mode=0o755, name="agy"):
-    path = Path(directory) / name
+def _exe_name(stem: str) -> str:
+    """Executable file name for this platform.
+
+    Windows resolves ``agy`` through ``PATHEXT`` and the provider only accepts
+    ``.exe``/``.com`` for a shell-free spawn, so a fake without an extension
+    would be rejected by the path check instead of exercising the test's rule.
+    """
+    return stem + (".exe" if os.name == "nt" else "")
+
+
+def _make_executable(directory, mode=0o755, name=None):
+    path = Path(directory) / (name if name is not None else _exe_name("agy"))
     path.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
     path.chmod(mode)
     return path
@@ -794,6 +820,7 @@ class PathValidationTests(unittest.TestCase):
             with mock.patch.object(mod.shutil, "which", return_value=str(exe)):
                 self.assertEqual(mod._agy_path(), str(exe.resolve()))
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits are not modeled on Windows")
     def test_group_or_world_writable_and_set_id_executable_is_rejected(self):
         for mode in (0o775, 0o757, 0o4755, 0o2755):
             with self.subTest(mode=oct(mode)), \
@@ -803,6 +830,8 @@ class PathValidationTests(unittest.TestCase):
                                        return_value=str(exe)):
                     self.assertIsNone(mod._agy_path())
 
+    @unittest.skipIf(os.name == "nt",
+                     "Windows os.access has no POSIX execute bit")
     def test_non_executable_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             exe = _make_executable(td, 0o644)
@@ -811,12 +840,14 @@ class PathValidationTests(unittest.TestCase):
 
     def test_directory_named_agy_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            directory = Path(td) / "agy"
+            directory = Path(td) / _exe_name("agy")
             directory.mkdir()
             with mock.patch.object(mod.shutil, "which",
                                    return_value=str(directory)):
                 self.assertIsNone(mod._agy_path())
 
+    @unittest.skipIf(os.name == "nt",
+                     "Windows path check does not model directory ACLs")
     def test_executable_in_a_writable_directory_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             writable = Path(td) / "bin"
@@ -828,11 +859,31 @@ class PathValidationTests(unittest.TestCase):
 
     def test_symlink_to_a_safe_executable_is_accepted(self):
         with tempfile.TemporaryDirectory() as td:
-            target = _make_executable(td, name="agy-real")
-            link = Path(td) / "agy"
-            link.symlink_to(target)
+            target = _make_executable(td, name=_exe_name("agy-real"))
+            link = Path(td) / _exe_name("agy")
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError) as exc:
+                self.skipTest(f"symlinks unavailable on this host: {exc}")
             with mock.patch.object(mod.shutil, "which", return_value=str(link)):
                 self.assertEqual(mod._agy_path(), str(target.resolve()))
+
+
+class WindowsPathTests(unittest.TestCase):
+    """The Windows branch of the path check, mocked on any host."""
+
+    def test_windows_accepts_only_exe_or_com_regular_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            exe = _make_executable(td, name="agy.exe")
+            com = _make_executable(td, name="agy.com")
+            bare = _make_executable(td, name="agy")
+            with mock.patch.object(mod.os, "name", "nt"):
+                self.assertEqual(mod._safe_agy_path(str(exe)),
+                                 str(exe.resolve()))
+                self.assertEqual(mod._safe_agy_path(str(com)),
+                                 str(com.resolve()))
+                self.assertIsNone(mod._safe_agy_path(str(bare)),
+                                  "shell-free spawn cannot run a bare file")
 
 
 _GRANDCHILD_SCRIPT = (
@@ -889,6 +940,16 @@ def _run_with_watchdog(call, seconds):
     return thread, box
 
 
+def _stdout_text(run):
+    """Captured stdout with the child's text-mode newline mapping undone.
+
+    A Windows child writing through text-mode stdout emits ``\\r\\n``; the
+    contract under test is the exact content and line structure, not the host
+    newline convention.
+    """
+    return run.stdout.decode("utf-8").replace("\r\n", "\n")
+
+
 def _reader_threads():
     """Live reader threads, so a cancelled reader leak is visible directly."""
     return [t for t in threading.enumerate()
@@ -911,7 +972,44 @@ def _read_pid(pidfile, timeout=3.0):
     return None
 
 
+def _windows_pid_is_dead(pid: int) -> bool:
+    """True when ``pid`` is not running; never signals or terminates it.
+
+    ``os.kill(pid, 0)`` is not a liveness probe on Windows: every signal other
+    than ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` calls ``TerminateProcess``, and a
+    dead PID raises ``OSError`` with ``WinError 87`` rather than
+    ``ProcessLookupError``.  Holding a ``SYNCHRONIZE`` handle and polling it
+    observes exit without changing the target.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    synchronize = 0x00100000
+    error_invalid_parameter = 87
+    wait_object_0 = 0x0
+    # Not present on POSIX ctypes; this branch runs only under Windows.
+    WinDLL = getattr(ctypes, "WinDLL")
+    get_last_error = getattr(ctypes, "get_last_error")
+    kernel32 = WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [
+        wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = kernel32.OpenProcess(synchronize, False, pid)
+    if not handle:
+        # Only "no such process" is death; access denied means it is alive.
+        return get_last_error() == error_invalid_parameter
+    try:
+        return kernel32.WaitForSingleObject(handle, 0) == wait_object_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _pid_is_dead(pid):
+    if os.name == "nt":
+        return _windows_pid_is_dead(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1237,7 +1335,7 @@ class RunnerTests(unittest.TestCase):
                              {"GEMINI_API_KEY": "secret-value", "PATH": os.environ.get("PATH", "")},
                              clear=False):
             run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
-        self.assertEqual(run.stdout, b"absent\ntrue\n")
+        self.assertEqual(_stdout_text(run), "absent\ntrue\n")
 
     def test_validated_proxy_reaches_the_child_but_other_secrets_do_not(self):
         code = (
@@ -1252,12 +1350,12 @@ class RunnerTests(unittest.TestCase):
         }, clear=False):
             run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
         self.assertEqual(
-            run.stdout, b"http://proxy.example:3128\nabsent\n")
+            _stdout_text(run), "http://proxy.example:3128\nabsent\n")
 
     def test_stdin_is_closed_for_noninteractive_runs(self):
         code = "import sys; print(repr(sys.stdin.read()))"
         run = mod._run_cli(sys.executable, ("-c", code), timeout=10)
-        self.assertEqual(run.stdout, b"''\n")
+        self.assertEqual(_stdout_text(run), "''\n")
 
     def test_a_cancelled_reader_returns_without_touching_the_pipe(self):
         read_fd, write_fd = os.pipe()
