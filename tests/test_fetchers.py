@@ -623,6 +623,50 @@ class GrokRestTests(unittest.TestCase):
             res = grok._fetch_grok_optin()
         self.assertEqual(res.unavailable_reason, "opt-in-disabled")
 
+    def test_grpc_empty_body_is_an_auth_rejection(self):
+        """An invalid or absent bearer returns HTTP 200 with an empty body.
+
+        Reproduced with a malformed bearer and with no Authorization header.
+        """
+        from quota_providers import grok
+
+        def _opener(_req, timeout=None):  # noqa: ANN001, ARG001
+            return _FakeResponse(b"")
+
+        with mock.patch.object(grok, "urlopen_no_redirect", _opener):
+            res = grok._fetch_grok_grpc(grok._grok_grpc_headers(bearer="lapsed"))
+        self.assertIsNotNone(res)
+        self.assertEqual(res.unavailable_reason, "auth-failed")
+        self.assertTrue(grok._is_grok_auth_failure(res))
+
+    def test_stale_bearer_is_refreshed_once_and_retried(self):
+        """A rejected bearer earns one forced refresh and one retry."""
+        from quota_providers import grok
+
+        tokens: list[bool] = []
+
+        def _token(force_refresh: bool = False) -> str:
+            tokens.append(force_refresh)
+            return "fresh-token" if force_refresh else "lapsed-token"
+
+        seen: list[str] = []
+
+        def _opener(req, timeout=None):  # noqa: ANN001, ARG001
+            auth = req.get_header("Authorization")
+            seen.append(auth)
+            if auth == "Bearer lapsed-token":
+                return _FakeResponse(b"")
+            return _FakeResponse(bytes.fromhex(self._GRPC_FIXTURE_HEX))
+
+        with mock.patch.object(grok, "_hermes_xai_access_token", _token), \
+             mock.patch.object(grok, "urlopen_no_redirect", _opener):
+            res = grok.fetch_grok_quota()
+
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual([w.label for w in res.windows], ["Weekly Limit"])
+        self.assertEqual(tokens, [False, True])
+        self.assertEqual(seen, ["Bearer lapsed-token", "Bearer fresh-token"])
+
 
 # -- Kimi ---------------------------------------------------------------------
 
