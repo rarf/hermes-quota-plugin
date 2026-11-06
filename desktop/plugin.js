@@ -56,7 +56,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "3.0.1";
+const WIDGET_VERSION = "3.1.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -1452,6 +1452,10 @@ function QuotaChipWithBar() {
 				className: "text-[0.6875rem] text-(--ui-text-secondary)",
 				children: valueText,
 			}),
+			// Layout A: a multi-account winner counts its other saved accounts.
+			worstProvider?.display_accounts?.length > 1
+				? jsx("span", { "data-chip-more": worstProvider.display_accounts.length - 1, className: "text-[0.6875rem]", style: { color: "var(--ui-text-quaternary)" }, children: `+${worstProvider.display_accounts.length - 1}` })
+				: null,
 			jsx(ChipAlert, { alert }),
 		],
 	});
@@ -1581,6 +1585,11 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
+				// Layout A: other saved Codex accounts are counted, never hidden;
+				// all of them stay reachable from the quota popover.
+				...(provider?.display_accounts?.length > 1
+					? [jsx("span", { "data-chip-more": provider.display_accounts.length - 1, style: { color: "var(--ui-text-quaternary)" }, children: `+${provider.display_accounts.length - 1}` }, "more")]
+					: []),
 				// No alert -> no child at all: a plain chip keeps exactly
 				// [dot/ring, name, value].
 				...(alert ? [jsx(ChipAlert, { alert })] : []),
@@ -1590,23 +1599,50 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 	return jsx(ChipPopover, { tip, kind: "quota", width: 300, card: (close) => jsx(QuotaCard, { close }), children: button });
 }
 
-// One status-bar cell for a provider whose saved pool has several sibling
-// rows: one light per card, in row order, tinted by that card's remaining
-// quota, followed by the base provider name. No value text, and the cell
-// never wraps — it stays a single compact line.
+// The limiting known window of one row: its account, label and remaining %.
+// Unknown/failed rows never rank (unknown is not zero).
+function limitingWindow(pid, provider) {
+	if (!provider || provider.unavailable_reason) return null;
+	let best = null;
+	for (const w of asWindowList(provider.windows)) {
+		const r = remainingPct(w);
+		if (r == null) continue;
+		if (!best || r < best.r) best = { r, label: w.label || tr("windowFallback") };
+	}
+	return best;
+}
+
+// Layout A: one status-bar cell for a provider whose saved pool has several
+// sibling rows. One light per account in row order (tinted by that account's
+// remaining quota), the provider name, then the limiting account, its window
+// and remaining value, and an explicit "+N" for the other saved accounts.
+// Every account stays reachable from the quota popover; nothing is selected.
+// The cell never wraps — it stays a single compact line.
 function ProviderGroupChip({ base, entries, alert = null, special }) {
 	const name = providerMeta(base).name;
 	const baseTip = providerGroupTip(entries);
 	const tip = special ? `${baseTip}\n\n${specialTipLines(special).join("\n")}` : baseTip;
+	let limit = null;
+	for (const [pid, provider] of entries) {
+		const w = limitingWindow(pid, provider);
+		if (w && (!limit || w.r < limit.r)) {
+			const account = typeof provider.account_label === "string" ? provider.account_label.trim() : "";
+			limit = { ...w, account: account || providerDisplayName(pid, provider) };
+		}
+	}
+	const more = entries.length - 1;
+	const value = limit ? fmtPct(limit.r) : tr("valueUnknown");
+	const summary = limit ? `${limit.account} · ${limit.label} ${value}` : value;
 	const button = jsxs(
 		"button",
 		{
 			type: "button",
-			"aria-label": `${name} · ${entries.length} cards${chipAlertAria(alert)} · Open Quota pane`,
+			"aria-label": `${name} · ${summary} · +${more}${chipAlertAria(alert)} · ${tr("chipQuotaOpen")}`,
 			className: cn(
-				"inline-flex h-full items-center gap-1 whitespace-nowrap px-1.5 text-[0.6875rem]",
+				"qm-sb-chip inline-flex h-full items-center gap-1 whitespace-nowrap px-1.5 text-[0.6875rem]",
 				"text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground transition-colors",
 			),
+			style: CHIP_NOWRAP,
 			children: [
 				...entries.map(([pid, provider], index) =>
 					jsx("span", {
@@ -1614,11 +1650,17 @@ function ProviderGroupChip({ base, entries, alert = null, special }) {
 						style: { background: toneColor(providerTone(provider)) },
 					}, `${pid}-light-${index}`),
 				),
-				jsx("span", { children: name }),
+				jsx("span", { children: name }, "name"),
+				limit
+					? jsx("span", { "data-chip-account": limit.account, style: { ...UI.ellipsis, maxWidth: 96, color: "var(--ui-text-secondary)" }, children: limit.account }, "account")
+					: null,
+				limit ? jsx("span", { "data-chip-window": limit.label, children: limit.label }, "window") : null,
+				jsx("span", { className: "tabular-nums", children: value }, "value"),
+				jsx("span", { "data-chip-more": more, style: { color: "var(--ui-text-quaternary)" }, children: `+${more}` }, "more"),
 				// The cell owns every sibling's countdown/forecast: the merged
 				// alert uses the fullest reset and the earliest fill, exactly
 				// like worst mode, so no card's warning is lost in the merge.
-				...(alert ? [jsx(ChipAlert, { alert })] : []),
+				...(alert ? [jsx(ChipAlert, { alert }, "alert")] : []),
 			],
 		},
 	);
@@ -2029,8 +2071,19 @@ function QuotaBar({ value, tone }) {
 	});
 }
 
-/** One quota window as a ring tile: % left in the centre, label + reset under it. */
-function WindowTile({ w, size, resetFormat }) {
+// Layout A: a quota window is one compact row: label, exact value and a thin
+// remaining bar. Unknown stays an empty track with "—", never 0%.
+function WindowBar({ r, tone }) {
+	return jsx("span", {
+		"aria-hidden": true,
+		style: { display: "block", height: 4, borderRadius: 2, background: "var(--ui-stroke-tertiary)", overflow: "hidden", minWidth: 0 },
+		children: r == null
+			? null
+			: jsx("span", { style: { display: "block", height: "100%", width: `${r}%`, background: toneColor(tone), borderRadius: 2 } }),
+	});
+}
+
+function WindowTile({ w, resetFormat }) {
 	const t = useQT();
 	const r = remainingPct(w);
 	const tone = toneForRemaining(r);
@@ -2039,29 +2092,25 @@ function WindowTile({ w, size, resetFormat }) {
 	const full = w.reset_at ? t("reset", formatReset(w.reset_at, resetFormat)) : "";
 	return jsxs("div", {
 		"data-window": label,
+		"data-window-bar": r,
 		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, full].filter(Boolean).join(" · "),
-		style: { ...UI.col, alignItems: "center", gap: 3 },
+		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
-			jsx(Ring, {
-				value: r,
-				tone,
-				size,
-				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
-				children: [
-					jsx("span", { style: { fontSize: Math.round(size * 0.26), fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }, "v"),
-					r == null ? null : jsx("span", { style: { fontSize: Math.max(8, Math.round(size * 0.17)), color: "var(--ui-text-tertiary)" }, children: t("left") }, "l"),
-				],
-			}),
-			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", overflowWrap: "anywhere" }, children: label }),
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", overflowWrap: "anywhere" }, children: label }, "label"),
+			jsx("span", {
+				style: { ...UI.num, fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)", textAlign: "end", whiteSpace: "nowrap" },
+				children: r == null ? "—" : `${fmtPct(r)} ${t("left")}`,
+			}, "value"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
 			// Shown in both pane-detail modes: "% left" is hard to act on
 			// without knowing when the window refills (#77).
-			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, ...UI.ellipsis, maxWidth: "100%" }, children: reset }) : null,
+			reset ? jsx("span", { "data-window-reset": "", style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", ...UI.ellipsis }, children: reset }, "reset") : null,
 		],
 	});
 }
 
-// One provider card: header (logo, name, health dot, plan pill), a row of ring
-// tiles — one per window — then forecasts, the used-% history chart and detail
+// One provider card: header (logo, name, health dot, plan pill), one compact
+// bar row per window, then forecasts, the used-% history chart and detail
 // lines. Unavailable providers render as a muted compact card.
 function ProviderRow({ id, provider, monitor, page = false, headerExtra, special }) {
 	const t = useQT();
@@ -2127,7 +2176,6 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 	}
 
 	const tone = providerTone(provider);
-	const ringSize = page ? 62 : 50;
 	const forecasts = monitor
 		? windows
 				.map((w) => ({ w, forecast: forecastFor(burnFor(monitor.burnMap, id, provider, w.label), w, monitor.nowSec) }))
@@ -2178,9 +2226,9 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				: null,
 			windows.length
 				? jsx("div", {
-						"data-rings": true,
-						style: { display: "grid", gridTemplateColumns: `repeat(auto-fill, minmax(${ringSize + 18}px, 1fr))`, gap: "10px 4px" },
-						children: windows.map((w, i) => jsx(WindowTile, { w, size: ringSize, resetFormat }, `${id}-w-${i}`)),
+						"data-windows": true,
+						style: { display: "grid", gridTemplateColumns: page ? "repeat(auto-fill, minmax(180px, 1fr))" : "minmax(0, 1fr)", gap: "8px 16px" },
+						children: windows.map((w, i) => jsx(WindowTile, { w, resetFormat }, `${id}-w-${i}`)),
 					})
 				: null,
 			// Agent monitor extras: burn rate / "fills before reset" per window and
@@ -2249,67 +2297,50 @@ function SettingRow({ label, hint, children, block = false }) {
 	});
 }
 
-function SettingsCard({ icon, title, children, footer }) {
-	return jsxs("section", {
+// Layout A: each group is a native disclosure (accordion). The title carries a
+// one-line scope note; rows keep label + hint left, control right.
+function SettingsCard({ icon, title, note, children, footer, open = false }) {
+	return jsxs("details", {
 		"data-settings-card": title,
-		style: { ...UI.card, padding: "10px 14px 6px" },
+		open: open || undefined,
+		style: { minWidth: 0, borderBottom: "1px solid var(--ui-stroke-tertiary)" },
 		children: [
-			jsxs("div", {
-				style: { ...UI.row, gap: 7, padding: "2px 0 4px" },
+			jsxs("summary", {
+				className: "cursor-pointer select-none",
+				style: { display: "flex", alignItems: "baseline", flexWrap: "wrap", columnGap: 8, rowGap: 0, padding: "9px 0", minWidth: 0, listStyle: "none" },
 				children: [
-					jsx("span", { style: { display: "inline-flex", color: "var(--ui-text-tertiary)" }, children: jsx(SdkIcon, { name: icon, className: "h-3.5 w-3.5", fallback: "" }) }),
-					jsx("span", { style: { fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)" }, children: title }),
+					jsx("span", { "aria-hidden": true, className: "qm-sb-chev", style: { ...UI.faint, width: 8, flexShrink: 0, textAlign: "center" }, children: isRtl() ? "‹" : "›" }, "c"),
+					jsx("span", { style: { display: "inline-flex", alignSelf: "center", color: "var(--ui-text-tertiary)" }, children: jsx(SdkIcon, { name: icon, className: "h-3.5 w-3.5", fallback: "" }) }, "i"),
+					jsx("span", { style: { fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)" }, children: title }, "t"),
+					note ? jsx("span", { style: { ...UI.faint, minWidth: 0 }, children: note }, "n") : null,
 				],
-			}),
-			jsx("div", { style: { ...UI.col }, children }),
-			footer ? jsx("div", { style: { ...UI.tiny, lineHeight: 1.4, padding: "2px 0 8px" }, children: footer }) : null,
+			}, "s"),
+			jsx("div", { style: { ...UI.col, paddingBottom: 6 }, children }, "b"),
+			footer ? jsx("div", { style: { ...UI.tiny, lineHeight: 1.4, padding: "2px 0 10px" }, children: footer }, "f") : null,
 		],
 	});
 }
 
-// One group of rows that share a base provider (saved pool accounts): the
-// per-card buttons live inside the selected card's own header, right of the
-// provider name — the row's own label plus its status tone. The card below
-// is still rendered by the same ProviderRow as every single-card provider,
-// so the detail keeps the full single-card completeness. A lone row never
-// reaches this component; the pane keeps its plain card path as-is.
+// One group of rows that share a base provider (saved pool accounts).
+// Layout A: no selection — every saved account renders its own complete
+// ProviderRow card in backend priority order, so every account and window is
+// visible at once. Showing an account never switches it. The provider-level
+// special notice stays nested in a card, attached once to the first account.
+// A lone row never reaches this component; the pane keeps its plain card path.
 function ProviderCardGroup({ entries, monitor, page = false, special }) {
-	const [selected, setSelected] = useState(0);
-	// A refresh can remove or reorder rows: clamp instead of blanking the UI.
-	const index = Math.max(0, Math.min(selected, entries.length - 1));
-	const [selectedId, selectedProvider] = entries[index];
-	const headerExtra = jsx("div", {
-		className: "flex items-center gap-1.5",
-		style: { flexWrap: "wrap" },
+	return jsx("div", {
+		"data-account-group": baseProviderId(entries[0][0]),
+		style: { ...UI.col, gap: 6 },
 		children: entries.map(([pid, provider], i) => {
-			const account =
-				provider && typeof provider.account_label === "string"
-					? provider.account_label.trim()
-					: "";
-			return jsxs(
-				"button",
-				{
-					type: "button",
-					"aria-pressed": i === index,
-					className: cn(
-						"inline-flex items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-2 py-0.5 font-normal",
-						"text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) transition-colors",
-					),
-					style:
-						i === index
-							? { background: "var(--ui-control-hover-background)" }
-							: undefined,
-					onClick: () => setSelected(i),
-					children: [
-						jsx("span", { children: account || providerDisplayName(pid, provider) }),
-						jsx(StatusDot, { tone: providerTone(provider) }),
-					],
-				},
-				`${pid}-${i}`,
-			);
+			const account = provider && typeof provider.account_label === "string" ? provider.account_label.trim() : "";
+			return jsx("div", {
+				"data-account": account || providerDisplayName(pid, provider),
+				"data-account-tone": providerTone(provider),
+				style: { minWidth: 0 },
+				children: jsx(ProviderRow, { id: pid, provider, monitor, page, special: i === 0 ? special : null }),
+			}, `${pid}-${i}`);
 		}),
 	});
-	return jsx(ProviderRow, { id: selectedId, provider: selectedProvider, headerExtra, monitor, page, special }, selectedId);
 }
 
 function ResetFormatControl() {
@@ -2404,6 +2435,7 @@ function DisabledProvidersControl() {
 	return jsx(SettingsCard, {
 		icon: "Plug",
 		title: t("disabledProvidersLabel"),
+		note: t("settingsNoteProviders"),
 		children: jsx("div", {
 			style: { display: "flex", flexWrap: "wrap", gap: 6, padding: "6px 0 10px" },
 			children: allProviders.map(([pid, p]) => {
@@ -2465,11 +2497,13 @@ function QuotaSettings() {
 	const t = useQT();
 	return jsxs("div", {
 		"data-quota-settings": true,
-		style: { ...UI.col, gap: 10, paddingBottom: 4 },
+		style: { ...UI.col, gap: 0, paddingBottom: 4, borderTop: "1px solid var(--ui-stroke-tertiary)" },
 		children: [
 			jsxs(SettingsCard, {
 				icon: "PanelBottom",
 				title: t("settingsGroupStatusBar"),
+				note: t("settingsNoteStatusBar"),
+				open: true,
 				children: [
 					jsx(ShowStatusBarControl, {}, "show"),
 					jsx(StatusbarModeControl, {}, "mode"),
@@ -2486,6 +2520,7 @@ function QuotaSettings() {
 			jsxs(SettingsCard, {
 				icon: "SlidersHorizontal",
 				title: t("settingsGroupQuota"),
+				note: t("settingsNoteQuota"),
 				children: [
 					jsx(ShowDockedPaneControl, {}, "docked"),
 					jsx(PaneDetailControl, {}, "detail"),
@@ -2524,12 +2559,12 @@ function SummaryStrip({ snapshot, providers }) {
 			type: "button",
 			onClick,
 			"data-summary": key,
-			className: "cursor-pointer",
-			style: { display: "inline-flex", border: 0, padding: 0, background: "transparent", minWidth: 0 },
-			children: jsx(Pill, { color, dot: true, children: text }),
+			className: "cursor-pointer hover:text-foreground",
+			style: { display: "inline-flex", border: 0, padding: 0, background: "transparent", minWidth: 0, ...UI.meta, color, fontWeight: 500, whiteSpace: "nowrap" },
+			children: text,
 		}, key);
 	const items = [
-		pill("working", STATE_STYLE.working, t("chipWorking", counts.working || 0), open),
+		pill("working", "var(--ui-text-secondary)", t("chipWorking", counts.working || 0), open),
 		counts.needs_approval ? pill("approval", STATE_STYLE.needs_approval, t("chipApproval", counts.needs_approval), open) : null,
 		counts.your_turn ? pill("turn", STATE_STYLE.waiting, t("chipYourTurn", counts.your_turn), open) : null,
 		counts.stalled ? pill("stalled", STATE_STYLE.stalled, t("countStalled", counts.stalled), open) : null,
@@ -2539,7 +2574,7 @@ function SummaryStrip({ snapshot, providers }) {
 	return jsx("div", {
 		"data-summary-strip": true,
 		title: low ? low.label : undefined,
-		style: { display: "flex", flexWrap: "wrap", gap: 5, minWidth: 0, flexShrink: 0 },
+		style: { display: "flex", flexWrap: "wrap", alignItems: "baseline", columnGap: 10, rowGap: 2, minWidth: 0, flexShrink: 0 },
 		children: items,
 	});
 }
@@ -3689,7 +3724,7 @@ function Sparkline({ values, points, height = 22, color = "var(--ui-accent)", ma
 	});
 }
 
-/** Small uppercase header (Agent Bar's "TOKENS / MINUTE"), a sub on the right. */
+/** Small header (Agent Bar's "TOKENS / MINUTE"), a sub on the right. */
 function Section({ title, sub, children }) {
 	return jsxs("div", {
 		style: { ...UI.col, gap: 6 },
@@ -3698,7 +3733,8 @@ function Section({ title, sub, children }) {
 				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, minWidth: 0 },
 				children: [
 					jsx("span", {
-						style: { fontSize: "0.625rem", fontWeight: 650, letterSpacing: "0.06em", textTransform: "uppercase", color: "var(--ui-text-tertiary)", ...UI.ellipsis },
+						"data-section-title": true,
+						style: { fontSize: "0.75rem", fontWeight: 600, color: "var(--ui-text-primary)", ...UI.ellipsis },
 						children: title,
 					}),
 					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, textAlign: "end", overflowWrap: "anywhere" }, children: sub }) : null,
@@ -3709,54 +3745,93 @@ function Section({ title, sub, children }) {
 	});
 }
 
-/** A card holding compact rows separated by hairlines. */
+/** Layout A: rows on hairlines, no surrounding card. */
 function List({ children }) {
 	const rows = asList(Array.isArray(children) ? children : [children]).filter(Boolean);
 	return jsx("div", {
-		style: { ...UI.card, padding: "2px 0", overflow: "hidden" },
+		style: { ...UI.col, minWidth: 0, borderTop: "1px solid var(--ui-stroke-tertiary)" },
 		children: rows.map((row, i) =>
-			jsx("div", { style: { borderTop: i ? "1px solid var(--ui-stroke-tertiary)" : undefined, minWidth: 0 }, children: row }, row && row.key != null ? row.key : i),
+			jsx("div", { style: { borderBottom: "1px solid var(--ui-stroke-tertiary)", minWidth: 0 }, children: row }, row && row.key != null ? row.key : i),
 		),
 	});
 }
 
-/** One compact row: optional click target, optional tone stripe. */
+/**
+ * One compact row: optional click target. `tone` no longer paints a stripe or
+ * gradient (layout A keeps colour for the status word); it is exposed as
+ * data-row-tone so attention ordering stays testable.
+ */
 function Row({ children, onClick, title, tone }) {
 	const style = {
 		...UI.col,
 		gap: 2,
 		width: "100%",
-		padding: "7px 10px",
+		padding: "7px 0",
 		textAlign: "start",
 		boxSizing: "border-box",
 		overflowWrap: "anywhere",
-		// The accent stripe sits on the inline-start edge (right in RTL).
-		background: tone ? `linear-gradient(${isRtl() ? "270deg" : "90deg"}, ${tint(tone, 10)}, transparent 55%)` : "transparent",
-		boxShadow: tone ? `inset ${isRtl() ? -2 : 2}px 0 0 ${tone}` : undefined,
+		background: "transparent",
 		border: 0,
 		color: "inherit",
 	};
 	// jsxs wants a static array; a single child is wrapped.
 	const kids = Array.isArray(children) ? children : [children];
+	const extra = { "data-row": true, "data-row-tone": tone || undefined };
 	return onClick
-		? jsxs("button", { type: "button", className: "cursor-pointer hover:bg-(--chrome-action-hover) transition-colors", style, title, onClick, children: kids })
-		: jsxs("div", { style, title, children: kids });
+		? jsxs("button", { type: "button", className: "cursor-pointer hover:bg-(--chrome-action-hover) transition-colors", style, title, onClick, ...extra, children: kids })
+		: jsxs("div", { style, title, ...extra, children: kids });
 }
 
-/** Agent Bar's KPI tile: small label, big number, one sub line. */
+/** Right-aligned status word: colour only, no fill (layout A). */
+function StatusWord({ color = "var(--ui-text-tertiary)", title, children, ...rest }) {
+	return jsx("span", {
+		...rest,
+		"data-status-word": true,
+		title,
+		style: { flexShrink: 0, fontSize: "0.6875rem", fontWeight: 600, color, whiteSpace: "nowrap" },
+		children,
+	});
+}
+
+/** Native disclosure with a quiet summary; content stays in the DOM. */
+function Disclosure({ id, label, sub, open = false, children }) {
+	return jsxs("details", {
+		"data-disclosure": id,
+		open: open || undefined,
+		style: { minWidth: 0 },
+		children: [
+			jsxs("summary", {
+				className: "cursor-pointer select-none",
+				style: { display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8, ...UI.meta, padding: "2px 0", minWidth: 0, listStyle: "none" },
+				children: [
+					jsxs("span", { style: { ...UI.ellipsis }, children: [jsx("span", { className: "qm-sb-chev", "aria-hidden": true, children: isRtl() ? "‹" : "›" }, "c"), ` ${label}`] }, "l"),
+					sub ? jsx("span", { style: { ...UI.faint, ...UI.num, flexShrink: 0 }, children: sub }, "s") : null,
+				],
+			}, "s"),
+			jsx("div", { style: { ...UI.col, gap: 6, paddingTop: 6 }, children }, "c"),
+		],
+	});
+}
+
+/** Layout A KPI: big number over a small caption, no card. */
 function Kpi({ label, value, sub, tone }) {
 	return jsxs("div", {
-		style: { ...UI.card, ...UI.col, gap: 1, padding: "7px 9px" },
+		"data-kpi": true,
+		style: { ...UI.col, gap: 1, padding: "2px 0", minWidth: 0 },
 		children: [
-			jsx("span", { style: { ...UI.meta, lineHeight: 1.25 }, children: label }),
-			jsx("span", { style: { ...UI.num, fontSize: "1rem", fontWeight: 650, lineHeight: 1.3, color: tone || "var(--ui-text-primary)", overflowWrap: "anywhere" }, children: value }),
+			jsx("span", { style: { ...UI.num, fontSize: "1.0625rem", fontWeight: 600, lineHeight: 1.25, color: tone || "var(--ui-text-primary)", overflowWrap: "anywhere" }, children: value }),
+			jsx("span", { style: { ...UI.meta, lineHeight: 1.3 }, children: label }),
 			sub ? jsx("span", { style: { ...UI.tiny, lineHeight: 1.35 }, children: sub }) : null,
 		],
 	});
 }
 
 function KpiGrid({ children, min = 84 }) {
-	return jsx("div", { style: { display: "grid", gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`, gap: 6 }, children });
+	return jsx("div", {
+		"data-kpi-strip": true,
+		style: { display: "grid", gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))`, gap: "6px 12px", paddingBottom: 8, borderBottom: "1px solid var(--ui-stroke-tertiary)" },
+		children,
+	});
 }
 
 function MetaLine({ parts }) {
@@ -3812,7 +3887,9 @@ function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn =
 	const badge = state !== "ended" && row.long_tool_call ? "long_tool" : state;
 	const activity = row.long_tool_call ? t("longToolCall", row.long_tool_call) : row.activity;
 	const hermes = row.open ? row.open.kind === "hermes-session" : !row.kind || row.kind === "hermes";
-	const color = STATE_STYLE[state] || STATE_STYLE.ended;
+	const stateColor = badge === "working" ? "var(--ui-text-tertiary)" : badge === "ended" ? "var(--ui-text-quaternary)" : STATE_STYLE[badge] || STATE_STYLE.ended;
+	// Layout A: title left, the state as a coloured word right; meta + age on
+	// line two; tokens/cost/context and activity on line three.
 	return jsxs("div", {
 		style: UI.col,
 		children: [
@@ -3822,61 +3899,48 @@ function LiveRow({ row, children, scope, snapshot, nowSec, ctxPct = null, warn =
 				onClick: () => void openMonitorTarget(scope, { open: row.open, row, sessionId: row.id, profile: row.profile }, snapshot),
 				children: [
 					jsxs("div", {
-						style: { display: "flex", alignItems: "flex-start", gap: 8, minWidth: 0 },
+						"data-session-head": true,
+						style: { ...UI.row, gap: 8, alignItems: "baseline" },
 						children: [
-							jsx("span", { style: { paddingTop: 5, flexShrink: 0, display: "inline-flex" }, children: jsx(Dot, { color, size: 7, halo: state === "working" }) }),
-							jsxs("div", {
-								style: { ...UI.col, gap: 2, flex: "1 1 auto" },
-								children: [
-									jsxs("div", {
-										style: { ...UI.row, gap: 6 },
-										children: [
-											jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: row.title || t("untitled") }),
-											ctxPct != null ? jsx(ContextPct, { pct: ctxPct, level: ctxLevel, title: t("ctxRowTip", fmtTokens(row.context_tokens), fmtTokens(row.context_max)) }, "ctx") : null,
-											row.tokens != null
-												? jsx("span", { style: { ...UI.meta, ...UI.num, flexShrink: 0, color: "var(--ui-text-secondary)", fontWeight: 600 }, children: t("tokensN", fmtTokens(row.tokens)) })
-												: null,
-										],
-									}),
-									jsxs("div", {
-										style: { display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 },
-										children: [
-											jsx("div", {
-												style: { flex: "1 1 auto", minWidth: 0 },
-												children: jsx(MetaLine, {
-													parts: [
-														row.subagent ? t("subagent") : null,
-														row.model,
-														row.cost != null ? fmtUsd(row.cost) : null,
-														row.context_tokens != null
-															? row.context_max
-																? t("contextOfN", fmtTokens(row.context_tokens), fmtTokens(row.context_max))
-																: t("contextN", fmtTokens(row.context_tokens))
-															: null,
-														row.account ? `@${row.account}` : null,
-													],
-												}),
-											}),
-											row.last ? jsx("span", { style: { ...UI.tiny, ...UI.num, flexShrink: 0 }, children: t("ago", fmtSpan(nowSec - Number(row.last))) }) : null,
-										],
-									}),
-									badge !== "working" || activity
-										? jsxs("div", {
-												style: { ...UI.row, gap: 6 },
-												children: [
-													badge !== "working" ? jsx(StateBadge, { state: badge }) : null,
-													activity ? jsx("span", { style: { ...UI.faint, ...UI.ellipsis }, title: activity, children: activity }) : null,
-												],
-											})
-										: null,
-								],
-							}),
+							jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis, flex: "1 1 auto" }, children: row.title || t("untitled") }),
+							jsx(StatusWord, { "data-state": badge, color: stateColor, children: t(`state_${badge}`) }),
 						],
 					}),
+					jsxs("div", {
+						style: { display: "flex", alignItems: "baseline", gap: 6, minWidth: 0 },
+						children: [
+							jsx("div", {
+								style: { flex: "1 1 auto", minWidth: 0 },
+								children: jsx(MetaLine, {
+									parts: [
+										row.subagent ? t("subagent") : null,
+										row.model,
+										row.account ? `@${row.account}` : null,
+									],
+								}),
+							}),
+							row.last ? jsx("span", { style: { ...UI.tiny, ...UI.num, flexShrink: 0 }, children: t("ago", fmtSpan(nowSec - Number(row.last))) }) : null,
+						],
+					}),
+					jsxs("div", {
+						style: { display: "flex", flexWrap: "wrap", alignItems: "baseline", columnGap: 10, rowGap: 2, minWidth: 0 },
+						children: [
+							row.tokens != null ? jsx("span", { style: { ...UI.meta, ...UI.num, color: "var(--ui-text-secondary)" }, children: t("tokensN", fmtTokens(row.tokens)) }, "tok") : null,
+							row.cost != null ? jsx("span", { style: { ...UI.meta, ...UI.num, color: "var(--ui-text-secondary)" }, children: fmtUsd(row.cost) }, "cost") : null,
+							row.context_tokens != null
+								? jsx("span", {
+										style: { ...UI.meta, ...UI.num },
+										children: row.context_max ? t("contextOfN", fmtTokens(row.context_tokens), fmtTokens(row.context_max)) : t("contextN", fmtTokens(row.context_tokens)),
+									}, "ctxn")
+								: null,
+							ctxPct != null ? jsx(ContextPct, { pct: ctxPct, level: ctxLevel, title: t("ctxRowTip", fmtTokens(row.context_tokens), fmtTokens(row.context_max)) }, "ctx") : null,
+						],
+					}),
+					activity ? jsx("span", { style: { ...UI.faint, ...UI.ellipsis }, title: activity, children: activity }) : null,
 				],
 			}),
 			children && children.length
-				? jsx("div", { style: { ...UI.col, marginInlineStart: 13, paddingInlineStart: 6, borderInlineStart: "1px solid var(--ui-stroke-secondary)" }, children })
+				? jsx("div", { style: { ...UI.col, marginInlineStart: 6, paddingInlineStart: 8, borderInlineStart: "1px solid var(--ui-stroke-secondary)" }, children })
 				: null,
 		],
 	});
@@ -3951,23 +4015,30 @@ function LiveView({ mon }) {
 					jsx(Kpi, { label: t("last60m"), value: fmtTokens(live.last_60m), sub: cost60 != null ? t("costPerMin", fmtUsd(cost60 / 60)) : null }, "60m"),
 				],
 			}),
-			tokenSeries.some((v) => v > 0)
-				? jsx(Section, {
-						title: t("tokensChart"),
+			// Layout A: charts are secondary; they move into one closed
+			// disclosure so attention and sessions lead. Values are kept.
+			tokenSeries.some((v) => v > 0) || messages.some((v) => v > 0)
+				? jsxs(Disclosure, {
+						id: "activity",
+						label: t("tokensChart"),
 						sub: cost60 != null ? t("cost60m", fmtUsd(cost60)) : null,
-						children: jsxs("div", {
-							style: { ...UI.col, gap: 5 },
-							children: [
-								sourceKeys.length > 1 || (sourceKeys.length === 1 && SOURCE_NAMES[sourceKeys[0]])
-									? jsx(Legend, { items: sourceKeys.map((k) => ({ label: sourceLabel(k), color: palette.get(k) })) })
-									: null,
-								jsx(StackedBars, { columns, colors: palette, height: 52, label: t("tokensChart"), marker: true, xLabels: tickLabels }),
-							],
-						}),
+						children: [
+							tokenSeries.some((v) => v > 0)
+								? jsxs("div", {
+										style: { ...UI.col, gap: 5 },
+										children: [
+											sourceKeys.length > 1 || (sourceKeys.length === 1 && SOURCE_NAMES[sourceKeys[0]])
+												? jsx(Legend, { items: sourceKeys.map((k) => ({ label: sourceLabel(k), color: palette.get(k) })) })
+												: null,
+											jsx(StackedBars, { columns, colors: palette, height: 52, label: t("tokensChart"), marker: true, xLabels: tickLabels }),
+										],
+									}, "tokens")
+								: null,
+							messages.some((v) => v > 0)
+								? jsx(Section, { title: t("messagesChart"), children: jsx(Sparkline, { values: messages, height: 30, color: "var(--ui-purple)", label: t("messagesChart") }) }, "messages")
+								: null,
+						],
 					})
-				: null,
-			messages.some((v) => v > 0)
-				? jsx(Section, { title: t("messagesChart"), children: jsx(Sparkline, { values: messages, height: 30, color: "var(--ui-purple)", label: t("messagesChart") }) })
 				: null,
 			attention.length
 				? jsx(Section, {
@@ -3980,17 +4051,15 @@ function LiveView({ mon }) {
 									onClick: () => void openMonitorTarget(mon.scope, { sessionId: a.session_id, profile: a.profile, source: a.source }, snapshot),
 									children: [
 										jsxs("div", {
-											style: { ...UI.row, gap: 6 },
+											style: { ...UI.row, gap: 8, alignItems: "baseline" },
 											children: [
-												jsx(Dot, { color: attentionTone(a.kind), size: 6 }),
-												jsx("span", { style: { ...UI.text, fontWeight: 500, ...UI.ellipsis, flex: "1 1 auto" }, children: tr(`attention_${a.kind}`, a.profile || tr("agent")) }),
-												a.since ? jsx("span", { style: { ...UI.tiny, ...UI.num, flexShrink: 0 }, children: t("ago", fmtSpan(nowSec - Number(a.since))) }) : null,
+												jsx("span", { style: { ...UI.text, fontWeight: 600, ...UI.ellipsis, flex: "1 1 auto" }, children: a.title || t("untitled") }),
+												jsx(StatusWord, { color: attentionTone(a.kind), children: tr(`attention_${a.kind}`, a.profile || tr("agent")) }),
 											],
 										}),
 										jsx("div", {
-											style: { ...UI.meta, ...UI.ellipsis, paddingInlineStart: 12 },
-											title: a.title || undefined,
-											children: [a.title || t("untitled"), a.detail && a.detail !== "finished" ? a.detail : null].filter(Boolean).join(" · "),
+											style: { ...UI.meta, ...UI.ellipsis },
+											children: [a.detail && a.detail !== "finished" ? a.detail : null, a.since ? t("ago", fmtSpan(nowSec - Number(a.since))) : null].filter(Boolean).join(" · ") || "\u00a0",
 										}),
 									],
 								}, a.id || `${a.session_id}-${a.kind}`),
@@ -4063,23 +4132,65 @@ function HealthView({ mon }) {
 	const notSetUp = allAccounts.filter((a) => !accounts.includes(a)).map((a) => providerMeta(a.provider).name);
 	const chains = asList(health.chains).filter(Boolean);
 	const speed = asList(health.speed).filter(Boolean);
-	const counts = { bad: 0, warn: 0, good: 0 };
+	const counts = { bad: 0, warn: 0, good: 0, muted: 0 };
 	for (const m of models) {
 		const tone = modelTone(m.status);
 		if (tone in counts) counts[tone] += 1;
 	}
+	// Layout A: verdict strip, then models (the evidence), then accounts, chains, speed.
+	const modelsSection = jsx(Section, {
+		title: t("healthModels"),
+		sub: t("last24h"),
+		children: models.length
+			? jsx(List, {
+					children: models.map((m, i) => {
+						const rate = finiteNumber(m.error_rate);
+						const cooldown = isoToSeconds(m.cooldown_until);
+						const tone = modelTone(m.status);
+						return jsxs(Row, {
+							tone: tone === "bad" ? toneColor("bad") : undefined,
+							children: [
+								jsxs("div", {
+									style: { ...UI.row, gap: 8, alignItems: "baseline" },
+									children: [
+										jsx("span", { style: { ...UI.text, fontWeight: 600, flex: "1 1 auto", ...UI.ellipsis }, children: m.model }),
+										jsx(StatusWord, { color: toneText(tone), children: t(`modelStatus_${m.status || "idle"}`) }),
+									],
+								}),
+								jsx(MetaLine, {
+									parts: [
+										providerMeta(m.provider).name,
+										m.calls_24h != null ? t("callsN", m.calls_24h) : null,
+										rate != null ? t("errorRate", fmtNum(rate * 100, rate < 0.1 ? 1 : 0)) : null,
+										m.errors_24h ? t("errorsN", m.errors_24h) : null,
+										cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
+										m.recovered ? t("recovered") : null,
+									],
+								}),
+								m.last_error && m.last_error.summary && (m.errors_24h || tone !== "good")
+									? jsx("div", { style: { ...UI.faint, ...UI.ellipsis }, title: m.last_error.summary, children: `${isRtl() ? "↲" : "↳"} ${m.last_error.summary}` })
+									: null,
+							],
+						}, `${m.provider}-${m.model}-${i}`);
+					}),
+				})
+			: jsx(Empty, { children: t("none") }),
+	});
 	return jsxs(ViewStack, {
 		name: "health",
 		children: [
 			models.length
 				? jsxs(KpiGrid, {
+						min: 56,
 						children: [
 							jsx(Kpi, { label: t("modelStatus_ok"), value: String(counts.good), tone: counts.good ? toneColor("good") : undefined }, "ok"),
 							jsx(Kpi, { label: t("modelStatus_degraded"), value: String(counts.warn), tone: counts.warn ? toneColor("warn") : undefined }, "warn"),
 							jsx(Kpi, { label: t("modelStatus_failing"), value: String(counts.bad), tone: counts.bad ? toneColor("bad") : undefined }, "bad"),
+							jsx(Kpi, { label: t("modelStatus_idle"), value: String(counts.muted) }, "idle"),
 						],
 					})
 				: null,
+			modelsSection,
 			jsx(Section, {
 				title: t("healthAccounts"),
 				children: accounts.length
@@ -4092,7 +4203,7 @@ function HealthView({ mon }) {
 											children: [
 												jsx(ProviderBadge, { pid: a.provider }),
 												jsx("span", { style: { ...UI.text, fontWeight: 600, flex: "1 1 auto", ...UI.ellipsis }, children: providerMeta(a.provider).name }),
-												a.unavailable ? jsx(Pill, { color: "var(--ui-text-tertiary)", children: t("unavailable", a.unavailable_code || a.unavailable) }) : null,
+												a.unavailable ? jsx(StatusWord, { children: t("unavailable", a.unavailable_code || a.unavailable) }) : null,
 											],
 										}),
 										...asList(a.credentials).filter(Boolean).map((c, j) => {
@@ -4100,12 +4211,11 @@ function HealthView({ mon }) {
 											const locked = Boolean(c.locked) || c.status === "exhausted";
 											const tone = locked ? "bad" : c.status === "ok" ? "good" : "muted";
 											return jsxs("div", {
-												style: { ...UI.row, gap: 6, paddingInlineStart: 26 },
+												style: { ...UI.row, gap: 8, alignItems: "baseline", paddingInlineStart: 22 },
 												children: [
-													jsx(Dot, { color: toneColor(tone), size: 6 }),
 													jsx("span", { style: { ...UI.secondary, flex: "1 1 auto", ...UI.ellipsis }, children: c.label || c.account_key || t("credentialN", j + 1) }),
 													until && until > nowSec ? jsx("span", { style: { ...UI.tiny, flexShrink: 0 }, children: t("unlocksIn", fmtSpan(until - nowSec)) }) : null,
-													jsx(Pill, { color: toneText(tone), children: locked ? t("credLocked") : c.status || "—" }),
+													jsx(StatusWord, { color: toneText(tone), children: locked ? t("credLocked") : c.status || "—" }),
 												],
 											}, `${i}-${j}`);
 										}),
@@ -4117,48 +4227,6 @@ function HealthView({ mon }) {
 			}),
 			notSetUp.length ? jsx(Empty, { children: t("notSetUp", notSetUp.length, notSetUp.join(", ")) }) : null,
 			jsx(Section, {
-				title: t("healthModels"),
-				sub: t("last24h"),
-				children: models.length
-					? jsx(List, {
-							children: models.map((m, i) => {
-								const rate = finiteNumber(m.error_rate);
-								const cooldown = isoToSeconds(m.cooldown_until);
-								const tone = modelTone(m.status);
-								return jsxs(Row, {
-									tone: tone === "bad" ? toneColor("bad") : undefined,
-									children: [
-										jsxs("div", {
-											style: { ...UI.row, gap: 6 },
-											children: [
-												jsx(Dot, { color: toneColor(tone), size: 6 }),
-												jsx("span", { style: { ...UI.text, fontWeight: 500, flex: "1 1 auto", ...UI.ellipsis }, children: m.model }),
-												jsx(Pill, { color: toneText(tone), children: t(`modelStatus_${m.status || "idle"}`) }),
-											],
-										}),
-										jsx("div", {
-											style: { paddingInlineStart: 12 },
-											children: jsx(MetaLine, {
-												parts: [
-													providerMeta(m.provider).name,
-													m.calls_24h != null ? t("callsN", m.calls_24h) : null,
-													rate != null ? t("errorRate", fmtNum(rate * 100, rate < 0.1 ? 1 : 0)) : null,
-													m.errors_24h ? t("errorsN", m.errors_24h) : null,
-													cooldown && cooldown > nowSec ? t("cooldownFor", fmtSpan(cooldown - nowSec)) : null,
-													m.recovered ? t("recovered") : null,
-												],
-											}),
-										}),
-										m.last_error && m.last_error.summary && (m.errors_24h || tone !== "good")
-											? jsx("div", { style: { ...UI.faint, ...UI.ellipsis, paddingInlineStart: 12 }, title: m.last_error.summary, children: `${isRtl() ? "↲" : "↳"} ${m.last_error.summary}` })
-											: null,
-									],
-								}, `${m.provider}-${m.model}-${i}`);
-							}),
-						})
-					: jsx(Empty, { children: t("none") }),
-			}),
-			jsx(Section, {
 				title: t("healthChains"),
 				children: chains.length
 					? jsx(List, {
@@ -4166,21 +4234,21 @@ function HealthView({ mon }) {
 								jsxs(Row, {
 									children: [
 										jsxs("div", {
-											style: { ...UI.row, gap: 6 },
+											style: { ...UI.row, gap: 8, alignItems: "baseline" },
 											children: [
 												jsx("span", { style: { ...UI.text, fontWeight: 600, flexShrink: 0 }, children: c.profile }),
-												jsx(Dot, { color: toneColor(modelTone(c.status)), size: 6 }),
-												jsx("span", { style: { ...UI.secondary, ...UI.ellipsis }, children: c.model }),
+												jsx("span", { style: { ...UI.secondary, ...UI.ellipsis, flex: "1 1 auto" }, children: c.model }),
+												jsx(StatusWord, { color: toneText(modelTone(c.status)), children: t(`modelStatus_${c.status || "idle"}`) }),
 											],
 										}),
 										asList(c.fallbacks).length
 											? asList(c.fallbacks).map((f, j) => {
 													const tone = f.state === "skip" ? "muted" : f.state === "risky" ? "warn" : "good";
 													return jsxs("div", {
-														style: { display: "flex", flexWrap: "wrap", alignItems: "center", gap: "2px 6px", paddingInlineStart: 12, minWidth: 0 },
+														style: { display: "flex", flexWrap: "wrap", alignItems: "baseline", justifyContent: "space-between", columnGap: 8, rowGap: 0, minWidth: 0 },
 														children: [
-															jsx("span", { style: { ...UI.meta, overflowWrap: "anywhere" }, children: `${arrowFwd()} ${f.model} (${providerMeta(f.provider).name})` }),
-															jsx(Pill, {
+															jsx("span", { style: { ...UI.meta, overflowWrap: "anywhere", minWidth: 0 }, children: `${arrowFwd()} ${f.model} (${providerMeta(f.provider).name})` }),
+															jsx(StatusWord, {
 																color: toneText(tone),
 																children:
 																	f.state === "skip"
@@ -4192,7 +4260,7 @@ function HealthView({ mon }) {
 														],
 													}, j);
 												})
-											: jsx("div", { style: { ...UI.faint, paddingInlineStart: 12 }, children: t("noFallbacks") }),
+											: jsx("div", { style: UI.faint, children: t("noFallbacks") }),
 									],
 								}, `${c.profile}-${i}`),
 							),
@@ -4322,22 +4390,6 @@ function UsageView({ mon }) {
 	return jsxs(ViewStack, {
 		name: "usage",
 		children: [
-			daily > 0 || monthly > 0
-				? jsx("div", {
-						style: { ...UI.card, padding: "10px 12px" },
-						children: jsx(Section, {
-							title: t("budgetTitle"),
-							sub: t("budgetSub"),
-							children: jsxs("div", {
-								style: { ...UI.col, gap: 10 },
-								children: [
-									jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }),
-									jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly }),
-								],
-							}),
-						}),
-					})
-				: jsx(Empty, { children: t("budgetHint") }),
 			jsxs(KpiGrid, {
 				children: [
 					jsx(Kpi, { label: t("costToday"), value: fmtUsd(u.today), sub: u.todayTokens != null ? t("tokensN", fmtTokens(u.todayTokens)) : null }, "today"),
@@ -4345,6 +4397,19 @@ function UsageView({ mon }) {
 					jsx(Kpi, { label: t("last7Days"), value: fmtUsd(weekTotal), sub: t("dailyAvg", fmtUsd(avg)) }, "week"),
 				],
 			}),
+			daily > 0 || monthly > 0
+				? jsx(Section, {
+						title: t("budgetTitle"),
+						sub: t("budgetSub"),
+						children: jsxs("div", {
+							style: { ...UI.col, gap: 8 },
+							children: [
+								jsx(BudgetBar, { label: t("budgetDaily"), spent: u.today, limit: daily }),
+								jsx(BudgetBar, { label: t("budgetMonthly"), spent: u.mtd, limit: monthly }),
+							],
+						}),
+					})
+				: jsx(Empty, { children: t("budgetHint") }),
 			jsx(Section, {
 				title: t("dailyChart"),
 				sub: fmtUsd(weekTotal),
@@ -4353,11 +4418,36 @@ function UsageView({ mon }) {
 					children: [
 						keys.length > 1 ? jsx(Legend, { items: keys.map((k) => ({ label: sourceLabel(k), color: palette.get(k) })) }) : null,
 						jsx(StackedBars, { columns, colors: palette, height: 64, label: t("last7Days"), xLabels: u.last7.map((d) => weekday(d.day)) }),
+						// Exact values for the chart (layout A: behind disclosure, never dropped).
+						jsx(Disclosure, {
+							id: "chart-values",
+							label: t("chartValues"),
+							children: jsx("div", {
+								role: "table",
+								style: { ...UI.col, minWidth: 0 },
+								children: u.last7.map((d) =>
+									jsxs("div", {
+										role: "row",
+										style: { display: "flex", justifyContent: "space-between", gap: 8, ...UI.meta, ...UI.num, padding: "2px 0", borderBottom: "1px solid var(--ui-stroke-tertiary)" },
+										children: [
+											jsx("span", { role: "cell", children: `${weekday(d.day)} · ${d.day}` }),
+											jsx("span", { role: "cell", style: { color: "var(--ui-text-secondary)" }, children: fmtUsd(d.cost) }),
+										],
+									}, d.day),
+								),
+							}),
+						}),
 					],
 				}),
 			}),
-			jsx(TopList, { title: t("topModels"), rows: models }),
-			jsx(TopList, { title: t("topProfiles"), rows: profiles, color: "var(--ui-purple)" }),
+			jsxs("div", {
+				"data-usage-breakdown": true,
+				style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: "14px 20px", minWidth: 0 },
+				children: [
+					jsx(TopList, { title: t("topModels"), rows: models }, "models"),
+					jsx(TopList, { title: t("topProfiles"), rows: profiles, color: "var(--ui-purple)" }, "profiles"),
+				],
+			}),
 			jsx(TopList, { title: t("topSessions"), rows: sessions, color: "var(--ui-cyan)", onPick: (pick) => void openMonitorTarget(mon.scope, pick, snapshot) }),
 			jsx("div", { style: UI.tiny, children: t("costEstimateNote") }),
 			jsx(SectionError, { snapshot, section: "usage" }),
@@ -4404,36 +4494,53 @@ function KanbanView({ mon }) {
 							sub: countLine,
 							children: any
 								? jsx("div", {
-										style: { ...UI.col, gap: 10 },
+										"data-kanban-lanes": true,
+										style: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "12px 16px", minWidth: 0 },
 										children: KANBAN_GROUPS.filter((g) => grouped[g].length).map((g) =>
 											jsxs("div", {
-												style: { ...UI.col, gap: 5 },
+												style: { ...UI.col, gap: 2, minWidth: 0 },
 												"data-kanban-group": g,
 												children: [
-													jsx("div", { children: jsx(Pill, { color: KANBAN_COLORS[g], dot: true, children: `${t(`kanbanGroup_${g}`)} · ${grouped[g].length}` }) }),
-													jsx(List, {
-														children: grouped[g].map((card) =>
-															jsxs(Row, {
-																tone: g === "failing" || g === "blocked" ? KANBAN_COLORS[g] : undefined,
-																title: card.open && card.open.command ? t("copyCommandTip", card.open.command) : undefined,
-																onClick: card.open && card.open.command ? () => void copyCommand(card.open.command) : undefined,
-																children: [
-																	jsx("span", { style: { ...UI.text, fontWeight: 500, lineHeight: 1.35 }, children: card.title || card.id }),
-																	jsx(MetaLine, {
-																		parts: [
-																			card.assignee || t("unassigned"),
-																			card.block_kind === "needs_input" ? t("cardWhat_input") : null,
-																			finiteNumber(card.consecutive_failures) ? t("failuresN", card.consecutive_failures) : null,
-																			card.id,
-																		],
-																	}),
-																	card.last_failure_error && g === "failing"
-																		? jsx("div", { style: { ...UI.faint, ...UI.ellipsis }, title: card.last_failure_error, children: `↳ ${card.last_failure_error}` })
-																		: null,
-																],
-															}, card.id),
-														),
+													jsx("div", {
+														"data-lane-head": true,
+														style: { ...UI.meta, color: "var(--ui-text-secondary)", paddingBottom: 4, borderBottom: "1px solid var(--ui-stroke-tertiary)" },
+														children: `${t(`kanbanGroup_${g}`)} · ${grouped[g].length}`,
 													}),
+													...grouped[g].map((card) =>
+														jsxs("div", {
+															"data-row": true,
+															style: { ...UI.col, gap: 2, padding: "7px 0", borderBottom: "1px solid var(--ui-stroke-tertiary)", minWidth: 0, overflowWrap: "anywhere" },
+															children: [
+																jsx("span", { style: { ...UI.text, fontWeight: 600, lineHeight: 1.35 }, children: card.title || card.id }),
+																jsx(MetaLine, {
+																	parts: [
+																		card.assignee || t("unassigned"),
+																		card.id,
+																	],
+																}),
+																jsx(MetaLine, {
+																	parts: [
+																		card.block_kind === "needs_input" ? t("cardWhat_input") : null,
+																		finiteNumber(card.consecutive_failures) ? t("failuresN", card.consecutive_failures) : null,
+																	].map((p) => (p ? jsx("span", { style: { color: KANBAN_COLORS[g] }, children: p }) : p)),
+																}),
+																card.last_failure_error && g === "failing"
+																	? jsx("div", { style: { ...UI.faint, ...UI.ellipsis }, title: card.last_failure_error, children: `↳ ${card.last_failure_error}` })
+																	: null,
+																card.open && card.open.command
+																	? jsx("button", {
+																			type: "button",
+																			"data-card-copy": card.id,
+																			className: "cursor-pointer hover:text-foreground",
+																			title: t("copyCommandTip", card.open.command),
+																			onClick: () => void copyCommand(card.open.command),
+																			style: { alignSelf: "flex-start", border: 0, padding: 0, background: "transparent", ...UI.meta, color: "var(--ui-text-secondary)", textDecoration: "underline", textUnderlineOffset: 2 },
+																			children: t("cardCopyCommand"),
+																		})
+																	: null,
+															],
+														}, card.id),
+													),
 												],
 											}, g),
 										),
@@ -4502,6 +4609,12 @@ const STATUSBAR_CSS = [
 	".qm-sb-chip:focus-visible,.qm-sb-row:focus-visible{outline:1px solid var(--ui-accent);outline-offset:-1px}",
 	// A row's "open" / "copy" hint shows on hover or keyboard focus only.
 	".qm-sb-act{opacity:0;transition:opacity .12s}.qm-sb-row:hover .qm-sb-act,.qm-sb-row:focus-visible .qm-sb-act{opacity:1}",
+	// Layout A disclosures: hide the native marker, rotate our chevron when open.
+	"details[data-disclosure]>summary,details[data-settings-card]>summary{list-style:none}",
+	"details[data-disclosure]>summary::-webkit-details-marker,details[data-settings-card]>summary::-webkit-details-marker{display:none}",
+	".qm-sb-chev{display:inline-block;transition:transform .12s}details[open]>summary .qm-sb-chev{transform:rotate(90deg)}",
+	"[dir=rtl] details[open]>summary .qm-sb-chev{transform:rotate(-90deg)}",
+	"@media (prefers-reduced-motion:reduce){.qm-sb-chev{transition:none}}",
 ].join("\n");
 
 /** Injects the chip keyframes once (idempotent; hot reload replaces the text). */
@@ -5349,21 +5462,17 @@ function QuotaCardWindow({ w, nowMs }) {
 	const tone = toneForRemaining(r);
 	const label = w.label || "window";
 	const reset = w.reset_at ? relativeCountdown(w.reset_at, nowMs) : "";
+	// Same compact-row grammar as the pane: label · exact value · bar · reset.
 	return jsxs("div", {
 		"data-card-window": label,
+		"data-window-bar": r,
 		title: [label, r == null ? "—" : `${fmtPct(r)} ${t("left")}`, reset ? t("popoverReset", reset) : ""].filter(Boolean).join(" · "),
-		style: { ...UI.col, alignItems: "center", gap: 2, width: 84 },
+		style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "2px 8px", minWidth: 0 },
 		children: [
-			jsx(Ring, {
-				value: r,
-				tone,
-				size: 32,
-				stroke: 3,
-				label: `${label} ${r == null ? "—" : `${fmtPct(r)} ${t("left")}`}`,
-				children: jsx("span", { style: { fontSize: 9, fontWeight: 650, color: "var(--ui-text-primary)", ...UI.num }, children: r == null ? "—" : fmtPct(r) }),
-			}),
-			jsx("span", { style: { ...UI.tiny, color: "var(--ui-text-secondary)", textAlign: "center", lineHeight: 1.2, maxWidth: "100%", ...UI.ellipsis }, children: label }),
-			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, lineHeight: 1.1 }, children: `↻ ${reset}` }) : null,
+			jsx("span", { style: { ...UI.meta, color: "var(--ui-text-secondary)", ...UI.ellipsis }, children: label }, "label"),
+			jsx("span", { style: { ...UI.num, fontSize: "0.6875rem", fontWeight: 600, color: "var(--ui-text-primary)", whiteSpace: "nowrap" }, children: r == null ? "—" : fmtPct(r) }, "value"),
+			jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r, tone }) }, "bar"),
+			reset ? jsx("span", { style: { ...UI.tiny, ...UI.num, gridColumn: "1 / -1", lineHeight: 1.1 }, children: `↻ ${reset}` }, "reset") : null,
 		],
 	});
 }
@@ -5377,8 +5486,12 @@ function QuotaCard({ close }) {
 	const forecastOn = useValue(quotaForecastAtom);
 	const nowMs = useNow(30_000);
 	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
+	// Same visibility rule as the status bar: a failed saved account keeps its
+	// slot (with its reason) so every account is reachable here without any
+	// selection; only never-configured rows stay hidden.
 	const entries = providerEntries(data && data.providers).filter(
-		([pid, p]) => isProviderEnabled(pid) && isConfigured(p) && (asWindowList(p.windows).length || accountFacts(p).balances.length),
+		([pid, p]) => isProviderEnabled(pid) && p && !isUnconfigured(p)
+			&& (isNoData(p) || asWindowList(p.windows).length || accountFacts(p).balances.length),
 	);
 	const toQuota = () => {
 		close();
@@ -5415,8 +5528,11 @@ function QuotaCard({ close }) {
 									p.plan ? jsx(Pill, { color: "var(--ui-text-tertiary)", children: p.plan }) : null,
 								],
 							}),
+							p.unavailable_reason
+								? jsx("span", { "data-card-unavailable": "", style: { ...UI.meta, overflowWrap: "anywhere" }, children: t("unavailable", p.unavailable_reason) })
+								: null,
 							windows.length
-								? jsx("div", { style: { display: "flex", flexWrap: "wrap", gap: "8px 4px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
+								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
 							...forecasts.map(({ w, f }, j) =>
@@ -5650,11 +5766,12 @@ function MonitorSettings() {
 	for (const kind of NOTIFY_KINDS) notify[kind] = useValue(notifyAtoms[kind]);
 	return jsxs("div", {
 		"data-monitor-settings": true,
-		style: { ...UI.col, gap: 10 },
+		style: { ...UI.col, gap: 0 },
 		children: [
 			jsxs(SettingsCard, {
 				icon: "Activity",
 				title: t("monitorSettingsTitle"),
+				note: t("settingsNoteMonitor"),
 				children: [
 					jsx(SettingSwitch, { label: t("monitorEnabledLabel"), hint: t("monitorEnabledHint"), checked: enabled, onChange: (v) => setStored(MONITOR_ENABLED_KEY, !!v, monitorEnabledAtom) }, "on"),
 					jsx(SettingSwitch, { label: t("accountsTabLabel"), hint: t("accountsTabHint"), checked: accountsTab, onChange: (v) => setStored(ACCOUNTS_TAB_KEY, !!v, accountsTabAtom) }, "accounts"),
@@ -5686,6 +5803,7 @@ function MonitorSettings() {
 			jsxs(SettingsCard, {
 				icon: "BarChart3",
 				title: t("budgetTitle"),
+				note: t("settingsNoteBudget"),
 				footer: t("budgetSettingsHint"),
 				children: [
 					jsx(BudgetInput, { label: t("budgetDaily"), kind: "daily" }, "daily"),
@@ -5695,6 +5813,7 @@ function MonitorSettings() {
 			jsx(SettingsCard, {
 				icon: "Bell",
 				title: t("notificationsTitle"),
+				note: t("settingsNoteNotifications"),
 				footer: t("notificationsHint"),
 				children: NOTIFY_KINDS.map((kind) =>
 					jsx(SettingSwitch, {
@@ -6079,6 +6198,33 @@ function AccountRing({ windows, size = 30 }) {
 
 const ACCOUNT_STATUS_COLOR = { active: "var(--ui-green)", cooldown: "var(--ui-yellow)", exhausted: "var(--ui-red)" };
 
+// Layout A: every quota window of a saved account, in the pane's compact
+// bar grammar. Display only — showing an account never switches it.
+function AccountWindows({ windows }) {
+	const t = useQT();
+	const list = asList(windows).filter((w) => w && w.label);
+	if (!list.length) return null;
+	return jsx("div", {
+		"data-account-windows": true,
+		style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", gap: "3px 10px", minWidth: 0 },
+		children: list.map((w, i) => {
+			const used = finiteNumber(w.used);
+			const left = used == null ? null : Math.max(0, Math.min(100, Math.round(100 - used)));
+			return jsxs("div", {
+				"data-account-window": w.label,
+				"data-window-bar": left,
+				title: left == null ? `${w.label}: —` : t("accountsRingLabel", w.label, left),
+				style: { display: "grid", gridTemplateColumns: "minmax(0, 1fr) auto", alignItems: "center", gap: "1px 6px", minWidth: 0 },
+				children: [
+					jsx("span", { style: { ...UI.tiny, ...UI.ellipsis }, children: w.label }, "l"),
+					jsx("span", { style: { ...UI.tiny, ...UI.num, color: left == null ? "var(--ui-text-quaternary)" : "var(--ui-text-secondary)" }, children: left == null ? "—" : `${left}%` }, "v"),
+					jsx("span", { style: { gridColumn: "1 / -1" }, children: jsx(WindowBar, { r: left, tone: toneForRemaining(left) }) }, "b"),
+				],
+			}, `${w.label}-${i}`);
+		}),
+	});
+}
+
 function AccountStatus({ row, nowSec }) {
 	const t = useQT();
 	const until = finiteNumber(row.status_until);
@@ -6186,7 +6332,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 			jsx("span", { style: { ...UI.tiny, ...UI.num, width: 12, flexShrink: 0, textAlign: "end" }, children: String(index + 1) }, "n"),
 			jsx(AccountRing, { windows: row.windows, size: page ? 32 : 28 }, "ring"),
 			jsxs("div", {
-				style: { ...UI.col, gap: 3, flex: "1 1 auto" },
+				style: { ...UI.col, gap: 3, flex: "1 1 auto", minWidth: 0 },
 				children: [
 					jsxs("div", {
 						style: { ...UI.row, gap: 6, flexWrap: "wrap" },
@@ -6204,6 +6350,7 @@ function AccountRow({ ctl, pool, row, index, count, firstActive, nowSec, page })
 							page && row.id ? jsx("span", { style: { ...UI.tiny, fontFamily: "var(--dt-font-mono)" }, children: row.id }, "id") : null,
 						],
 					}, "meta"),
+					jsx(AccountWindows, { windows: row.windows }, "windows"),
 				],
 			}, "body"),
 			jsxs("div", {
@@ -7379,7 +7526,7 @@ const I18N_EN = {
 	budgetSub: "estimated API cost",
 	settingsGroupStatusBar: "Status bar & sidebar",
 	settingsGroupQuota: "Quota view",
-	subagentsN: (n) => `${n} subagents running`,
+	subagentsN: (n) => (n === 1 ? "1 subagent running" : `${n} subagents running`),
 	// ---- context guard ----
 	ctxChipOthers: (n, w) => `${n} ${n === 1 ? "session" : "sessions"} ≥ ${w}%`,
 	ctxChipAria: (pct) => `Context ${pct}% full`,
@@ -7415,6 +7562,14 @@ const I18N_EN = {
 	notifyContextBody: "compress it (/compress) or start a new chat",
 	navContext: (pct) => `ctx ${pct}%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Chart values",
+	cardCopyCommand: "Copy command",
+	settingsNoteStatusBar: "Named accounts, explicit overflow",
+	settingsNoteQuota: "Dock, density, reset and refresh",
+	settingsNoteProviders: "Sources shown",
+	settingsNoteMonitor: "Opt-in, separate from quotas",
+	settingsNoteBudget: "Alerts only, never blocks",
+	settingsNoteNotifications: "System permission still required",
 	_locale: "en",
 	navLabel: "Quota",
 	resetToday: (time) => `today ${time}`,
@@ -7847,6 +8002,14 @@ const I18N_TR = {
 	notifyContextBody: "sıkıştır (/compress) ya da yeni sohbet aç",
 	navContext: (pct) => `bağlam %${pct}`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Grafik değerleri",
+	cardCopyCommand: "Komutu kopyala",
+	settingsNoteStatusBar: "Adlandırılmış hesaplar, açık taşma",
+	settingsNoteQuota: "Panel, yoğunluk, sıfırlama ve yenileme",
+	settingsNoteProviders: "Gösterilen kaynaklar",
+	settingsNoteMonitor: "İsteğe bağlı, kotalardan ayrı",
+	settingsNoteBudget: "Yalnızca uyarı, asla engellemez",
+	settingsNoteNotifications: "Sistem izni yine gerekli",
 	_locale: "tr",
 	navLabel: "Kota",
 	resetToday: (time) => `bugün ${time}`,
@@ -8301,6 +8464,14 @@ const I18N_DE = {
 	notifyContextBody: "komprimieren (/compress) oder einen neuen Chat beginnen",
 	navContext: (pct) => `Kontext ${pct}\u00a0%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Diagrammwerte",
+	cardCopyCommand: "Befehl kopieren",
+	settingsNoteStatusBar: "Benannte Konten, sichtbarer Überlauf",
+	settingsNoteQuota: "Seitenleiste, Dichte, Reset und Aktualisierung",
+	settingsNoteProviders: "Angezeigte Quellen",
+	settingsNoteMonitor: "Opt-in, getrennt von den Kontingenten",
+	settingsNoteBudget: "Nur Warnungen, blockiert nie",
+	settingsNoteNotifications: "Systemberechtigung weiterhin nötig",
 	_locale: "de",
 	navLabel: "Kontingent",
 	resetToday: (time) => `heute ${time}`,
@@ -8733,6 +8904,14 @@ const I18N_ES = {
 	notifyContextBody: "comprímelo (/compress) o empieza un chat nuevo",
 	navContext: (pct) => `ctx ${pct}\u00a0%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Valores del gráfico",
+	cardCopyCommand: "Copiar comando",
+	settingsNoteStatusBar: "Cuentas con nombre, desbordamiento explícito",
+	settingsNoteQuota: "Panel, densidad, reinicio y actualización",
+	settingsNoteProviders: "Fuentes mostradas",
+	settingsNoteMonitor: "Opcional, separado de las cuotas",
+	settingsNoteBudget: "Solo avisos, nunca bloquea",
+	settingsNoteNotifications: "Sigue haciendo falta el permiso del sistema",
 	_locale: "es",
 	navLabel: "Cuota",
 	resetToday: (time) => `hoy ${time}`,
@@ -9165,6 +9344,14 @@ const I18N_FR = {
 	notifyContextBody: "compressez-le (/compress) ou ouvrez un nouveau chat",
 	navContext: (pct) => `ctx ${pct}\u00a0%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Valeurs du graphique",
+	cardCopyCommand: "Copier la commande",
+	settingsNoteStatusBar: "Comptes nommés, dépassement explicite",
+	settingsNoteQuota: "Panneau, densité, réinitialisation et actualisation",
+	settingsNoteProviders: "Sources affichées",
+	settingsNoteMonitor: "Facultatif, distinct des quotas",
+	settingsNoteBudget: "Alertes seulement, ne bloque jamais",
+	settingsNoteNotifications: "Autorisation système toujours requise",
 	_locale: "fr",
 	navLabel: "Quota",
 	resetToday: (time) => `aujourd'hui ${time}`,
@@ -9597,6 +9784,14 @@ const I18N_RU = {
 	notifyContextBody: "сожмите его (/compress) или начните новый чат",
 	navContext: (pct) => `контекст ${pct}\u00a0%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "Значения графика",
+	cardCopyCommand: "Копировать команду",
+	settingsNoteStatusBar: "Названные аккаунты, явное переполнение",
+	settingsNoteQuota: "Панель, плотность, сброс и обновление",
+	settingsNoteProviders: "Показываемые источники",
+	settingsNoteMonitor: "По желанию, отдельно от квот",
+	settingsNoteBudget: "Только предупреждения, без блокировки",
+	settingsNoteNotifications: "Нужно разрешение системы",
 	_locale: "ru",
 	navLabel: "Квоты",
 	resetToday: (time) => `сегодня в ${time}`,
@@ -10029,6 +10224,14 @@ const I18N_JA = {
 	notifyContextBody: "圧縮する（/compress）か新しいチャットを始めてください",
 	navContext: (pct) => `コンテキスト ${pct}%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "グラフの値",
+	cardCopyCommand: "コマンドをコピー",
+	settingsNoteStatusBar: "アカウント名を表示し、超過分を明示",
+	settingsNoteQuota: "パネル、密度、リセット、更新",
+	settingsNoteProviders: "表示するソース",
+	settingsNoteMonitor: "任意。クォータとは別",
+	settingsNoteBudget: "通知のみで、ブロックしません",
+	settingsNoteNotifications: "システムの許可が引き続き必要",
 	_locale: "ja",
 	navLabel: "クォータ",
 	resetToday: (time) => `今日 ${time}`,
@@ -10461,6 +10664,14 @@ const I18N_ZH = {
 	notifyContextBody: "压缩它（/compress）或开始新的聊天",
 	navContext: (pct) => `上下文 ${pct}%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "图表数值",
+	cardCopyCommand: "复制命令",
+	settingsNoteStatusBar: "显示账号名称，明确标出溢出",
+	settingsNoteQuota: "侧栏、密度、重置与刷新",
+	settingsNoteProviders: "显示的来源",
+	settingsNoteMonitor: "可选，与配额分开",
+	settingsNoteBudget: "仅提醒，从不阻止",
+	settingsNoteNotifications: "仍需系统权限",
 	_locale: "zh",
 	navLabel: "额度",
 	resetToday: (time) => `今天 ${time}`,
@@ -10893,6 +11104,14 @@ const I18N_ZH_HANT = {
 	notifyContextBody: "壓縮它（/compress）或開始新的聊天",
 	navContext: (pct) => `上下文 ${pct}%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "圖表數值",
+	cardCopyCommand: "複製指令",
+	settingsNoteStatusBar: "顯示帳號名稱，明確標出溢出",
+	settingsNoteQuota: "側欄、密度、重設與重新整理",
+	settingsNoteProviders: "顯示的來源",
+	settingsNoteMonitor: "可選，與配額分開",
+	settingsNoteBudget: "僅提醒，從不阻擋",
+	settingsNoteNotifications: "仍需系統權限",
 	_locale: "zh-hant",
 	navLabel: "額度",
 	resetToday: (time) => `今天 ${time}`,
@@ -11325,6 +11544,14 @@ const I18N_AR = {
 	notifyContextBody: "اضغطه (/compress) أو ابدأ محادثة جديدة",
 	navContext: (pct) => `السياق ${pct}%`,
 	// ---- locale-aware formatting + status-bar tooltips ----
+	chartValues: "قيم الرسم البياني",
+	cardCopyCommand: "نسخ الأمر",
+	settingsNoteStatusBar: "حسابات بأسمائها مع إظهار الفائض",
+	settingsNoteQuota: "اللوحة والكثافة وإعادة التعيين والتحديث",
+	settingsNoteProviders: "المصادر المعروضة",
+	settingsNoteMonitor: "اختياري ومنفصل عن الحصص",
+	settingsNoteBudget: "تنبيهات فقط ولا يمنع أبدًا",
+	settingsNoteNotifications: "ما زال إذن النظام مطلوبًا",
 	_locale: "ar",
 	navLabel: "الحصة",
 	resetToday: (time) => `اليوم ${time}`,

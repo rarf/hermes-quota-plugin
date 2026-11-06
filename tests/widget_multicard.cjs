@@ -107,10 +107,16 @@ function renderWidget(options = {}) {
   };
   const before = runPass();
   const beforeButtons = cardButtons(before);
-  const labels = beforeButtons.map(nodeText);
-  const tones = beforeButtons.map(
-    (b) => b.props.children.find((c) => c && c.props && c.props['data-tone']).props['data-tone'],
-  );
+  // Layout A: the pane renders every saved account as its own row
+  // ([data-account] + [data-account-tone]); no selection buttons exist.
+  // Label/tone contracts read those rows, falling back to card buttons.
+  const accountRows = [...walk(before)].filter((n) => n.props && typeof n.props['data-account'] === 'string');
+  const labels = accountRows.length ? accountRows.map((n) => n.props['data-account']) : beforeButtons.map(nodeText);
+  const tones = accountRows.length
+    ? accountRows.map((n) => n.props['data-account-tone'])
+    : beforeButtons.map(
+        (b) => b.props.children.find((c) => c && c.props && c.props['data-tone']).props['data-tone'],
+      );
   const pressed = beforeButtons.map((b) => b.props['aria-pressed'] === true);
   let after = null;
   let pressedAfter = null;

@@ -4,6 +4,10 @@
 
 See provider quotas, reset times and account balances in Hermes Desktop and the CLI—without adding network calls to every UI render.
 
+**3.1 redesigns the Desktop views:** every saved account and quota window is
+visible at once as compact rows with bars, and the status bar names the
+limiting account with an explicit `+N`.
+
 **3.0 adds Agent Monitor:** an opt-in view of live Hermes sessions, context usage,
 model health, usage estimates and quota history inside Desktop. No separate
 monitoring server. Existing quota views remain available without enrollment.
@@ -95,7 +99,7 @@ Additional accounts are explicitly configured by directory and display label. La
 
 ## Privacy and security
 
-Extra Claude accounts are opt-in and read-only: no refresh-token exchange, credential write-back or tokens in the display cache. Requests identify this plugin rather than Claude Code. Primary-account resolution remains Hermes-core behavior. Other providers may use opt-in browser/OS credential-store reads and vendor client identities; see [provider disclosures](docs/providers.md). Python plugins are trusted host code, not sandboxed applications. **Catalog limitation (3.0.1):** existing provider credential readers and OAuth handling do not meet current Hermes catalog rule 11, which requires Hermes-managed credential routes and prohibits direct credential-store reads, OAuth refresh and vendor-client impersonation. Disclosure or opt-in does not waive that rule. This bugfix release does not migrate those integrations or establish eligibility for a new catalog pin. [Security details and limitations](docs/security.md).
+Extra Claude accounts are opt-in and read-only: no refresh-token exchange, credential write-back or tokens in the display cache. Requests identify this plugin rather than Claude Code. Primary-account resolution remains Hermes-core behavior. Other providers may use opt-in browser/OS credential-store reads and vendor client identities; see [provider disclosures](docs/providers.md). Python plugins are trusted host code, not sandboxed applications. **Catalog rule 11:** some provider integrations read vendor credential stores directly, use vendor OAuth handling or vendor client identities instead of Hermes-managed credential routes. They stay opt-in and disclosed, and 3.1.0 does not change them; whether that is acceptable for a catalog pin is for the catalog reviewers to decide. [Security details and limitations](docs/security.md).
 
 ## Grok authentication
 
