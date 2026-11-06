@@ -476,6 +476,20 @@ class MonitorNotificationTest(unittest.TestCase):
         self.assertEqual(out['value'][3], 3)  # needs-input + review + failing; running/done are not alerts
 
 
+    def test_unusable_provider_windows_do_not_raise_quota_notifications(self):
+        provider = {
+            'windows': [{'label': 'Session', 'used_percent': 99, 'reset_at': iso(600)}],
+            'access_state': 'unavailable',
+            'api_calls_available': None,
+        }
+        expr = '''(() => {
+          const p = PROVIDER;
+          const r = monitorNotifications({snapshot: SNAP, providers: {'anthropic:work': p}, settings: {}}, {}, NOW);
+          return r.notes.filter((n) => n.kind === 'quota' || n.kind === 'soon').length;
+        })()'''.replace('SNAP', json.dumps(snapshot())).replace(
+            'PROVIDER', json.dumps(provider)).replace('NOW', repr(NOW))
+        self.assertEqual(0, run(expr=expr)['value'])
+
 def _react_available():
     return all((ROOT / 'node_modules' / m).is_dir() for m in ('react', 'react-dom', '@babel/core', '@babel/preset-env'))
 

@@ -111,7 +111,7 @@ const factory = new Function(
   "CTX",
   "setTimeout",
   "clearTimeout",
-  `${source.slice(start, end)}\nreturn { CLI_TIMEOUT_MS, normalizeQuotaScope, parseJsonOutput, quotaQueryKey, readSnapshot, writeSnapshot, quotaCli, refreshQuotaCache, refreshFocusedQuota: typeof refreshFocusedQuota === "function" ? refreshFocusedQuota : undefined };`,
+  `${source.slice(start, end)}\nreturn { CLI_TIMEOUT_MS, normalizeQuotaScope, parseJsonOutput, quotaQueryKey, readSnapshot, writeSnapshot, quotaCli, refreshQuotaCache, invalidateQuotaSurfaces, refreshFocusedQuota: typeof refreshFocusedQuota === "function" ? refreshFocusedQuota : undefined };`,
 );
 const api = factory(host, CTX, setTimeout, clearTimeout);
 const invalidated = [];
@@ -123,6 +123,7 @@ const mutationConfig = new Function(
   "CLI_TIMEOUT_MS",
   "quotaQueryKey",
   "qc",
+  "invalidateQuotaSurfaces",
   `return (${extractObjectAfter("const refresh = useMutation(")});`,
 )(
   api.refreshFocusedQuota,
@@ -132,6 +133,7 @@ const mutationConfig = new Function(
   api.CLI_TIMEOUT_MS,
   api.quotaQueryKey,
   { invalidateQueries: (request) => invalidated.push(request.queryKey) },
+  api.invalidateQuotaSurfaces,
 );
 const useQuotaStart = source.indexOf("function useQuota()");
 const useQuotaEnd = source.indexOf("\n// ---- single worst chip", useQuotaStart);
@@ -480,7 +482,10 @@ class WidgetProfileRoutingTests(unittest.TestCase):
         self.assertEqual("remote-a", call["route"]["connectionId"])
         self.assertEqual({"spawnPriority": "foreground"}, call["options"])
         self.assertEqual(
-            [["quota", "widget", "remote-a", "shared"]],
+            [
+                ["quota", "widget", "remote-a", "shared"],
+                ["quota", "billing", "remote-a", "shared"],
+            ],
             self.result["invalidated"],
         )
 

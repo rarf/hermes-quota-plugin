@@ -23,6 +23,10 @@ import os
 import re
 import stat
 import sys
+import contextvars
+import inspect
+import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -31,6 +35,7 @@ from typing import Any, Optional
 
 from .base import (
     GENERATED_ACCOUNT_ID_PREFIX,
+    AccountBalance,
     Deadline,
     QuotaAccount,
     QuotaResult,
@@ -1113,6 +1118,375 @@ def _nous_claim(account_info, name):
     return claims.get(name) if isinstance(claims, dict) else None
 
 
+#: Display-safe claims from the local OAuth JWT snapshot. The old master card
+#: read these directly; the fresh account-API snapshot does not carry them.
+#: Entitlement claims are deliberately excluded: the Billing/account snapshot
+#: owns plan and access state, and a stale paid claim must never override it.
+_NOUS_MASTER_CLAIM_NAMES = (
+    "rate_limit_rpm",
+    "rate_limit_tpm",
+    "rate_limit_rph",
+    "member_spend_usd",
+    "member_spend_cap_usd",
+)
+
+
+def _nous_master_claims(account_info) -> dict:
+    """Only the old card's display-safe rate/spend claims, or an empty map."""
+    claims = getattr(account_info, "raw_claims", None)
+    if not isinstance(claims, dict):
+        return {}
+    return {
+        name: claims[name]
+        for name in _NOUS_MASTER_CLAIM_NAMES
+        if name in claims
+    }
+
+
+def _nous_identity_text(value) -> Optional[str]:
+    """A non-empty identity string, or ``None`` when the value proves nothing."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    if isinstance(value, (int, float)):
+        return str(value)
+    return None
+
+
+def _nous_user_identities(account_info) -> dict[str, set[str]]:
+    """Every display-safe user identifier this snapshot carries.
+
+    The fresh account-API snapshot does not populate ``user_id`` on older
+    cores, but its raw payload may still name the user (``user.id``), and both
+    sides can carry a Privy DID or email. Bucketing by kind means an email is
+    only compared with an email, a DID with a DID, and a subject with a
+    subject; a kind that exists on both sides must intersect.
+    """
+    buckets: dict[str, set[str]] = {"user": set(), "privy": set(), "email": set()}
+
+    def add(kind: str, value) -> None:
+        text = _nous_identity_text(value)
+        if text:
+            buckets[kind].add(text)
+
+    add("user", getattr(account_info, "user_id", None))
+    add("privy", getattr(account_info, "privy_did", None))
+    add("email", getattr(account_info, "email", None))
+
+    raw_account = getattr(account_info, "raw_account", None)
+    if isinstance(raw_account, dict):
+        user = raw_account.get("user")
+        if isinstance(user, dict):
+            for name in ("id", "user_id", "sub"):
+                add("user", user.get(name))
+            add("privy", user.get("privy_did"))
+            add("email", user.get("email"))
+        for name in ("user_id", "sub"):
+            add("user", raw_account.get(name))
+
+    claims = getattr(account_info, "raw_claims", None)
+    if isinstance(claims, dict):
+        for name in ("sub", "user_id"):
+            add("user", claims.get(name))
+        add("privy", claims.get("privy_did"))
+        add("email", claims.get("email"))
+    return buckets
+
+
+def _nous_org_identity(account_info) -> Optional[str]:
+    """The portal organisation id, or ``None`` when this snapshot has none."""
+    org = _nous_identity_text(getattr(account_info, "org_id", None))
+    if org:
+        return org
+    raw_account = getattr(account_info, "raw_account", None)
+    if isinstance(raw_account, dict):
+        organisation = raw_account.get("organisation")
+        if isinstance(organisation, dict):
+            org = _nous_identity_text(organisation.get("id"))
+        if not org:
+            org = _nous_identity_text(raw_account.get("organisation_id"))
+        if org:
+            return org
+    return _nous_identity_text(_nous_claim(account_info, "org_id"))
+
+
+def _nous_portal_identity(account_info) -> Optional[str]:
+    """The portal base URL, normalized only by its trailing slash."""
+    portal = _nous_identity_text(getattr(account_info, "portal_base_url", None))
+    if not portal:
+        return None
+    return portal.rstrip("/")
+
+
+def _nous_org_match_key(value) -> Optional[str]:
+    """A pseudonymous, local organisation digest for the Desktop cache merge.
+
+    `billing.state` exposes `org_slug` but no signed-in user id. Hashing the
+    slug to an unkeyed FNV-1a 64-bit hex digest avoids persisting the raw slug
+    in the quota cache. It is not a secret, not authentication, and not a
+    cryptographic identifier: an organisation slug is low-entropy, so anyone
+    holding it can recompute this digest. It is only a pseudonymous matching
+    aid, and it cannot distinguish two users who share the same organisation.
+    """
+    text = _nous_identity_text(value)
+    if not text:
+        return None
+    key = 0xCBF29CE484222325
+    for byte in text.encode("utf-8"):
+        key ^= byte
+        key = (key * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return f"{key:016x}"
+
+
+def _nous_plan_identity(account_info) -> Optional[tuple[Optional[str], Optional[int]]]:
+    """A provable plan identity, or ``None`` when this snapshot cannot name one.
+
+    The name and the numeric tier are compared independently: two snapshots
+    that both carry names must agree on the name, and two that both carry tiers
+    must agree on the tier. A name on one side and only a tier on the other is
+    not proof. ``account_tier`` is used for the free tier (where it is the plan
+    identity) but never as a generic paid identity, because ``"paid"`` does not
+    say which paid plan.
+    """
+    sub = getattr(account_info, "subscription", None)
+    plan = _nous_subscription_plan(sub)
+    name = " ".join(plan.split()).casefold() if plan else None
+    tier_tag = _nous_account_tier(account_info)
+    if name is None and tier_tag in _NOUS_FREE_TIER_NAMES:
+        name = "free"
+    access = getattr(account_info, "paid_service_access_info", None)
+    tier = _nous_tier_claim(account_info, access)
+    if tier is None:
+        tier = _nous_int(getattr(sub, "tier", None))
+    if tier is not None and tier <= 0:
+        tier = None
+    if name is None and tier is None:
+        return None
+    return name, tier
+
+
+def _nous_same_plan(cached, fresh) -> bool:
+    """Whether two snapshots prove the same plan for their JWT claims.
+
+    Claim-level facts such as rate limits and period spend are plan-specific:
+    a cached JWT from an older paid tier must not decorate a newer plan just
+    because both snapshots are paid. Missing or only partially comparable
+    identities fail closed.
+    """
+    left = _nous_plan_identity(cached)
+    right = _nous_plan_identity(fresh)
+    if left is None or right is None:
+        return False
+    left_name, left_tier = left
+    right_name, right_tier = right
+    if left_name is not None and right_name is not None and left_name != right_name:
+        return False
+    if left_tier is not None and right_tier is not None and left_tier != right_tier:
+        return False
+    return (
+        (left_name is not None and right_name is not None)
+        or (left_tier is not None and right_tier is not None)
+    )
+
+
+def _nous_same_account(cached, fresh) -> bool:
+    """Whether two snapshots prove they describe the same Portal account.
+
+    Fail-closed: portal and organisation ids must both be present and equal,
+    and at least one user identifier kind (subject, Privy DID, email) must be
+    present on both sides and intersect. A missing identifier is not a match,
+    and one disagreeing shared kind vetoes an otherwise matching one.
+    """
+    try:
+        cached_portal = _nous_portal_identity(cached)
+        fresh_portal = _nous_portal_identity(fresh)
+        if not cached_portal or not fresh_portal or cached_portal != fresh_portal:
+            return False
+        cached_org = _nous_org_identity(cached)
+        fresh_org = _nous_org_identity(fresh)
+        if not cached_org or not fresh_org or cached_org != fresh_org:
+            return False
+        cached_users = _nous_user_identities(cached)
+        fresh_users = _nous_user_identities(fresh)
+        matched = False
+        for kind, cached_values in cached_users.items():
+            fresh_values = fresh_users.get(kind) or set()
+            if not cached_values or not fresh_values:
+                continue
+            if not (cached_values & fresh_values):
+                return False
+            matched = True
+        return matched
+    except Exception:
+        return False
+
+
+def _nous_snapshot_is_free(account_info) -> bool:
+    """Whether a snapshot's own facts prove a free-tier account."""
+    sub = getattr(account_info, "subscription", None)
+    if _nous_subscription_is_empty(sub):
+        sub = None
+    access = getattr(account_info, "paid_service_access_info", None)
+    paid = getattr(account_info, "paid_service_access", None)
+    evidence = _nous_has_paid_plan_evidence(access, sub, paid)
+    return _nous_free_tier_evidence(account_info, access, sub, paid, evidence)
+
+
+def _nous_snapshot_is_free_plan(account_info) -> bool:
+    """Whether the snapshot's own plan identity explicitly names Free."""
+    try:
+        identity = _nous_plan_identity(account_info)
+    except Exception:
+        return False
+    return identity is not None and identity[0] == "free"
+
+
+def _nous_snapshot_may_read_free(account_info) -> bool:
+    """Whether a cached snapshot is consistent with a fresh Free reading.
+
+    A JWT minted for a Free plan that holds purchased credits carries
+    ``paid_access: true``, but core's JWT path has no plan name and cannot
+    populate the purchased-credit fields, so ``_nous_snapshot_reads_free``
+    cannot prove that shape. Requiring proof there dropped the live JWT's
+    rate-limit claims and an enabled tool pool.
+
+    Only the unprovable shape is accepted: a JWT with ``paid_access: true``
+    and no paid plan name, paid account tier, subscription, or paid
+    subscription evidence. Anything that actually names or corroborates a paid
+    plan still fails closed.
+    """
+    if _nous_snapshot_reads_free(account_info):
+        return True
+    if getattr(account_info, "source", None) != "jwt":
+        return False
+    if getattr(account_info, "paid_service_access", None) is not True:
+        return False
+    identity = _nous_plan_identity(account_info)
+    if identity is not None and identity[0] not in (None, "free"):
+        return False
+    if _nous_account_tier(account_info) in _NOUS_PAID_TIER_NAMES:
+        return False
+    sub = getattr(account_info, "subscription", None)
+    if _nous_subscription_is_empty(sub):
+        sub = None
+    access = getattr(account_info, "paid_service_access_info", None)
+    return not _nous_has_paid_subscription_evidence(access, sub)
+
+
+def _nous_snapshot_reads_free(account_info) -> bool:
+    """The free/paid reading used to match cached JWT facts.
+
+    A JWT minted for a Free plan holding purchased credits can carry
+    ``paid_access: true``; core's JWT path does not populate the purchased
+    credit fields, so ``_nous_snapshot_is_free`` cannot corroborate that shape
+    and reads it as non-free. An explicit Free plan identity is the remaining
+    proof, and a genuine paid plan fails it. Everything else keeps the existing
+    free-tier evidence rule.
+    """
+    if _nous_snapshot_is_free(account_info):
+        return True
+    if (
+        getattr(account_info, "source", None) != "jwt"
+        or getattr(account_info, "paid_service_access", None) is not True
+    ):
+        return False
+    access = getattr(account_info, "paid_service_access_info", None)
+    sub = getattr(account_info, "subscription", None)
+    if _nous_has_paid_subscription_evidence(access, sub):
+        return False
+    return _nous_snapshot_is_free_plan(account_info)
+
+
+def _nous_with_master_claims(account_info, claims: dict):
+    """Return the account snapshot with independent JWT facts attached.
+
+    The fresh account API omits ``raw_claims`` entirely, so its card lost the
+    RPM/TPM/RPH and spend details the old JWT-backed method showed. The claims
+    are attached to a copy (never the caller's object) and only the whitelisted
+    display facts above cross over; no token, identity or entitlement field is
+    copied into the cache.
+    """
+    if not claims:
+        return account_info
+    existing = getattr(account_info, "raw_claims", None)
+    merged = dict(existing) if isinstance(existing, dict) else {}
+    merged.update(claims)
+    try:
+        import dataclasses
+
+        return dataclasses.replace(account_info, raw_claims=merged)
+    except Exception:
+        # Test doubles and older core snapshots may be simple objects rather
+        # than dataclasses; copy before mutating so the source stays pristine.
+        try:
+            import copy
+
+            clone = copy.copy(account_info)
+            setattr(clone, "raw_claims", merged)
+            return clone
+        except Exception:
+            return account_info
+
+
+def _nous_with_tool_access(account_info, tool_access):
+    """Return the account snapshot with a proven cached tool pool attached.
+
+    ``NousPortalAccountInfo`` is frozen, so the same copy-on-write approach as
+    ``_nous_with_master_claims`` applies; test doubles and older snapshots fall
+    back to a shallow copy.
+    """
+    try:
+        import dataclasses
+
+        return dataclasses.replace(account_info, tool_access=tool_access)
+    except Exception:
+        try:
+            import copy
+
+            clone = copy.copy(account_info)
+            setattr(clone, "tool_access", tool_access)
+            return clone
+        except Exception:
+            return account_info
+
+
+class _NousToolAccess:
+    """Minimal ``tool_access`` shape for a raw-claim-only snapshot."""
+
+    __slots__ = ("enabled", "coverage")
+
+    def __init__(self, *, enabled: bool, coverage: dict[str, bool]) -> None:
+        self.enabled = enabled
+        self.coverage = coverage
+
+
+def _nous_tool_access_claim(account_info):
+    """The snapshot's parsed ``tool_access`` entitlement, or ``None``.
+
+    Core normally supplies a normalized ``tool_access`` object from either the
+    JWT claim or the account payload. An older snapshot may carry only the raw
+    claim dict, so parse that with the same fail-closed rule as core: only a
+    literal ``true`` enables the pool or a coverage category.
+    """
+    value = getattr(account_info, "tool_access", None)
+    if value is not None:
+        return value
+    raw = _nous_claim(account_info, "tool_access")
+    if not isinstance(raw, dict):
+        return None
+    coverage = raw.get("coverage")
+    return _NousToolAccess(
+        enabled=raw.get("enabled") is True,
+        coverage={
+            key: flag is True
+            for key, flag in coverage.items()
+            if isinstance(key, str)
+        } if isinstance(coverage, dict) else {},
+    )
+
+
 def _format_rate_limit(value) -> Optional[str]:
     number = _finite_usd(value)
     if number is None or number < 0:
@@ -1124,12 +1498,119 @@ def _format_rate_limit(value) -> Optional[str]:
     return f"{number:g}"
 
 
+#: Published API-key rate limits from the official Nous Portal API docs
+#: (https://portal.nousresearch.com/api-docs, retrieved 2026-11-06). Only
+#: RPM and TPM are published; there is no published requests-per-hour ceiling,
+#: so RPH is never invented for a fallback. Live account claims always take
+#: precedence and include RPH when the account supplies it.
+_NOUS_PUBLISHED_RATE_LIMITS: dict[str, tuple[str, int, int]] = {
+    "free": ("Free", 50, 500_000),
+    "basic": ("Basic", 400, 2_000_000),
+    "plus": ("Plus", 400, 4_000_000),
+    "super": ("Super", 800, 8_000_000),
+    "scale": ("Scale", 600, 6_000_000),
+    "ultra": ("Ultra", 1_600, 16_000_000),
+    "default paid users": ("Default paid users", 180, 720_000),
+}
+
+
+def _nous_has_rate_claim(account_info) -> bool:
+    """Whether the account snapshot carries any usable live rate-limit claim.
+
+    A key with a null/blank value is absence, not a claim; a key with any
+    other value is an actual account fact and must win over a published
+    fallback even if that value later fails formatting. This prevents a
+    malformed claim from being silently replaced by a different published
+    ceiling.
+    """
+    claims = getattr(account_info, "raw_claims", None)
+    if not isinstance(claims, dict):
+        return False
+    for name in ("rate_limit_rpm", "rate_limit_tpm", "rate_limit_rph"):
+        if name not in claims:
+            continue
+        value = claims[name]
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return True
+    return False
+
+
+def _nous_published_plan_key(plan: Optional[str]) -> Optional[str]:
+    """Match a live plan label to one documented published tier.
+
+    The account API names paid plans with a product prefix ("Hermes Plus")
+    while the docs table uses the bare tier ("Plus"). Stripping that prefix
+    is an exact tier mapping, not a generic paid-tier guess; an unknown
+    suffix (or a numeric tier) still has no entry.
+    """
+    if not plan:
+        return None
+    key = " ".join(plan.split()).casefold()
+    if key in _NOUS_PUBLISHED_RATE_LIMITS:
+        return key
+    prefix = "hermes "
+    if key.startswith(prefix):
+        bare = key[len(prefix):]
+        if bare in _NOUS_PUBLISHED_RATE_LIMITS:
+            return bare
+    return None
+
+
+def _nous_published_rate_limits(account_info, state, sub) -> Optional[tuple[str, int, int]]:
+    """The documented ceiling for an unambiguous tier, or ``None``.
+
+    This is a fallback only: any live rate-limit claim wins. The tier identity
+    must be exact — the subscription's own plan label (or a proven Free state
+    when that label is absent). Numeric tiers and generic ``paid``/``paid_access``
+    flags are deliberately not normalized into a plan, because they cannot
+    distinguish Plus, Super, Scale, Ultra, Basic or the default paid ceiling.
+    A product-prefixed account label ("Hermes Plus") maps to the same bare
+    published tier; an unknown label still yields no fallback.
+
+    ``unknown`` is accepted only because a low balance maps to it on Desktop
+    while the plan label itself is still exact. The published ceiling is a
+    property of that documented plan, not a claim that the account is currently
+    usable; a missing or non-exact label still yields no fallback.
+    """
+    if state not in ("free", "active", "depleted", "paused", "unknown"):
+        return None
+    if _nous_has_rate_claim(account_info):
+        return None
+    plan = _nous_subscription_plan(sub)
+    key = _nous_published_plan_key(plan)
+    if key is None and state == "free":
+        key = "free"
+    if key is None:
+        return None
+    entry = _NOUS_PUBLISHED_RATE_LIMITS.get(key)
+    if entry is None:
+        return None
+    # Fail closed across the free/paid boundary: a Free account must not wear a
+    # paid tier's published ceiling, and a paid plan must not inherit Free's.
+    if state == "free" and key != "free":
+        return None
+    if state != "free" and key == "free":
+        return None
+    return entry
+
+
 def _nous_tool_pool_labels(account_info) -> list[str]:
-    """Names of the free Tool-Gateway categories this account may use."""
+    """Names of the free Tool-Gateway categories this account may use.
+
+    ``tool_access.enabled`` is the Portal's live entitlement switch: a positive
+    pool balance that is not gated off. Coverage entries alone are not proof the
+    pool is usable, so a missing/False switch keeps the whole line off.
+    """
     try:
         import dataclasses
 
-        coverage = getattr(getattr(account_info, "tool_access", None), "coverage", None)
+        tool_access = _nous_tool_access_claim(account_info)
+        if getattr(tool_access, "enabled", None) is not True:
+            return []
+        coverage = getattr(tool_access, "coverage", None)
         if coverage is None:
             return []
         if isinstance(coverage, dict):
@@ -1144,103 +1625,1094 @@ def _nous_tool_pool_labels(account_info) -> list[str]:
         return []
 
 
-def _credit_line(access, attr, label) -> Optional[str]:
-	"""Return a '$X.XX' detail line when the attribute is a finite USD amount."""
-	amount = _finite_usd(getattr(access, attr, None))
-	if amount is None:
-		return None
-	return f"{label}: ${amount:.2f}"
+#: Display names for the usage-window gauges the Portal reports. The server
+#: sends stable ids plus its own title case ("Today", "This week", "This
+#: month", "Large models (monthly)"); the quota card uses the compact, exact
+#: names below for the ids it knows. An unknown id keeps the server's own
+#: label.
+_NOUS_USAGE_WINDOW_LABELS = {
+    "day": "Daily",
+    "week": "Weekly",
+    "month": "Monthly",
+    "top_tier": "Large models (Monthly)",
+}
+
+
+def _nous_window_label(gauge) -> Optional[str]:
+    """One display label for a live usage-window gauge, or None when unusable."""
+    gauge_id = getattr(gauge, "id", None)
+    if not isinstance(gauge_id, str) or not gauge_id.strip():
+        return None
+    gauge_id = gauge_id.strip()
+    known = _NOUS_USAGE_WINDOW_LABELS.get(gauge_id)
+    if known is not None:
+        return known
+    raw = getattr(gauge, "label", None)
+    text = raw.strip() if isinstance(raw, str) and raw.strip() else gauge_id
+    # Provider-authored fallback text: never let control or bidi characters
+    # reach a terminal/widget row, and keep a malformed label bounded.
+    text = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]", "", text)
+    text = text.strip()
+    return text[:80] or None
+
+
+def _nous_paused_reason(account_info) -> Optional[str]:
+    """The usage-window plan's own pause fact, when core supplied one.
+
+    Core's ``NousUsageWindowInfo.paused_reason`` is set while a usage-window
+    plan's renewal is unpaid. It is the authoritative pause signal; the older
+    ``member_spend_cap_exceeded`` flag on the access block is a different
+    pause reason and neither field can stand in for the other.
+    """
+    window = getattr(account_info, "usage_window", None) if account_info is not None else None
+    reason = getattr(window, "paused_reason", None) if window is not None else None
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    return None
+
+
+def _nous_usage_window_exhausted(window) -> Optional[bool]:
+    """Whether a live usage-window plan's included allowance is fully spent.
+
+    Only ``scope == "all"`` gauges gate every paid model; a full ``top_tier``
+    gauge blocks that model class, not paid calls generally. ``True`` means at
+    least one general gauge is full, ``False`` means usable gauges exist and
+    none is full, and ``None`` means the snapshot proves neither (no usable
+    general gauge).
+    """
+    gauges = getattr(window, "gauges", None) if window is not None else None
+    if not isinstance(gauges, (list, tuple)) or not gauges:
+        return None
+    seen = False
+    exhausted = False
+    for gauge in gauges:
+        if getattr(gauge, "scope", None) != "all":
+            continue
+        used_bp = getattr(gauge, "used_bp", None)
+        if isinstance(used_bp, bool) or not isinstance(used_bp, (int, float)):
+            continue
+        if not math.isfinite(float(used_bp)) or not 0 <= used_bp <= 10_000:
+            continue
+        seen = True
+        if used_bp >= 10_000:
+            exhausted = True
+    return exhausted if seen else None
+
+
+def _nous_credit_continuation(access) -> Optional[bool]:
+    """Whether purchased credits can carry calls past the included allowance.
+
+    Only the purchased wallet is spendable after a pause or an exhausted
+    included window; included subscription credits are exactly what stopped.
+    ``total_usable_credits`` sums those withheld credits in, so it can never
+    prove continuation. An explicit zero wallet proves a stop; a missing
+    wallet stays unknown rather than assumed.
+    """
+    purchased = _nous_credit_value(access, "purchased_credits_remaining")
+    if purchased is None:
+        return None
+    return purchased > 0
+
+
+def _nous_usage_window_windows(account_info) -> list[QuotaWindow]:
+    """Live usage-window allowances as quota windows, in the server's order."""
+    from datetime import datetime, timezone
+
+    if _nous_paused_reason(account_info) is not None:
+        # A paused plan withholds its included allowance; stale gauges are not
+        # remaining quota and must never be ranked.
+        return []
+    window = getattr(account_info, "usage_window", None)
+    gauges = getattr(window, "gauges", None) if window is not None else None
+    if not gauges:
+        return []
+    windows: list[QuotaWindow] = []
+    for gauge in gauges:
+        label = _nous_window_label(gauge)
+        if label is None:
+            continue
+        used_bp = getattr(gauge, "used_bp", None)
+        if isinstance(used_bp, bool) or not isinstance(used_bp, (int, float)):
+            continue
+        used = max(0.0, min(100.0, float(used_bp) / 100.0))
+        reset_at = None
+        stamp = getattr(gauge, "resets_at_ms", None)
+        if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+            try:
+                reset_at = datetime.fromtimestamp(float(stamp) / 1000.0, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                reset_at = None
+        windows.append(QuotaWindow(label=label, used_percent=used, reset_at=reset_at))
+    return windows
+
+
+#: ``NousPortalAccountInfo.account_tier`` values the core uses for the free
+#: tier. ``anonymous`` is the guest identity; ``free`` is a named free account.
+_NOUS_FREE_TIER_NAMES = frozenset({"free", "anonymous"})
+#: Account-tier claims that contradict a free-tier reading. They are evidence
+#: that the account is (or was) paid, not evidence that it is currently usable.
+_NOUS_PAID_TIER_NAMES = frozenset({"paid", "pro"})
+#: Denial reasons that mean the entitlement could not be resolved or has
+#: lapsed. They must not be rendered as credit exhaustion even when a stale
+#: subscription object happens to show a paid plan.
+_NOUS_UNAVAILABLE_REASONS = frozenset({"account_missing", "subscription_expired"})
+
+
+def _nous_account_tier(account_info) -> Optional[str]:
+    """The portal's account-tier claim, normalized, or ``None`` when absent.
+
+    ``NousPortalAccountInfo.account_tier`` is normalized by core from the JWT
+    or the account payload. Older snapshots may only carry the raw claim, so
+    fall back to it without treating an absent claim as "free".
+    """
+    value = getattr(account_info, "account_tier", None)
+    if not isinstance(value, str) or not value.strip():
+        value = _nous_claim(account_info, "account_tier")
+    return value.strip().lower() if isinstance(value, str) and value.strip() else None
+
+
+def _nous_int(value) -> Optional[int]:
+    number = _finite_usd(value)
+    if number is None or number < 0 or not number.is_integer():
+        return None
+    return int(number)
+
+
+def _nous_subscription_plan(sub) -> Optional[str]:
+    """The subscription's own plan name, never a synthesized tier label."""
+    plan = getattr(sub, "plan", None) if sub is not None else None
+    if isinstance(plan, str) and plan.strip():
+        return plan.strip()
+    return None
+
+
+def _nous_subscription_is_empty(sub) -> bool:
+    """Whether a subscription object carries no fact at all.
+
+    The portal serializes an absent subscription as ``{}``, but padding those
+    fields with zeroes is just as empty: a zero tier/charge/grant/remaining
+    balance is not a plan, and treating it as one used to suppress the free-tier
+    classification (the snapshot looked like it had a subscription only because
+    every number was 0). A positive grant, charge, rollover or balance remains a
+    fact, as does a real plan name, a positive tier, or a period end.
+    """
+    if sub is None:
+        return True
+    if _nous_subscription_plan(sub) is not None:
+        return False
+    tier = _nous_int(getattr(sub, "tier", None))
+    if tier is not None and tier > 0:
+        return False
+    if getattr(sub, "current_period_end", None):
+        return False
+    for attr in (
+        "monthly_charge",
+        "monthly_credits",
+        "credits_remaining",
+        "rollover_credits",
+    ):
+        value = _finite_usd(getattr(sub, attr, None))
+        if value is not None and value > 0:
+            return False
+    return True
+
+
+def _nous_tier_claim(account_info, access) -> Optional[int]:
+    """The subscription-tier number from the normalized access record or JWT.
+
+    A tier number is a plan label, not proof of paid entitlement: a live free
+    JWT carries ``subscription_tier`` 5. Callers must gate it on paid evidence.
+    """
+    tier = _nous_int(getattr(access, "subscription_tier", None)) if access is not None else None
+    if tier is None:
+        tier = _nous_int(_nous_claim(account_info, "subscription_tier"))
+    return tier
+
+
+def _nous_credit_value(access, name) -> Optional[float]:
+    return _finite_usd(getattr(access, name, None)) if access is not None else None
+
+
+def _nous_spend_value(account_info, access, name) -> Optional[float]:
+    """A period-spend/cap fact, preferring the fresh account snapshot.
+
+    The account-API access block carries ``member_spend_usd`` and
+    ``member_spend_cap_usd`` directly; a cached JWT carries them as raw claims.
+    Reading only the claims dropped the fresh snapshot's own values whenever
+    no JWT was available, so the access record wins and the claims are fallback.
+    """
+    value = _nous_credit_value(access, name)
+    if value is None:
+        value = _finite_usd(_nous_claim(account_info, name))
+    return value
+
+
+def _nous_has_positive_credit(access) -> bool:
+    for name in (
+        "subscription_credits_remaining",
+        "purchased_credits_remaining",
+        "total_usable_credits",
+    ):
+        value = _nous_credit_value(access, name)
+        if value is not None and value > 0:
+            return True
+    return False
+
+
+def _nous_has_purchased_credit(access) -> bool:
+    value = _nous_credit_value(access, "purchased_credits_remaining")
+    return value is not None and value > 0
+
+
+def _nous_has_paid_plan_evidence(access, sub, paid) -> bool:
+    """Whether the snapshot carries actual evidence of a paid plan or credits.
+
+    ``paid_service_access is False`` alone is deliberately not evidence: core
+    uses that flag for both "not a paid plan" and "paid plan with no usable
+    credits" (see ``format_nous_portal_entitlement_message``). Subscription
+    facts must corroborate it.
+    """
+    if paid is True:
+        return True
+    if access is not None:
+        paid_sub = getattr(access, "active_subscription_is_paid", None)
+        charge = _nous_credit_value(access, "subscription_monthly_charge")
+        if paid_sub is True:
+            return True
+        if paid_sub is False:
+            # The portal explicitly says this subscription is not paid. Only
+            # purchased credits can still constitute paid-service evidence.
+            return _nous_has_purchased_credit(access)
+        if getattr(access, "has_active_subscription", None) is True and _nous_has_positive_credit(access):
+            return True
+        if charge is not None and charge > 0:
+            return True
+    if _nous_has_positive_credit(access):
+        return True
+    if sub is not None:
+        monthly_charge = _finite_usd(getattr(sub, "monthly_charge", None))
+        monthly_credits = _finite_usd(getattr(sub, "monthly_credits", None))
+        plan = _nous_subscription_plan(sub)
+        if (monthly_charge is not None and monthly_charge > 0) or (
+            monthly_credits is not None and monthly_credits > 0
+        ):
+            return True
+        if plan is not None and plan.lower() not in _NOUS_FREE_TIER_NAMES:
+            return True
+    return False
+
+
+def _nous_has_active_paid_subscription(access, sub) -> bool:
+    """Whether an active paid subscription is corroborated by the snapshot.
+
+    This mirrors the core's ``has_active_subscription`` +
+    ``active_subscription_is_paid`` pair (and a positive subscription charge),
+    not the ambiguous ``paid_service_access`` denial. An explicit
+    ``active_subscription_is_paid is False`` is authoritative: it is not paid.
+    """
+    if access is not None:
+        active = getattr(access, "has_active_subscription", None) is True
+        paid_sub = getattr(access, "active_subscription_is_paid", None)
+        charge = _nous_credit_value(access, "subscription_monthly_charge")
+        if active and paid_sub is True:
+            return True
+        if active and paid_sub is None and charge is not None and charge > 0:
+            return True
+    if sub is not None:
+        charge = _finite_usd(getattr(sub, "monthly_charge", None))
+        if charge is not None and charge > 0:
+            return True
+    return False
+
+
+def _nous_has_positive_subscription_credit(access) -> bool:
+    value = _nous_credit_value(access, "subscription_credits_remaining")
+    return value is not None and value > 0
+
+
+#: The portal's credit totals are USD. A corrupt or absurd value must not
+#: allocate an enormous formatted string or claim an impossible balance.
+_NOUS_BALANCE_MAX_USD = 1e15
+
+
+def _nous_total_usable(access, state: str) -> Optional[float]:
+    """The account's total usable credit figure, only when the source proves it.
+
+    ``total_usable_credits`` already includes both the included subscription
+    credits and the purchased wallet, so it is rendered as-is and never summed
+    with either component. A missing total may fall back to the purchased
+    wallet only when the snapshot explicitly reports zero subscription credits
+    (the wallet is then the whole usable balance); an unknown subscription
+    component is not a supported total. Zero is a known amount and must remain
+    visible. States whose snapshot cannot prove a current amount
+    (unknown/unavailable) contribute nothing.
+
+    A paused plan withholds its included allowance, yet the portal's total
+    still counts it. Only the purchased wallet is spendable there, and only
+    when the snapshot reports it: the paused total is not a balance.
+    """
+    if access is None or state in ("unknown", "unavailable"):
+        return None
+
+    def _valid(amount: Optional[float]) -> Optional[float]:
+        if amount is None or amount < 0 or amount > _NOUS_BALANCE_MAX_USD:
+            return None
+        return amount
+
+    if state == "paused":
+        return _valid(_finite_usd(getattr(access, "purchased_credits_remaining", None)))
+    amount = _valid(_finite_usd(getattr(access, "total_usable_credits", None)))
+    if amount is not None:
+        return amount
+    subscription = _finite_usd(getattr(access, "subscription_credits_remaining", None))
+    purchased = _valid(_finite_usd(getattr(access, "purchased_credits_remaining", None)))
+    if subscription == 0 and purchased is not None:
+        return purchased
+    return None
+
+
+def _nous_has_paid_subscription_evidence(access, sub) -> bool:
+    """Whether the snapshot proves a paid *subscription*, not just paid calls.
+
+    ``paid_service_access`` can be true because an otherwise free account holds
+    purchased credits. Subscription facts have to corroborate a paid plan: an
+    active paid subscription, a positive monthly charge, positive subscription
+    credits, positive monthly credits, or a non-Free plan name.
+    """
+    if _nous_has_active_paid_subscription(access, sub):
+        return True
+    if access is not None:
+        if getattr(access, "active_subscription_is_paid", None) is True:
+            return True
+        charge = _nous_credit_value(access, "subscription_monthly_charge")
+        if charge is not None and charge > 0:
+            return True
+        if _nous_has_positive_subscription_credit(access):
+            return True
+    if sub is not None:
+        charge = _finite_usd(getattr(sub, "monthly_charge", None))
+        monthly = _finite_usd(getattr(sub, "monthly_credits", None))
+        plan = _nous_subscription_plan(sub)
+        if (charge is not None and charge > 0) or (monthly is not None and monthly > 0):
+            return True
+        if plan is not None and plan.lower() not in _NOUS_FREE_TIER_NAMES:
+            return True
+    return False
+
+
+def _nous_credits_exhausted(access, sub) -> Optional[bool]:
+    """True only when the snapshot explicitly reports zero usable credits.
+
+    Missing fields stay unknown: an absent balance is not proof of depletion.
+    """
+    values: list[float] = []
+    if access is not None:
+        for name in (
+            "subscription_credits_remaining",
+            "purchased_credits_remaining",
+            "total_usable_credits",
+        ):
+            value = _nous_credit_value(access, name)
+            if value is not None:
+                values.append(value)
+    if sub is not None:
+        value = _finite_usd(getattr(sub, "credits_remaining", None))
+        if value is not None:
+            values.append(value)
+    if not values:
+        return None
+    return all(value <= 0 for value in values)
+
+
+def _nous_free_tier_evidence(account_info, access, sub, paid, paid_plan_evidence) -> bool:
+    """Whether this snapshot says free tier, rather than inferring it from a denial.
+
+    An explicit free plan or free ``account_tier`` is evidence, but a paid
+    *subscription* fact vetoes it: a paid account can carry a stale free tier
+    claim. Conversely, ``paid_service_access: true`` alone does not make a
+    free-plan account paid — purchased credits on a Free plan also produce it.
+    With ``paid_service_access: true`` the free tier is only accepted when the
+    account names itself free and the credits are purchased (not included-plan
+    subscription credits). A JWT snapshot has only claims, so ``account_tier``
+    is the reliable free signal there. A richer account snapshot also carries
+    explicit subscription facts; only an explicit ``has_active_subscription is
+    False`` (never a missing field) counts as "no paid plan".
+    """
+    plan = _nous_subscription_plan(sub)
+    if _nous_has_paid_subscription_evidence(access, sub):
+        return False
+    if plan is not None and plan.lower() == "free":
+        if paid is True:
+            return (
+                _nous_has_purchased_credit(access)
+                and not _nous_has_positive_subscription_credit(access)
+            )
+        return True
+    tier = _nous_account_tier(account_info)
+    if tier in _NOUS_FREE_TIER_NAMES:
+        if paid is True:
+            # ``paid_service_access`` is true for a Free plan holding purchased
+            # credits. Only that shape is accepted; included-plan subscription
+            # credits would contradict a free plan.
+            return (
+                _nous_has_purchased_credit(access)
+                and not _nous_has_positive_subscription_credit(access)
+            )
+        return True
+    if getattr(account_info, "is_anonymous_tier", False) is True:
+        return True
+    # An explicit "no active subscription" is the account API's own answer and
+    # outranks the aggregate ``paid_service_access`` flag and a bare paid tier
+    # claim. That flag is also true for a Free plan whose purchased credits
+    # fund calls; treating it as paid here classified a Free+top-up account as
+    # an active paid plan and rendered its padded renewal date. Only the
+    # explicit False counts, and only when the subscription is not paid; all
+    # paid-subscription evidence (plan name, charge, included credits) was
+    # already checked above.
+    if access is not None:
+        if (
+            getattr(access, "has_active_subscription", None) is False
+            and getattr(access, "active_subscription_is_paid", None) is not True
+        ):
+            return True
+    if tier in _NOUS_PAID_TIER_NAMES:
+        return False
+    if paid is True:
+        return False
+    if paid_plan_evidence:
+        return False
+    return False
+
+
+def _nous_access_state(account_info, access, sub, paid, paid_plan_evidence) -> str:
+    """Classify the snapshot as free, active, depleted, paused, unavailable or unknown."""
+    # The usage-window plan's own pause reason is authoritative. Core withholds
+    # the included allowance while it is set, so neither `paid_service_access`,
+    # the access reason, nor the older member-spend-cap flag may turn this into
+    # active, free or unavailable. A failed or stale lookup is converted to
+    # `unknown` by the caller after this classification, so only a fresh
+    # snapshot reaches this branch.
+    if _nous_paused_reason(account_info) is not None:
+        return "paused"
+    reason = getattr(access, "reason", None) if access is not None else None
+    if reason in _NOUS_UNAVAILABLE_REASONS:
+        # The lookup could not resolve an account or the subscription lapsed.
+        # That authoritative denial outranks any stale paid flag still carried
+        # by the snapshot.
+        return "unavailable"
+    if _nous_free_tier_evidence(account_info, access, sub, paid, paid_plan_evidence):
+        return "free"
+    if access is not None and getattr(access, "member_spend_cap_exceeded", None) is True:
+        return "paused"
+    if paid is True:
+        return "active"
+    if paid_plan_evidence:
+        exhausted = _nous_credits_exhausted(access, sub)
+        explicitly_unpaid = (
+            access is not None
+            and getattr(access, "active_subscription_is_paid", None) is False
+        )
+        if exhausted is True and not explicitly_unpaid and (paid is False or reason == "no_usable_credits"):
+            return "depleted"
+        if (
+            paid is False
+            and not explicitly_unpaid
+            and _nous_has_active_paid_subscription(access, sub)
+            and exhausted is not False
+        ):
+            # Core's entitlement copy treats an active paid subscription whose
+            # access was denied as credit exhaustion. Explicit positive credits
+            # contradict that, so only then fall through to "unavailable".
+            return "depleted"
+        if paid is False:
+            # A paid plan exists but the portal did not grant access and the
+            # snapshot does not prove the credits are gone.
+            return "unavailable"
+        if exhausted is False:
+            return "active"
+        return "unknown"
+    return "unknown"
+
+
+def _nous_api_calls_available(
+    state,
+    access,
+    sub,
+    paid,
+    total_usable=None,
+    usage_window=None,
+) -> Optional[bool]:
+    """Structured availability, only where the snapshot proves it.
+
+    A free snapshot with a positive total-usable balance is available through
+    purchased credits: the balance funds calls even though the plan stays Free
+    and no subscription exists. A plain free account with no credits stays
+    ``None`` (muted): free-model access is not evidence that paid API calls are
+    available.
+
+    A usage-window plan carries the authoritative included allowance in its
+    gauges. Once an all-scope gauge is full, calls continue only when
+    ``keep_going_on_credits`` allows the purchased wallet to pay, and only if
+    that purchased balance is explicitly positive. A paused plan is likewise
+    governed by that switch plus the purchased balance; an absent wallet answer
+    is unknown, not a promise or a denial. The portal's total-usable figure is
+    never evidence here: it still counts the withheld included credits.
+    """
+    keep_going = getattr(usage_window, "keep_going_on_credits", None) if usage_window is not None else None
+    if not isinstance(keep_going, bool):
+        keep_going = None
+
+    if state == "depleted":
+        return False
+    if state == "paused":
+        if keep_going is False:
+            return False
+        if keep_going is True:
+            return _nous_credit_continuation(access)
+        return None
+    if state == "free":
+        # Positive purchased credits fund calls even if the portal omitted the
+        # total field. When the total is present it is authoritative: a zero
+        # total cannot coexist with a "purchased credits are available" claim.
+        if total_usable is not None:
+            return True if total_usable > 0 else None
+        if _nous_has_purchased_credit(access):
+            return True
+        return None
+    if state != "active":
+        return None
+    # The live allowance outranks a bare paid flag. `paid_service_access` can
+    # stay true while every included gauge is full; claiming calls available
+    # there was the false "API calls available: yes".
+    exhausted = _nous_usage_window_exhausted(usage_window)
+    if exhausted is True:
+        if keep_going is False:
+            # The included allowance is spent and the account is configured not
+            # to spend purchased credits past it: calls stop.
+            return False
+        if keep_going is True:
+            return _nous_credit_continuation(access)
+        # Included allowance spent, continuation unproven.
+        return None
+    if exhausted is False:
+        # A live all-scope gauge with headroom proves the included allowance is
+        # still usable, even though `usage.available` is false for these plans.
+        return True
+    if usage_window is not None and getattr(usage_window, "gauges", None):
+        # Gauges exist but none is a usable all-scope gauge (for example only a
+        # top-tier meter): this snapshot cannot prove general call availability.
+        return None
+    if paid is True:
+        return True
+    if _nous_has_positive_credit(access):
+        return True
+    if sub is not None:
+        remaining = _finite_usd(getattr(sub, "credits_remaining", None))
+        monthly = _finite_usd(getattr(sub, "monthly_credits", None))
+        if (remaining is not None and remaining > 0) or (monthly is not None and monthly > 0):
+            return True
+    return None
+
+
+#: The whole Nous fetch must finish inside ``quota_cache.REFRESH_BUDGET_S``
+#: (20s). Core's account lookup has an 8s socket timeout, which bounds socket
+#: inactivity rather than wall time, so each lookup runs in a daemon thread
+#: under this hard wall-clock budget; an abandoned worker cannot delay the
+#: sweep or process exit.
+_NOUS_FETCH_BUDGET_S = 19.0
+_NOUS_ACCOUNT_TIMEOUT_S = 8.0
+
+#: Returned by :func:`_bounded_account_lookup` when the wall clock expired.
+#: Distinct from ``None`` (a lookup that completed without a value) so the
+#: caller can refuse to start a second, overlapping lookup: the abandoned
+#: worker may still be in flight, and a duplicate could repeat a token refresh
+#: or portal request. Never passed to consumers.
+_NOUS_LOOKUP_TIMEOUT = object()
+
+
+def _bounded_account_lookup(get_info, *, force_fresh: Optional[bool], timeout: float):
+    """Call the account lookup under a hard wall-clock timeout.
+
+    ``contextvars.copy_context()`` preserves the active profile/auth context in
+    the worker thread. ``force_fresh`` is passed explicitly as a keyword
+    whenever it is a bool; ``None`` is the compatibility path for an older core
+    whose lookup accepts no keyword and is the only case that calls it with no
+    arguments. Returns ``None`` on an empty result, raises a failed lookup's
+    exception, and returns :data:`_NOUS_LOOKUP_TIMEOUT` when the wall clock
+    expired.
+    The worker is a daemon: a timed-out portal request keeps running to its own
+    socket timeout but never blocks the quota sweep or process exit.
+    """
+    if timeout <= 0:
+        return _NOUS_LOOKUP_TIMEOUT
+    result: dict[str, Any] = {}
+    done = threading.Event()
+    context = contextvars.copy_context()
+    kwargs = {} if force_fresh is None else {"force_fresh": bool(force_fresh)}
+
+    def _worker() -> None:
+        try:
+            result["value"] = context.run(get_info, **kwargs)
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            done.set()
+
+    thread = threading.Thread(target=_worker, name="quota-nous-account", daemon=True)
+    thread.start()
+    if not done.wait(timeout):
+        return _NOUS_LOOKUP_TIMEOUT
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+def _nous_lookup_accepts_force_fresh(get_info) -> bool:
+    """Whether the lookup advertises the ``force_fresh`` keyword.
+
+    Used only to avoid a speculative keyword call (and its retry) against an
+    older core. A wrapper with ``**kwargs`` is treated as supported; if it then
+    rejects the keyword, the TypeError fallback still performs one no-argument
+    call.
+    """
+    try:
+        parameters = inspect.signature(get_info).parameters
+    except (TypeError, ValueError):
+        return True
+    if "force_fresh" in parameters:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+
+
+def _nous_portal_account(get_info, *, deadline: float) -> tuple[Any, bool]:
+    """The freshest usable Nous snapshot plus independent master-method claims.
+
+    Two reads, in this order:
+
+    * ``force_fresh=False`` is the old master method. When a valid saved JWT
+      exists it is decoded locally; when it does not, core may fall through to
+      a network/pool lookup, so this read is not assumed local. If it returns
+      an account-API snapshot already, that snapshot is reused as the fresh one
+      instead of issuing a duplicate forced read.
+    * ``force_fresh=True`` is the authoritative account snapshot (subscription,
+      credits, entitlement) and may omit ``raw_claims`` entirely.
+
+    The account-API snapshot wins for service facts. Cached JWT claims are
+    attached only when all of these hold: the cached snapshot really came from
+    the local JWT (``source == "jwt"``), both snapshots prove the same portal,
+    organisation and user identity, their free/paid readings do not contradict
+    each other, and their plans are provably identical (matching name and/or
+    numeric tier). Missing identity or an unprovable plan change is not a
+    match; it contributes no claims. A transient fresh-lookup failure falls
+    back to the cached snapshot, but the caller marks it stale and never turns
+    its fields into a current Free/paid verdict.
+
+    A first lookup that exceeds its wall-clock slice ends the whole read: its
+    abandoned worker may still be running, so starting the forced lookup would
+    duplicate the same core work. Both lookups remain inside the sweep's
+    deadline.
+
+    NOTE: ``hermes_cli.nous_account`` is a core module, not a documented plugin
+    API; ``hermes plugins validate`` warns about it under catalog rule 9. This
+    plugin has no public account-data seam (``agent.account_usage`` documents
+    ``fetch_account_usage`` for usage panels but registers no ``nous`` fetcher),
+    so this stays a fail-open best effort rather than a compliance claim.
+    """
+    supports_force_fresh = _nous_lookup_accepts_force_fresh(get_info)
+
+    def _lookup(*, force_fresh: bool):
+        nonlocal supports_force_fresh
+        timeout = min(_NOUS_ACCOUNT_TIMEOUT_S, deadline - time.monotonic())
+        if not supports_force_fresh:
+            # Known-old core: call it exactly once, with no keyword.
+            try:
+                return _bounded_account_lookup(get_info, force_fresh=None, timeout=timeout)
+            except Exception:
+                return None
+        try:
+            return _bounded_account_lookup(get_info, force_fresh=force_fresh, timeout=timeout)
+        except TypeError:
+            # A wrapper advertised **kwargs but rejected the keyword. Do not
+            # retry the forced read: one no-argument call is enough, and
+            # retrying both reads would repeat the same core work.
+            supports_force_fresh = False
+            if force_fresh:
+                return None
+            timeout = min(_NOUS_ACCOUNT_TIMEOUT_S, deadline - time.monotonic())
+            try:
+                return _bounded_account_lookup(get_info, force_fresh=None, timeout=timeout)
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    def _usable(info) -> bool:
+        return (
+            info is not None
+            and getattr(info, "logged_in", False)
+            and getattr(info, "source", None) != "error"
+        )
+
+    # Read the master snapshot first. If the fresh account lookup ran first,
+    # core's process cache could satisfy this call with the claim-less account
+    # API object instead.
+    cached = _lookup(force_fresh=False)
+    if cached is _NOUS_LOOKUP_TIMEOUT:
+        # The abandoned first worker may still be refreshing/reading; a second
+        # lookup now would duplicate it. Fail closed for this sweep.
+        return None, False
+
+    if _usable(cached) and getattr(cached, "source", None) == "account_api":
+        # The supposedly local read already went to the account API. Reuse it:
+        # a forced read would be the same request a second time.
+        fresh = cached
+    elif supports_force_fresh:
+        fresh = _lookup(force_fresh=True)
+        if fresh is _NOUS_LOOKUP_TIMEOUT:
+            fresh = None
+    else:
+        fresh = None
+
+    if _usable(fresh):
+        account = fresh
+    elif _usable(cached):
+        account = cached
+    else:
+        account = fresh if fresh is not None else cached
+
+    # A forced account-API read that failed leaves only the cached JWT/local
+    # snapshot. That snapshot is usable history, not a current entitlement
+    # verdict; the caller must mark it stale instead of presenting its paid
+    # plan, renewal or credit lines as a fresh read.
+    stale_fallback = supports_force_fresh and not _usable(fresh) and _usable(cached)
+
+    # Prove identity once. A cached JWT may contribute display facts only when
+    # it is the same Portal account and organisation; rate/spend claims are
+    # plan-specific too, while the free tool-pool switch is not (core documents
+    # it as decoupled from paid/billing access).
+    same_account = (
+        _usable(cached)
+        and getattr(cached, "source", None) == "jwt"
+        and _usable(fresh)
+        and _nous_same_account(cached, fresh)
+    )
+    same_plan = same_account and _nous_same_plan(cached, fresh)
+    same_free = False
+    if same_account:
+        # A stale JWT can still carry the previous plan's rate/spend claims.
+        # This plain parity answer rejects a proven paid snapshot against a
+        # free one. It also accepts a JWT whose paid_access: true cannot be
+        # disproved as Free-with-purchased-credits (core's JWT path has no
+        # plan name or purchased-credit fields), because that live shape
+        # otherwise lost its rate-limit claims and enabled tool pool. A paid
+        # plan name, paid account tier, or paid-subscription evidence still
+        # vetoes the match. The unproven shape also needs the same plan tier;
+        # otherwise an older paid tier could look free merely because core's
+        # JWT path cannot name it.
+        cached_free = _nous_snapshot_reads_free(cached)
+        fresh_free = _nous_snapshot_reads_free(fresh)
+        same_free = cached_free == fresh_free or (
+            same_plan and fresh_free and _nous_snapshot_may_read_free(cached)
+        )
+
+    claims: dict[str, Any] = {}
+    fresh_plan_identity = _nous_plan_identity(fresh) if same_account else None
+    fresh_plan_is_free_or_absent = (
+        fresh_plan_identity is None or fresh_plan_identity[0] in (None, "free")
+    )
+    free_plan_match = (
+        same_account
+        and _nous_snapshot_is_free_plan(cached)
+        and _nous_snapshot_reads_free(fresh)
+        and fresh_plan_is_free_or_absent
+    )
+    if free_plan_match:
+        # A cached JWT whose own plan identity says Free, against a fresh
+        # snapshot that reads Free, is the same plan even when the fresh label
+        # is missing (the account API can prove Free through its subscription
+        # block alone). Rate limits are then the Free plan's, not a stale paid
+        # tier's.
+        claims = _nous_master_claims(cached)
+    elif same_plan and same_free:
+        claims = _nous_master_claims(cached)
+    if not claims and _usable(account) and getattr(account, "source", None) == "jwt":
+        claims = _nous_master_claims(account)
+    if _usable(account) and claims:
+        account = _nous_with_master_claims(account, claims)
+
+    # The fresh account API may omit ``tool_access`` entirely on a Free plan
+    # whose JWT minted an enabled pool. Inherit it only from a cached JWT that
+    # proves the same account and the same free/paid reading. An explicit
+    # fresh value (including ``enabled: false``) always wins: absence is the
+    # only shape that may be backfilled, so a disabled pool is never revived.
+    inherited_tool_access = None
+    if (
+        same_account
+        and same_free
+        and _usable(fresh)
+        and _nous_snapshot_reads_free(fresh)
+    ):
+        fresh_tool_access = _nous_tool_access_claim(fresh)
+        if fresh_tool_access is None:
+            cached_tool_access = _nous_tool_access_claim(cached)
+            if (
+                cached_tool_access is not None
+                and getattr(cached_tool_access, "enabled", None) is True
+                and _nous_snapshot_may_read_free(cached)
+            ):
+                inherited_tool_access = cached_tool_access
+    if inherited_tool_access is not None and _usable(account):
+        account = _nous_with_tool_access(account, inherited_tool_access)
+    return account, stale_fallback
 
 
 def _fetch_nous_portal() -> QuotaResult:
+    deadline = time.monotonic() + _NOUS_FETCH_BUDGET_S
     try:
         from hermes_cli.nous_account import get_nous_portal_account_info
-
-        account = get_nous_portal_account_info()
     except Exception:
         return build_unavailable("nous", "fetcher-unavailable")
-    if account is None or not getattr(account, "logged_in", False):
+    account, stale_fallback = _nous_portal_account(get_nous_portal_account_info, deadline=deadline)
+    if account is None:
+        return build_unavailable("nous", "fetcher-unavailable")
+    if not getattr(account, "logged_in", False):
         return build_unavailable("nous", "not-logged-in")
 
     access = getattr(account, "paid_service_access_info", None)
     sub = getattr(account, "subscription", None)
+    if _nous_subscription_is_empty(sub):
+        sub = None
     paid = getattr(account, "paid_service_access", None)
+
+    # Classify before rendering any money line. A free account can carry the
+    # portal's padded zero balances (and a free-plan subscription object), and
+    # those are not facts worth three "$0.00" rows or a "Cycle ends:" date.
+    paid_plan_evidence = _nous_has_paid_plan_evidence(access, sub, paid)
+    state = _nous_access_state(account, access, sub, paid, paid_plan_evidence)
+    lookup_failed = getattr(account, "source", None) == "error"
+    stale_snapshot = bool(stale_fallback) and not lookup_failed
+    if lookup_failed or stale_snapshot:
+        # A failed lookup can still carry a stored tier claim; a stale cached
+        # JWT can still carry a paid plan, renewal and rate/spend facts. None
+        # of those is evidence of the account's current entitlement. Stay
+        # unknown/muted rather than presenting the fallback as a fresh read.
+        state = "unknown"
 
     windows: list[QuotaWindow] = []
     details: list[str] = []
+    detail_facts: dict[str, str] = {}
+    account_balances: list[AccountBalance] = []
+
+    def _add_detail(key: str, line: Optional[str]) -> None:
+        """Append one display line and preserve its identity for merging."""
+        if line:
+            details.append(line)
+            detail_facts[key] = line
+
+    # One prominent, explicitly labeled amount. The portal computes it from
+    # every usable credit (included plan allowance + purchased wallet), so it is
+    # rendered as-is and never re-added from the component lines below.
+    total_usable = _nous_total_usable(access, state)
+    if total_usable is not None:
+        account_balances.append(
+            AccountBalance(
+                currency="USD",
+                total_balance=f"{total_usable:.2f}",
+                label="Account balance",
+            )
+        )
+
+    # Paid facts (subscription gauge, credit lines, rollover, renewal, spend,
+    # rate limits) describe the *current* plan. An unavailable snapshot could
+    # not resolve the account or its subscription lapsed, so its stale paid
+    # values must not be rendered as current facts. Free and unknown snapshots
+    # have no paid plan to describe either.
+    paid_facts = state in ("active", "depleted", "paused")
+    # A paused plan withholds its included allowance. Its gauges are stale
+    # quota, not remaining quota: neither the subscription gauge nor live
+    # usage-window windows may be shown or ranked. Renewal/spend facts about
+    # the plan may still describe it.
+    window_facts = paid_facts and state != "paused"
 
     # Subscription gauge — only with a positive monthly denominator and a sane
     # remaining value (remaining > cap means rollover across periods, where the
-    # monthly number stops being a meaningful denominator).
+    # monthly number stops being a meaningful denominator). A free plan has no
+    # paid subscription window to gauge.
     monthly = _finite_usd(getattr(sub, "monthly_credits", None)) if sub is not None else None
     remaining = _finite_usd(getattr(sub, "credits_remaining", None)) if sub is not None else None
-    if monthly is not None and monthly > 0 and remaining is not None and remaining <= monthly:
+    if window_facts and monthly is not None and monthly > 0 and remaining is not None and remaining <= monthly:
         used_pct = max(0.0, min(100.0, (monthly - remaining) / monthly * 100.0))
         windows.append(QuotaWindow(label="Subscription", used_percent=round(used_pct, 2)))
-        details.append(f"${remaining:.2f} of ${monthly:.2f} subscription credits left")
+        _add_detail(
+            "subscription_window",
+            f"${remaining:.2f} of ${monthly:.2f} subscription credits left",
+        )
 
-    if access is not None:
-        for attr, label in (
-            ("subscription_credits_remaining", "Subscription credits"),
-            ("purchased_credits_remaining", "Top-up credits"),
-            ("total_usable_credits", "Total usable"),
-        ):
-            line = _credit_line(access, attr, label)
-            if line is not None:
-                details.append(line)
+    # Usage-window plans (Plus / Super / Ultra) carry their allowances in the
+    # account snapshot's ``usage_window`` block rather than a monthly credit
+    # grant. Render the live gauges in the server's order with the card's
+    # exact window names. A stale or unavailable snapshot never reaches here
+    # (``paid_facts`` is false), so an old allowance cannot masquerade as
+    # current.
+    usage_windows = _nous_usage_window_windows(account) if window_facts else []
+    if usage_windows:
+        windows.extend(usage_windows)
 
-    if sub is not None:
+    # The card shows one prominent Account balance and no separate
+    # subscription/top-up component lines: `total_usable` above is the
+    # authoritative spendable amount, and a zero component beside it is noise,
+    # not a second balance.
+
+    if sub is not None and paid_facts:
         rollover = _finite_usd(getattr(sub, "rollover_credits", None))
         if rollover is not None and rollover > 0:
-            details.append(f"Rollover: ${rollover:.2f}")
+            _add_detail("rollover", f"Rollover: ${rollover:.2f}")
         period_end = getattr(sub, "current_period_end", None)
         if period_end:
-            details.append(f"Renews: {period_end}")
+            # The account snapshot carries no cancellation state, so it cannot
+            # prove the subscription will renew. "Cycle ends" is true for both
+            # a renewal and a cancellation; "Renews" was false for the latter.
+            _add_detail("cycle_ends", f"Cycle ends: {period_end}")
 
-    plan = (getattr(sub, "plan", None) if sub is not None else None) or None
+    # Only the subscription's own plan name is a label here. A bare numeric
+    # tier is merely a claim; it becomes "Tier N" below only when a paid
+    # subscription/access fact corroborates it (a live free JWT also carries
+    # subscription_tier 5).
+    plan = _nous_subscription_plan(sub)
 
     # Some paid Portal accounts expose spend and subscription rate limits in
-    # raw claims without a subscription object or credit cap. These are useful
-    # details, but spend is not a quota denominator and must not become a
-    # percentage window.
-    member_spend = _finite_usd(_nous_claim(account, "member_spend_usd"))
-    member_spend_cap = _finite_usd(_nous_claim(account, "member_spend_cap_usd"))
-    if member_spend is not None:
+    # raw claims without a subscription object or credit cap. The fresh account
+    # API has its own member_spend_usd/member_spend_cap_usd fields, so prefer
+    # those over a cached JWT when both exist; an older JWT-only snapshot still
+    # supplies them. These are useful details, but spend is not a quota
+    # denominator and must not become a percentage window.
+    member_spend = _nous_spend_value(account, access, "member_spend_usd")
+    member_spend_cap = _nous_spend_value(account, access, "member_spend_cap_usd")
+    if member_spend is not None and paid_facts:
         suffix = " (no cap reported)" if member_spend_cap is None else ""
-        details.append(f"Spend this period: ${member_spend:.2f}{suffix}")
-
-    tier = _finite_usd(_nous_claim(account, "subscription_tier"))
-    if plan is None and tier is not None and tier >= 0 and tier.is_integer():
-        plan = f"Tier {int(tier)}"
+        _add_detail("spend", f"Spend this period: ${member_spend:.2f}{suffix}")
 
     rate_limits = []
     for claim, unit in (("rate_limit_rpm", "RPM"), ("rate_limit_tpm", "TPM"), ("rate_limit_rph", "RPH")):
         formatted = _format_rate_limit(_nous_claim(account, claim))
         if formatted is not None:
             rate_limits.append(f"{formatted} {unit}")
-    if rate_limits:
-        details.append("Rate limits: " + " · ".join(rate_limits))
+    if rate_limits and state != "unavailable" and not (lookup_failed or stale_snapshot):
+        _add_detail("rate_limits", "Rate limits: " + " · ".join(rate_limits))
+    elif not (lookup_failed or stale_snapshot):
+        published = _nous_published_rate_limits(account, state, sub)
+        if published is not None:
+            _tier, published_rpm, published_tpm = published
+            rpm_text = _format_rate_limit(published_rpm)
+            tpm_text = _format_rate_limit(published_tpm)
+            if rpm_text and tpm_text:
+                _add_detail(
+                    "rate_ceiling",
+                    f"Rate ceiling: {rpm_text} RPM / {tpm_text} TPM (published)",
+                )
 
-    if not windows and not details:
-        if paid is False:
-            # Free tier: the portal exposes no credit/usage numbers at all
-            # (verified against a live free account). Show what IS true.
-            details.append("Free tier - free models only")
-            details.append("Rate ceiling: 50 RPM / 500k TPM (published)")
-            pool = _nous_tool_pool_labels(account)
-            if pool:
-                details.append("Tool pool: " + ", ".join(pool))
-            plan = plan or "Free"
+    if lookup_failed or stale_snapshot:
+        plan = None
+    tier = _nous_tier_claim(account, access)
+
+    # A subscription-tier claim is a plan label only when a paid subscription
+    # actually corroborates it. A live free JWT carries ``subscription_tier`` 5;
+    # turning that claim into "Tier 5" was the original misclassification. An
+    # unavailable snapshot's paid labels are stale, so they are suppressed.
+    tier_is_paid_label = (
+        paid is True
+        or sub is not None
+        or (
+            access is not None
+            and (
+                getattr(access, "has_active_subscription", None) is True
+                or getattr(access, "active_subscription_is_paid", None) is True
+            )
+        )
+    )
+    if plan is None and tier is not None and tier_is_paid_label and state in (
+        "active", "depleted", "paused",
+    ):
+        plan = f"Tier {tier}"
+    if state == "unavailable":
+        # The plan name/subscription object may be a stale copy from before the
+        # lookup failed or the subscription lapsed; the status line is the only
+        # current fact this snapshot proves.
+        plan = None
+
+    if state == "free":
+        # A Free plan can hold a positive purchased wallet. Those dollars fund
+        # paid models, so the old "free models only" line would deny a balance
+        # the same snapshot reports. Show the positive top-up component and say
+        # what it pays for; zero subscription lines and the free plan's padded
+        # renewal date stay suppressed. A zero total contradicts a usable
+        # wallet, so in that inconsistent shape the copy stays conservative.
+        purchased = _nous_credit_value(access, "purchased_credits_remaining")
+        purchased_positive = purchased is not None and purchased > 0
+        purchased_funds_calls = purchased_positive and (
+            total_usable is None or total_usable > 0
+        )
+        if purchased_funds_calls:
+            _add_detail(
+                "free_tier",
+                "Free tier - paid models via purchased credits",
+            )
+        elif total_usable is not None and total_usable > 0:
+            # A funded total without a positive purchased component is a
+            # credit source this snapshot does not name. Do not deny it with
+            # "free models only" and do not invent "purchased" either.
+            _add_detail("free_tier", "Free tier - credits available")
         else:
-            return build_unavailable("nous", "no-data")
-    elif paid is False:
-        details.append("Status: access depleted - top up to restore")
+            _add_detail("free_tier", "Free tier - free models only")
+        pool = _nous_tool_pool_labels(account)
+        if pool:
+            _add_detail("tool_pool", "Tool pool: " + ", ".join(pool))
+        plan = "Free"
+    elif state == "depleted":
+        _add_detail("status", "Status: access depleted - top up to restore")
+    elif state == "paused":
+        paused_reason = _nous_paused_reason(account)
+        if paused_reason == "payment_past_due":
+            _add_detail("status", "Status: included usage paused - subscription payment failed")
+        elif access is not None and getattr(access, "member_spend_cap_exceeded", None) is True:
+            _add_detail("status", "Status: access paused - member spend cap exceeded")
+        else:
+            _add_detail("status", "Status: included usage paused - check billing")
+    elif state == "unavailable":
+        _add_detail("status", "Paid access is unavailable - check billing or refresh the Portal session")
+    elif state == "unknown":
+        if stale_snapshot:
+            _add_detail(
+                "status",
+                "Paid access: unknown - cached account snapshot is stale; the fresh lookup failed",
+            )
+        elif lookup_failed:
+            _add_detail("status", "Account lookup failed - access status unknown")
+        else:
+            _add_detail("status", "Paid access: unknown - this account snapshot has no subscription details")
+    elif state == "active" and not windows and not details:
+        _add_detail("status", "Paid access: active")
 
-    return QuotaResult(label="nous", windows=windows, plan=plan, details=details)
+    return QuotaResult(
+        label="nous",
+        windows=windows,
+        plan=plan,
+        details=details,
+        detail_facts=detail_facts,
+        account_balances=account_balances,
+        api_calls_available=_nous_api_calls_available(
+            state, access, sub, paid, total_usable,
+            usage_window=getattr(account, "usage_window", None),
+        ),
+        access_state=state,
+        account_org_key=_nous_org_match_key(getattr(account, "org_slug", None)),
+    )
 
 
 _register("nous")(_fetch_nous_portal)
-
 
 # -- OpenAI Codex (with per-model Spark limits) ------------------------------
 # The core fetcher covers plan-level Session/Weekly windows, but drops

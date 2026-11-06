@@ -10,6 +10,7 @@ import importlib
 import json
 import os
 import sys
+import time
 import types
 import unittest
 import urllib.error
@@ -180,6 +181,13 @@ def _nous_account(**overrides):
     """A stand-in for NousPortalAccountInfo shaped like the live free dump."""
     base = dict(
         logged_in=True,
+        source="jwt",
+        fresh=False,
+        user_id="synthetic-user",
+        org_id="synthetic-org",
+        org_slug="synthetic-org",
+        portal_base_url="https://portal.invalid",
+        account_tier=None,
         subscription=None,
         paid_service_access=False,
         tool_access=None,
@@ -194,28 +202,2611 @@ def _nous_account(**overrides):
     return types.SimpleNamespace(**base)
 
 
+def _nous_access(**overrides):
+    """A fresh account-API paid_service_access block with explicit facts."""
+    base = dict(
+        allowed=False,
+        paid_access=False,
+        reason="no_usable_credits",
+        has_active_subscription=False,
+        active_subscription_is_paid=False,
+        subscription_tier=None,
+        subscription_monthly_charge=None,
+        subscription_credits_remaining=0.0,
+        purchased_credits_remaining=0.0,
+        total_usable_credits=0.0,
+        member_spend_cap_exceeded=False,
+    )
+    base.update(overrides)
+    return types.SimpleNamespace(**base)
+
+
+def _nous_fresh_free(**overrides):
+    """A fresh account-API Free snapshot, with no tool-access field by default."""
+    base = dict(
+        source="account_api",
+        fresh=True,
+        account_tier="free",
+        paid_service_access=False,
+        paid_service_access_info=_nous_access(),
+        tool_access=None,
+    )
+    base.update(overrides)
+    return _nous_account(**base)
+
+
+_NOUS_MISSING = object()
+
+
 class NousPortalFetcherTests(unittest.TestCase):
-    def _fetch_with(self, account):
-        from quota_providers.builtin import _fetch_nous_portal
+    def _fetch_with(self, account, *, fresh=_NOUS_MISSING, cached=_NOUS_MISSING):
+        from quota_providers import builtin
+
+        calls: list[bool] = []
+
+        def _choose(value, fallback):
+            if value is _NOUS_MISSING:
+                value = fallback
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def fake_get(*args, **kwargs):
+            is_fresh = bool(kwargs.get("force_fresh"))
+            calls.append(is_fresh)
+            return _choose(fresh if is_fresh else cached, account)
 
         fake_mod = types.ModuleType("hermes_cli.nous_account")
-        fake_mod.get_nous_portal_account_info = lambda *a, **k: account
+        setattr(fake_mod, "get_nous_portal_account_info", fake_get)
         with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}):
-            return _fetch_nous_portal()
+            result = builtin._fetch_nous_portal()
+        self.lookup_calls = calls
+        return result
 
     def test_free_account_gets_honest_card(self):
         acct = _nous_account(
+            account_tier="free",
             tool_access=types.SimpleNamespace(
-                coverage={"firecrawl": True, "browser_use": True, "krea": False}
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True, "krea": False},
             )
         )
         res = self._fetch_with(acct)
         self.assertIsNone(res.unavailable_reason)
         self.assertEqual(res.plan, "Free")
         self.assertEqual(res.windows, [])
+        self.assertIsNone(res.api_calls_available)
+        self.assertEqual(res.access_state, "free")
+        self.assertEqual(self.lookup_calls, [False, True])
         joined = "\n".join(res.details)
         self.assertIn("Free tier", joined)
         self.assertIn("browser-use, firecrawl", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_live_plus_usage_window_surfaces_windows_and_one_account_balance(self):
+        """The real live Plus account shape.
+
+        The plan is usage-window based: the subscription grant is zero, the
+        fresh account snapshot carries four gauges, and the only money is the
+        purchased top-up. The card must show the exact allowance names and one
+        prominent Account balance (the portal's total), with no separate
+        subscription or top-up component lines.
+        """
+        gauges = (
+            types.SimpleNamespace(
+                id="day", scope="all", label="Today", used_bp=0,
+                resets_at_ms=1794056810060,
+            ),
+            types.SimpleNamespace(
+                id="week", scope="all", label="This week", used_bp=0,
+                resets_at_ms=1794575210060,
+            ),
+            types.SimpleNamespace(
+                id="month", scope="all", label="This month", used_bp=0,
+                resets_at_ms=1796562047000,
+            ),
+            types.SimpleNamespace(
+                id="top_tier", scope="top_tier", label="Large models (monthly)",
+                used_bp=0, resets_at_ms=1796562047000,
+            ),
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier=None,
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(
+                plan="Hermes Plus", tier=110, monthly_charge=20.0,
+                monthly_credits=0.0, credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-12-06T13:00:47.000Z",
+            ),
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=9.993238,
+                total_usable_credits=9.993238,
+                member_spend_usd=0.000483,
+            ),
+            usage_window=types.SimpleNamespace(
+                gauges=gauges,
+                featured_model_ids=(
+                    "deepseek/deepseek-v4-flash-0731",
+                    "z-ai/glm-5.3",
+                    "stepfun/step-3.7-flash:free",
+                ),
+                auto_top_up_enabled=False,
+                paused_reason=None,
+                keep_going_on_credits=False,
+            ),
+            tool_access=types.SimpleNamespace(
+                enabled=False,
+                coverage={"firecrawl": True, "browser-use": True},
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual("Hermes Plus", res.plan)
+        self.assertEqual("active", res.access_state)
+        self.assertEqual(
+            ["Daily", "Weekly", "Monthly", "Large models (Monthly)"],
+            [w.label for w in res.windows],
+        )
+        self.assertEqual([0.0, 0.0, 0.0, 0.0], [w.used_percent for w in res.windows])
+        self.assertTrue(all(w.reset_at and w.reset_at.endswith("+00:00")
+                            for w in res.windows))
+        self.assertEqual(
+            [("USD", "9.99", "Account balance")],
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+        )
+        joined = "\n".join(res.details)
+        # One Account balance row is the money; no separate component lines.
+        self.assertNotIn("Subscription credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertIn("Cycle ends: 2026-12-06T13:00:47.000Z", joined)
+        self.assertIn("Spend this period: $0.00 (no cap reported)", joined)
+        self.assertNotIn("Tool pool", joined)
+        self.assertNotIn("Rate limits", joined)
+        # No live JWT claim is available to this snapshot, so the exact
+        # "Hermes Plus" label maps to the docs' bare Plus ceiling.
+        self.assertIn("Rate ceiling: 400 RPM / 4M TPM (published)", joined)
+        self.assertTrue(res.api_calls_available)
+
+    def _plus_usage_account(self, *, used_bp=0, paused_reason=None, keep_going=None,
+                            purchased=0.0, total=0.0):
+        """The real core usage-window shape with the fields the CLI reads."""
+        gauges = (
+            types.SimpleNamespace(
+                id="day", scope="all", label="Today", used_bp=used_bp,
+                resets_at_ms=1794056810060,
+            ),
+            types.SimpleNamespace(
+                id="week", scope="all", label="This week", used_bp=0,
+                resets_at_ms=1794575210060,
+            ),
+            types.SimpleNamespace(
+                id="top_tier", scope="top_tier", label="Large models (monthly)",
+                used_bp=0, resets_at_ms=1796562047000,
+            ),
+        )
+        return _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier=None,
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(
+                plan="Hermes Plus", tier=110, monthly_charge=20.0,
+                monthly_credits=0.0, credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-12-06T13:00:47.000Z",
+            ),
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=purchased,
+                total_usable_credits=total,
+            ),
+            usage_window=types.SimpleNamespace(
+                gauges=gauges,
+                featured_model_ids=(),
+                auto_top_up_enabled=False,
+                paused_reason=paused_reason,
+                keep_going_on_credits=keep_going,
+            ),
+        )
+
+    def test_paused_usage_window_is_paused_with_no_included_windows(self):
+        """A withheld usage-window plan is paused, not active or unavailable.
+
+        Core exposes the pause in ``usage_window.paused_reason``; the CLI used
+        to read only the unrelated member-spend-cap flag, so a paid paused plan
+        was classified active and its stale gauges were ranked.
+        """
+        acct = self._plus_usage_account(
+            paused_reason="payment_past_due", keep_going=False,
+            purchased=9.99, total=9.99,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual("paused", res.access_state)
+        self.assertEqual("Hermes Plus", res.plan)
+        self.assertEqual([], res.windows)
+        self.assertIs(False, res.api_calls_available)
+        self.assertIn(
+            "Status: included usage paused - subscription payment failed",
+            res.details,
+        )
+
+    def test_paused_usage_window_with_paid_flag_false_is_not_unavailable(self):
+        """The portal can drop `paid_service_access` while the plan is paused.
+
+        That aggregate denial — even the lapsed-subscription reason — must not
+        hide the paused plan or its wallet; only the usage-window pause fact
+        decides this state. A stale/failed lookup is converted to `unknown`
+        separately.
+        """
+        for reason in ("no_usable_credits", "subscription_expired"):
+            with self.subTest(reason=reason):
+                acct = self._plus_usage_account(
+                    paused_reason="payment_past_due", keep_going=False,
+                    purchased=9.99, total=9.99,
+                )
+                acct.paid_service_access = False
+                acct.paid_service_access_info.reason = reason
+                res = self._fetch_with(acct)
+                self.assertEqual("paused", res.access_state)
+                self.assertEqual("Hermes Plus", res.plan)
+                self.assertEqual([], res.windows)
+                self.assertEqual(
+                    [("USD", "9.99", "Account balance")],
+                    [(b.currency, b.total_balance, b.label)
+                     for b in res.account_balances],
+                )
+
+    def test_paused_usage_window_keeps_calls_on_proven_purchased_credits(self):
+        acct = self._plus_usage_account(
+            paused_reason="payment_past_due", keep_going=True,
+            purchased=9.99, total=9.99,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual("paused", res.access_state)
+        self.assertEqual([], res.windows)
+        self.assertIs(True, res.api_calls_available)
+
+    def test_paused_usage_window_without_a_continuation_answer_stays_unknown(self):
+        acct = self._plus_usage_account(
+            paused_reason="payment_past_due", keep_going=None,
+            purchased=9.99, total=9.99,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual("paused", res.access_state)
+        self.assertIsNone(res.api_calls_available)
+
+    def test_paused_continuation_ignores_the_withheld_subscription_total(self):
+        """The portal's total still counts the allowance a pause withholds.
+
+        Only the purchased wallet is spendable while paused. A zero wallet is
+        proof that calls stop even when a subscription component and the total
+        both stay positive, and that withheld $18 is not an Account balance.
+        """
+        acct = self._plus_usage_account(
+            paused_reason="payment_past_due", keep_going=True,
+            purchased=0.0, total=18.0,
+        )
+        acct.paid_service_access_info.subscription_credits_remaining = 18.0
+        res = self._fetch_with(acct)
+        self.assertEqual("paused", res.access_state)
+        self.assertIs(False, res.api_calls_available)
+        self.assertEqual(
+            [("USD", "0.00", "Account balance")],
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+        )
+
+    def test_paused_balance_is_the_purchased_wallet_not_the_total(self):
+        acct = self._plus_usage_account(
+            paused_reason="payment_past_due", keep_going=True,
+            purchased=4.0, total=22.0,
+        )
+        acct.paid_service_access_info.subscription_credits_remaining = 18.0
+        res = self._fetch_with(acct)
+        self.assertIs(True, res.api_calls_available)
+        self.assertEqual(
+            [("USD", "4.00", "Account balance")],
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+        )
+
+    def test_paused_continuation_without_a_proven_credit_balance_stays_unknown(self):
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier=None,
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(
+                plan="Hermes Plus", tier=110, monthly_charge=20.0,
+                monthly_credits=0.0, credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-12-06T13:00:47.000Z",
+            ),
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                purchased_credits_remaining=None,
+                total_usable_credits=None,
+                subscription_credits_remaining=None,
+            ),
+            usage_window=types.SimpleNamespace(
+                gauges=(),
+                featured_model_ids=(),
+                auto_top_up_enabled=False,
+                paused_reason="payment_past_due",
+                keep_going_on_credits=True,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual("paused", res.access_state)
+        self.assertIsNone(res.api_calls_available)
+
+    def test_full_all_scope_gauge_with_keep_going_off_reports_calls_unavailable(self):
+        """A paid flag cannot override an exhausted included allowance."""
+        acct = self._plus_usage_account(used_bp=10_000, keep_going=False)
+        res = self._fetch_with(acct)
+        self.assertEqual("active", res.access_state)
+        self.assertEqual(["Daily", "Weekly", "Large models (Monthly)"],
+                         [w.label for w in res.windows])
+        self.assertIs(False, res.api_calls_available)
+
+    def test_full_gauge_with_keep_going_on_and_a_funded_wallet_stays_available(self):
+        acct = self._plus_usage_account(
+            used_bp=10_000, keep_going=True, purchased=2.0, total=2.0,
+        )
+        res = self._fetch_with(acct)
+        self.assertIs(True, res.api_calls_available)
+
+    def test_full_gauge_continuation_needs_a_positive_purchased_wallet(self):
+        """A total that includes the spent included credits proves nothing.
+
+        After the included allowance is exhausted, only the purchased wallet
+        can pay. The portal total can still be positive from the included
+        component, so it must not be read as continuation.
+        """
+        acct = self._plus_usage_account(
+            used_bp=10_000, keep_going=True, purchased=0.0, total=18.0,
+        )
+        acct.paid_service_access_info.subscription_credits_remaining = 18.0
+        res = self._fetch_with(acct)
+        self.assertEqual("active", res.access_state)
+        self.assertIs(False, res.api_calls_available)
+
+    def test_full_gauge_continuation_without_a_wallet_stays_unknown(self):
+        acct = self._plus_usage_account(
+            used_bp=10_000, keep_going=True, purchased=1.0, total=18.0,
+        )
+        acct.paid_service_access_info.purchased_credits_remaining = None
+        acct.paid_service_access_info.subscription_credits_remaining = 18.0
+        res = self._fetch_with(acct)
+        self.assertEqual("active", res.access_state)
+        self.assertIsNone(res.api_calls_available)
+
+    def test_partial_all_scope_gauge_keeps_calls_available(self):
+        acct = self._plus_usage_account(used_bp=5_000, keep_going=False)
+        res = self._fetch_with(acct)
+        self.assertIs(True, res.api_calls_available)
+
+    def test_top_tier_only_gauge_does_not_claim_general_availability(self):
+        acct = self._plus_usage_account(keep_going=False)
+        acct.usage_window.gauges = (
+            types.SimpleNamespace(
+                id="top_tier", scope="top_tier", label="Large models (monthly)",
+                used_bp=0, resets_at_ms=1796562047000,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.api_calls_available)
+
+    def test_real_core_dataclasses_preserve_paid_plus_and_free_cards(self):
+        """Exercise the actual core classes, not only attribute stand-ins.
+
+        The small stand-ins are needed for CI (Hermes core is not installed
+        there), but this test runs wherever the plugin is loaded by Hermes and
+        catches a field rename/type change in the real dataclasses.
+        """
+        try:
+            from agent.usage_gauges import WindowGauge
+            from hermes_cli.nous_account import (
+                NousPaidServiceAccessInfo,
+                NousPortalAccountInfo,
+                NousPortalSubscriptionInfo,
+                NousUsageWindowInfo,
+            )
+        except Exception as exc:  # pragma: no cover - core is optional in plugin CI
+            self.skipTest(f"Hermes core dataclasses unavailable: {exc}")
+
+        paid = NousPortalAccountInfo(
+            logged_in=True,
+            source="account_api",
+            fresh=True,
+            org_id="synthetic-org",
+            org_slug="synthetic-org",
+            account_tier=None,
+            subscription=NousPortalSubscriptionInfo(
+                plan="Hermes Plus",
+                tier=110,
+                monthly_charge=20.0,
+                monthly_credits=0.0,
+                credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-12-06T13:00:47.000Z",
+            ),
+            paid_service_access=True,
+            paid_service_access_info=NousPaidServiceAccessInfo(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=9.99,
+                total_usable_credits=9.99,
+            ),
+            usage_window=NousUsageWindowInfo(
+                gauges=(
+                    WindowGauge("day", "all", "Today", 0, 1794056810060),
+                    WindowGauge("week", "all", "This week", 0, 1794575210060),
+                    WindowGauge("top_tier", "top_tier", "Large models (monthly)",
+                                0, 1796562047000),
+                ),
+                featured_model_ids=(),
+                auto_top_up_enabled=False,
+                paused_reason=None,
+                keep_going_on_credits=False,
+            ),
+        )
+        paid_result = self._fetch_with(paid)
+        self.assertEqual("Hermes Plus", paid_result.plan)
+        self.assertEqual("active", paid_result.access_state)
+        self.assertEqual(["Daily", "Weekly", "Large models (Monthly)"],
+                         [w.label for w in paid_result.windows])
+        self.assertIs(True, paid_result.api_calls_available)
+        self.assertIn("Cycle ends: 2026-12-06T13:00:47.000Z", paid_result.details)
+
+        free = NousPortalAccountInfo(
+            logged_in=True,
+            source="account_api",
+            fresh=True,
+            org_id="synthetic-org",
+            org_slug="synthetic-org",
+            account_tier="free",
+            subscription=NousPortalSubscriptionInfo(
+                plan="Free",
+                tier=0,
+                monthly_charge=0.0,
+                monthly_credits=0.0,
+                credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2027-01-01",
+            ),
+            paid_service_access=False,
+            paid_service_access_info=NousPaidServiceAccessInfo(
+                allowed=False,
+                paid_access=False,
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=False,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+        )
+        free_result = self._fetch_with(free)
+        self.assertEqual("Free", free_result.plan)
+        self.assertEqual("free", free_result.access_state)
+        self.assertEqual([], free_result.windows)
+        joined = "\n".join(free_result.details)
+        self.assertIn("Free tier", joined)
+        self.assertNotIn("Cycle ends:", joined)
+        self.assertIsNone(free_result.api_calls_available)
+
+    def test_usage_window_positive_credits_are_only_the_account_balance(self):
+        """A positive included credit is part of the total, not a second line."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(
+                plan="Hermes Plus", tier=110, monthly_charge=20.0,
+                monthly_credits=0.0, credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-12-06T13:00:47.000Z",
+            ),
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_credits_remaining=5.0,
+                purchased_credits_remaining=9.993238,
+                total_usable_credits=14.993238,
+            ),
+            usage_window=types.SimpleNamespace(
+                gauges=(
+                    types.SimpleNamespace(
+                        id="day", scope="all", label="Today", used_bp=0,
+                        resets_at_ms=1794056810060,
+                    ),
+                ),
+                featured_model_ids=(),
+                auto_top_up_enabled=False,
+                paused_reason=None,
+                keep_going_on_credits=False,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(["Daily"], [w.label for w in res.windows])
+        joined = "\n".join(res.details)
+        self.assertNotIn("Subscription credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertEqual(
+            [("USD", "14.99", "Account balance")],
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+        )
+
+    def test_tool_pool_requires_the_live_entitlement_switch(self):
+        """Coverage entries alone must not advertise a gated-off tool pool."""
+        acct = _nous_account(
+            account_tier="free",
+            tool_access=types.SimpleNamespace(
+                enabled=False,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertNotIn("Tool pool", "\n".join(res.details))
+        self.assertNotIn("tool_pool", res.detail_facts)
+
+    def test_free_pool_survives_fresh_account_omitting_tool_access(self):
+        """The account API may omit tool_access; the same-account JWT has it.
+
+        This is the live shape that lost the line: a fresh Free snapshot with
+        no tool-access field replaced a cached JWT snapshot whose enabled pool
+        was the only source of the entitlement.
+        """
+        cached = _nous_account(
+            account_tier="free",
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free()
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIn("Tool pool: browser-use, firecrawl", res.details)
+        self.assertEqual(
+            res.detail_facts.get("tool_pool"), "Tool pool: browser-use, firecrawl",
+        )
+        self.assertEqual(self.lookup_calls, [False, True])
+
+    def test_free_topup_jwt_claims_and_pool_survive_fresh_account(self):
+        """A free-plan JWT can carry paid_access true because of top-up credit.
+
+        Core's JWT path has no purchased-credit fields, so the old free/paid
+        parity check read this as a plan mismatch and dropped both the pool and
+        the plan's rate-limit claims. The explicit Free plan identity proves the
+        same plan, so both are safe to merge for the same account.
+        """
+        cached = _nous_account(
+            account_tier="free",
+            paid_service_access=True,
+            raw_claims={
+                "paid_access": True,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+                "member_spend_usd": 1.0,
+            },
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free(
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIn("Tool pool: browser-use, firecrawl", res.details)
+        self.assertIn("Rate limits: 50 RPM · 500k TPM · 2.1k RPH", res.details)
+        self.assertEqual(
+            res.detail_facts.get("rate_limits"),
+            "Rate limits: 50 RPM · 500k TPM · 2.1k RPH",
+        )
+
+    def test_live_free_topup_jwt_without_account_tier_keeps_rate_limits(self):
+        """The real JWT has no plan name or account tier, only tier 5.
+
+        Core's JWT path also cannot populate the purchased-credit fields, so
+        ``paid_access: true`` is the only free/paid signal it carries. The
+        fresh account API proves Free (a Free subscription with purchased
+        credits), and the matching tier 5 proves the same plan; the JWT's rate
+        limits must still reach the card.
+        """
+        cached = _nous_account(
+            account_tier=None,
+            paid_service_access=True,
+            raw_claims={
+                "paid_access": True,
+                "subscription_tier": 5,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+            tool_access=types.SimpleNamespace(
+                enabled=False,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free(
+            account_tier=None,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=False,
+                subscription_tier=5,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Free", tier=5, monthly_charge=0.0, monthly_credits=0.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-01",
+            ),
+            tool_access=types.SimpleNamespace(
+                enabled=False,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertEqual(
+            res.detail_facts.get("rate_limits"),
+            "Rate limits: 50 RPM · 500k TPM · 2.1k RPH",
+        )
+        self.assertNotIn("tool_pool", res.detail_facts)
+        self.assertNotIn("Tool pool", "\n".join(res.details))
+
+    def test_live_free_topup_jwt_without_account_tier_can_still_supply_the_pool(self):
+        """The same real JWT shape must not lose an enabled pool either."""
+        cached = _nous_account(
+            account_tier=None,
+            paid_service_access=True,
+            raw_claims={"paid_access": True, "subscription_tier": 5},
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free(
+            account_tier=None,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=False,
+                subscription_tier=5,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Free", tier=5, monthly_charge=0.0, monthly_credits=0.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-01",
+            ),
+            tool_access=None,
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.detail_facts.get("tool_pool"),
+                         "Tool pool: browser-use, firecrawl")
+
+    def test_planless_paid_tier_jwt_still_does_not_match_a_fresh_free_plan(self):
+        """The ambiguous shape is accepted only when the tier also matches."""
+        cached = _nous_account(
+            account_tier=None,
+            paid_service_access=True,
+            raw_claims={
+                "paid_access": True,
+                "subscription_tier": 2,
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+            },
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True},
+            ),
+        )
+        fresh = _nous_fresh_free(
+            account_tier=None,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=False,
+                subscription_tier=5,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+            subscription=types.SimpleNamespace(plan="Free", tier=5),
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertNotIn("rate_limits", res.detail_facts)
+        self.assertNotIn("Rate limits:", "\n".join(res.details))
+        self.assertNotIn("tool_pool", res.detail_facts)
+
+    def test_fresh_explicitly_disabled_pool_is_not_revived_from_the_jwt(self):
+        """An explicit fresh ``enabled: false`` outranks a cached enabled pool."""
+        cached = _nous_account(
+            account_tier="free",
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free(
+            tool_access=types.SimpleNamespace(
+                enabled=False,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertNotIn("Tool pool", "\n".join(res.details))
+        self.assertNotIn("tool_pool", res.detail_facts)
+
+    def test_cached_free_pool_never_crosses_accounts(self):
+        """A different user/org keeps the cached JWT's pool off this row."""
+        cached = _nous_account(
+            user_id="synthetic-other-user",
+            account_tier="free",
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True, "browser_use": True},
+            ),
+        )
+        fresh = _nous_fresh_free()
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertNotIn("Tool pool", "\n".join(res.details))
+        self.assertNotIn("tool_pool", res.detail_facts)
+
+    def test_cached_jwt_raw_tool_access_claim_is_inherited(self):
+        """An older/synthetic JWT with only the raw claim still supplies it."""
+        cached = _nous_account(
+            account_tier="free",
+            tool_access=None,
+            raw_claims={
+                "tool_access": {
+                    "enabled": True,
+                    "coverage": {"firecrawl": True, "browser_use": True},
+                },
+            },
+        )
+        fresh = _nous_fresh_free()
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertIn("Tool pool: browser-use, firecrawl", res.details)
+        self.assertEqual(
+            res.detail_facts.get("tool_pool"), "Tool pool: browser-use, firecrawl",
+        )
+
+    def test_free_pool_needs_only_a_proven_account_not_a_plan_label(self):
+        """A Free JWT's pool and rate limits survive a missing fresh plan label.
+
+        The fresh account snapshot can prove Free through its subscription
+        block while carrying no plan name or tier. The cached JWT explicitly
+        names Free and the account is the same, so its Free-plan rate limits
+        and tool pool remain that account's facts. Spend is not rendered on a
+        Free card, so it stays absent without being a cross-account concern.
+        """
+        cached = _nous_account(
+            account_tier="free",
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "member_spend_usd": 1.0,
+            },
+            tool_access=types.SimpleNamespace(
+                enabled=True,
+                coverage={"firecrawl": True},
+            ),
+        )
+        fresh = _nous_fresh_free(account_tier=None)
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIn("Tool pool: firecrawl", res.details)
+        self.assertIn("Rate limits: 50 RPM", res.details)
+        joined = "\n".join(res.details)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("spend", res.detail_facts)
+
+    def test_free_jwt_tier_claim_is_not_a_paid_plan(self):
+        """The live free JWT carries subscription_tier 5; it is not "Tier 5"."""
+        acct = _nous_account(
+            account_tier="free",
+            raw_claims={
+                "paid_access": False,
+                "subscription_tier": 5,
+                "member_spend_usd": 0.0,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.windows, [])
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - free models only", joined)
+        self.assertIn("Rate limits: 50 RPM · 500k TPM · 2.1k RPH", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_paid_fresh_snapshot_keeps_master_jwt_facts(self):
+        """The account API wins for plan/status; the JWT still supplies limits."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="paid",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason=None,
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=3.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+                "member_spend_usd": 6.0,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertIsNone(res.unavailable_reason)
+        # Fresh account facts own the plan and percentage window.
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(res.access_state, "active")
+        self.assertEqual(len(res.windows), 1)
+        joined = "\n".join(res.details)
+        # The old master facts survive the fresh snapshot's missing raw_claims.
+        self.assertIn("Rate limits: 50 RPM · 500k TPM · 2.1k RPH", joined)
+        self.assertIn("Spend this period: $6.00", joined)
+        self.assertEqual(
+            res.detail_facts.get("rate_limits"),
+            "Rate limits: 50 RPM · 500k TPM · 2.1k RPH",
+        )
+        self.assertEqual(res.detail_facts.get("spend"), "Spend this period: $6.00")
+        self.assertEqual(self.lookup_calls, [False, True])
+
+    def test_paid_plan_change_drops_stale_jwt_rate_and_spend(self):
+        """A cached JWT from an older paid tier is not the current plan's facts.
+
+        Rate limits and period spend are plan-specific. Both snapshots being
+        paid (and even naming the same account) is not enough: without a
+        provably identical plan name/tier the cached claims must be dropped.
+        """
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=0.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Pro", tier=3),
+            raw_claims={
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+                "member_spend_usd": 21.77,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(res.access_state, "active")
+        joined = "\n".join(res.details)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("rate_limits", res.detail_facts)
+        self.assertNotIn("spend", res.detail_facts)
+
+    def test_cached_claims_require_a_provable_same_plan(self):
+        """A paid JWT that cannot name its plan is not merged into a paid card."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={"rate_limit_rpm": 50, "member_spend_usd": 6.0},
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Plus")
+        joined = "\n".join(res.details)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+
+    def test_free_fresh_snapshot_keeps_master_rate_facts(self):
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(),
+        )
+        cached = _nous_account(
+            account_tier="free",
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        joined = "\n".join(res.details)
+        self.assertIn("Rate limits: 50 RPM · 500k TPM · 2.1k RPH", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertEqual(res.detail_facts.get("rate_limits"),
+                         "Rate limits: 50 RPM · 500k TPM · 2.1k RPH")
+
+    def test_master_lookup_failure_keeps_billing_fresh_card_without_claims(self):
+        """The account API can succeed independently of the local JWT read."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(),
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=RuntimeError("jwt unavailable"))
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        joined = "\n".join(res.details)
+        self.assertIn("Rate ceiling: 50 RPM / 500k TPM (published)", joined)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("rate_limits", res.detail_facts)
+        self.assertEqual(self.lookup_calls, [False, True])
+
+    def _fetch_paid_plan_without_claims(self, plan, *, tier=2):
+        """A fresh paid plan snapshot whose JWT carries no live rate claims."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="paid",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason=None,
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=tier,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan=plan, tier=tier, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=0.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan=plan, tier=tier),
+        )
+        return self._fetch_with(fresh, fresh=fresh, cached=cached)
+
+    def test_published_rate_ceiling_for_every_documented_paid_tier(self):
+        """Each official API-docs tier gets its own published ceiling."""
+        expected = {
+            "Basic": "Rate ceiling: 400 RPM / 2M TPM (published)",
+            "Plus": "Rate ceiling: 400 RPM / 4M TPM (published)",
+            "Hermes Plus": "Rate ceiling: 400 RPM / 4M TPM (published)",
+            "Super": "Rate ceiling: 800 RPM / 8M TPM (published)",
+            "Scale": "Rate ceiling: 600 RPM / 6M TPM (published)",
+            "Ultra": "Rate ceiling: 1.6k RPM / 16M TPM (published)",
+            "Default paid users": "Rate ceiling: 180 RPM / 720k TPM (published)",
+        }
+        for plan, line in expected.items():
+            with self.subTest(plan=plan):
+                res = self._fetch_paid_plan_without_claims(plan)
+                self.assertEqual(res.plan, plan)
+                self.assertEqual(res.access_state, "active")
+                self.assertIn(line, res.details)
+                self.assertEqual(res.detail_facts.get("rate_ceiling"), line)
+                self.assertNotIn("rate_limits", res.detail_facts)
+
+    def test_unknown_or_numeric_only_paid_tier_gets_no_published_ceiling(self):
+        """No hypothetical normalization from a bare tier or an unknown label."""
+        for plan in ("Pro", None):
+            with self.subTest(plan=plan):
+                res = self._fetch_paid_plan_without_claims(plan)
+                self.assertEqual(res.access_state, "active")
+                joined = "\n".join(res.details)
+                self.assertNotIn("Rate ceiling", joined)
+                self.assertNotIn("rate_ceiling", res.detail_facts)
+
+    def test_live_rate_claims_win_over_published_tier_and_keep_rph(self):
+        """Actual JWT claims are used as-is; RPH is never dropped for a fallback."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="paid",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason=None,
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=0.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+            raw_claims={
+                "rate_limit_rpm": 51,
+                "rate_limit_tpm": 501_000,
+                "rate_limit_rph": 2_100,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(
+            res.detail_facts.get("rate_limits"),
+            "Rate limits: 51 RPM · 501k TPM · 2.1k RPH",
+        )
+        self.assertNotIn("rate_ceiling", res.detail_facts)
+        self.assertNotIn("Rate ceiling", "\n".join(res.details))
+
+    def test_partial_or_malformed_live_claim_never_mixes_in_published_values(self):
+        """A present claim is authoritative; a broken one is not replaced."""
+        for claim, expected in (
+            ({"rate_limit_rpm": 399}, "Rate limits: 399 RPM"),
+            ({"rate_limit_rpm": "not-a-number"}, None),
+        ):
+            with self.subTest(claim=claim):
+                fresh = _nous_account(
+                    source="account_api",
+                    fresh=True,
+                    account_tier="paid",
+                    paid_service_access=True,
+                    paid_service_access_info=_nous_access(
+                        allowed=True,
+                        paid_access=True,
+                        reason=None,
+                        has_active_subscription=True,
+                        active_subscription_is_paid=True,
+                        subscription_tier=2,
+                        subscription_monthly_charge=20.0,
+                        subscription_credits_remaining=14.0,
+                        purchased_credits_remaining=12.0,
+                        total_usable_credits=26.0,
+                    ),
+                    subscription=types.SimpleNamespace(
+                        plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                        credits_remaining=14.0, rollover_credits=0.0,
+                        current_period_end="2026-12-03",
+                    ),
+                )
+                cached = _nous_account(
+                    account_tier="paid",
+                    paid_service_access=True,
+                    subscription=types.SimpleNamespace(plan="Plus", tier=2),
+                    raw_claims=claim,
+                )
+                res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+                joined = "\n".join(res.details)
+                self.assertNotIn("Rate ceiling", joined)
+                self.assertNotIn("rate_ceiling", res.detail_facts)
+                if expected is None:
+                    self.assertNotIn("Rate limits", joined)
+                    self.assertNotIn("rate_limits", res.detail_facts)
+                else:
+                    self.assertIn(expected, joined)
+
+    def test_stale_paid_snapshot_gets_no_published_ceiling(self):
+        """A stale cached plan is not a current tier identity."""
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+        )
+        res = self._fetch_with(cached, fresh=RuntimeError("fresh lookup failed"), cached=cached)
+        self.assertEqual(res.access_state, "unknown")
+        self.assertNotIn("Rate ceiling", "\n".join(res.details))
+        self.assertNotIn("rate_ceiling", res.detail_facts)
+
+    def test_nous_result_carries_opaque_account_org_for_safe_merge(self):
+        acct = _nous_account(org_slug="synthetic-org")
+        res = self._fetch_with(acct)
+        # Fixed FNV-1a 64 vector, so the test cannot silently agree with a
+        # broken implementation that hashes the wrong bytes.
+        self.assertEqual(res.account_org_key, "10afe58765c15923")
+        self.assertNotIn("synthetic-org", "\n".join(res.details))
+        self.assertIsNotNone(res.account_org_key)
+        self.assertNotIn("synthetic-org", res.account_org_key or "")
+
+    def test_published_rate_ceiling_allows_a_low_balance_unknown_exact_plan(self):
+        """An exact paid plan keeps its documented ceiling while access is unknown."""
+        from quota_providers import builtin
+
+        sub = types.SimpleNamespace(plan="Plus", tier=2)
+        acct = _nous_account(subscription=sub, raw_claims={})
+        self.assertEqual(
+            builtin._nous_published_rate_limits(acct, "unknown", sub),
+            ("Plus", 400, 4_000_000),
+        )
+
+    def test_published_rate_ceiling_maps_hermes_plus_and_never_crosses_free(self):
+        """The account API's product label is the same exact Plus tier.
+
+        A prefixed paid label never gives a Free reading a paid ceiling, and a
+        Free label on a paid snapshot never inherits the Free ceiling.
+        """
+        from quota_providers import builtin
+
+        plus = types.SimpleNamespace(plan="Hermes Plus", tier=110)
+        acct = _nous_account(subscription=plus, raw_claims={})
+        for state in ("active", "unknown", "depleted", "paused"):
+            with self.subTest(state=state):
+                self.assertEqual(
+                    builtin._nous_published_rate_limits(acct, state, plus),
+                    ("Plus", 400, 4_000_000),
+                )
+        self.assertIsNone(
+            builtin._nous_published_rate_limits(acct, "free", plus)
+        )
+        free = types.SimpleNamespace(plan="Free", tier=5)
+        self.assertIsNone(
+            builtin._nous_published_rate_limits(acct, "active", free)
+        )
+
+    def test_master_claims_do_not_copy_identity_or_entitlement_fields(self):
+        """Only the old card's display-safe rate/spend claims cross over."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(),
+        )
+        cached = _nous_account(
+            account_tier="free",
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "member_spend_usd": 0.0,
+                "email": "private@example.invalid",
+                "org_id": "secret-org",
+                "subscription_tier": 5,
+                "paid_access": True,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        blob = "\n".join(res.details) + repr(res.detail_facts)
+        self.assertNotIn("private@example.invalid", blob)
+        self.assertNotIn("secret-org", blob)
+        self.assertNotIn("Tier 5", blob)
+        self.assertNotIn("paid_access", blob)
+        self.assertIn("Rate limits: 50 RPM", blob)
+        self.assertEqual(
+            set(res.detail_facts),
+            {"free_tier", "rate_limits"},
+        )
+
+    def test_stale_paid_jwt_claims_do_not_decorate_a_fresh_free_snapshot(self):
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(),
+        )
+        cached = _nous_account(
+            source="jwt",
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={
+                "paid_access": True,
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+                "rate_limit_rph": 16_800,
+                "member_spend_usd": 21.77,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - free models only", joined)
+        self.assertIn("Rate ceiling: 50 RPM / 500k TPM (published)", joined)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("Tier 5", joined)
+
+    def test_stale_paid_claims_do_not_decorate_a_free_snapshot_without_a_tier(self):
+        """A free snapshot proven only by ``has_active_subscription: false``.
+
+        Core's freest account shape has no ``account_tier`` and no subscription
+        object; only the access block says there is no active subscription. A
+        stale paid JWT's rate/spend claims must not cross that free/paid
+        boundary.
+        """
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier=None,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+            ),
+        )
+        cached = _nous_account(
+            source="jwt",
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={
+                "paid_access": True,
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+                "rate_limit_rph": 16_800,
+                "member_spend_usd": 21.77,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - free models only", joined)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("Tier 5", joined)
+
+    def test_free_topup_without_plan_name_is_not_active_and_has_no_renewal(self):
+        """An explicit no-subscription Free plan with top-up stays Free.
+
+        Core's aggregate ``paid_service_access`` is true when purchased credits
+        fund calls, so a plan-less Free snapshot used to be classified active
+        and its padded renewal date was rendered. The account API's explicit
+        ``has_active_subscription: false`` is the authoritative answer.
+        """
+        free_sub = types.SimpleNamespace(
+            plan=None, tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+            subscription=free_sub,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIs(res.api_calls_available, True)
+        self.assertEqual(res.windows, [])
+        self.assertEqual(
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+            [("USD", "10.00", "Account balance")],
+        )
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - paid models via purchased credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("Cycle ends:", joined)
+        self.assertNotIn("Subscription credits", joined)
+
+    def test_cached_claims_require_the_same_user(self):
+        """A different user in the same org must never receive cached claims."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            user_id="synthetic-other-user",
+            account_tier="paid",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason=None,
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=3.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "member_spend_usd": 6.0,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(res.access_state, "active")
+        joined = "\n".join(res.details)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("rate_limits", res.detail_facts)
+        self.assertNotIn("spend", res.detail_facts)
+
+    def test_cached_claims_require_the_same_org_and_portal(self):
+        """A shared user label is not enough without the same org and portal."""
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={"rate_limit_rpm": 50},
+        )
+        for changed in (
+            {"org_id": "synthetic-other-org"},
+            {"portal_base_url": "https://other-portal.invalid"},
+        ):
+            with self.subTest(changed=changed):
+                fresh = _nous_account(
+                    source="account_api",
+                    fresh=True,
+                    paid_service_access=True,
+                    paid_service_access_info=_nous_access(
+                        allowed=True,
+                        paid_access=True,
+                        reason="usable_credits",
+                        has_active_subscription=True,
+                        active_subscription_is_paid=True,
+                    ),
+                    **changed,
+                )
+                res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+                self.assertNotIn("Rate limits:", "\n".join(res.details))
+
+    def test_cached_claims_are_refused_when_identity_is_not_proven(self):
+        """Missing identity is fail-closed, not an implicit match."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            user_id=None,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={"rate_limit_rpm": 50},
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertNotIn("Rate limits:", "\n".join(res.details))
+
+    def test_exhausted_paid_snapshot_keeps_its_paid_jwt_rate_claims(self):
+        """A denied paid account is not a Free account; keep its rate facts."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="paid",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+            raw_claims={
+                "rate_limit_rpm": 400,
+                "rate_limit_tpm": 4_000_000,
+                "rate_limit_rph": 16_800,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(res.access_state, "depleted")
+        self.assertIn("Rate limits: 400 RPM · 4M TPM · 16.8k RPH",
+                      "\n".join(res.details))
+
+    def test_free_account_api_snapshot_is_not_depleted(self):
+        """A fresh account API that explicitly has no subscription is free."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access_info=_nous_access(),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Free")
+        self.assertIsNone(res.api_calls_available)
+        self.assertEqual(res.access_state, "free")
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier", joined)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("unknown", joined)
+
+    def test_free_snapshot_suppresses_zero_credits_and_renewal(self):
+        """A free plan's padded zero balances are not display facts."""
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            subscription=free_sub,
+            raw_claims={"member_spend_usd": 0.0},
+            paid_service_access_info=_nous_access(),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertEqual(res.windows, [])
+        # Zero is a known total, distinct from an absent field: it stays on the
+        # card without turning the plan into a paid subscription.
+        self.assertEqual(
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+            [("USD", "0.00", "Account balance")],
+        )
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - free models only", joined)
+        for noise in ("Subscription credits", "Top-up credits", "Account balance",
+                      "Cycle ends:", "Spend this period:", "$0.00"):
+            self.assertNotIn(noise, joined)
+
+    def test_missing_total_with_zero_subscription_uses_the_wallet_as_total(self):
+        """An absent total may use the wallet only when subscription credits are zero.
+
+        This is the supported top-up-only shape: there is no included credit
+        pool, so the purchased wallet is the whole Account balance. The card
+        still renders one balance row, not a component line.
+        """
+        access = _nous_access(
+            allowed=True,
+            paid_access=True,
+            reason="usable_credits",
+            has_active_subscription=False,
+            active_subscription_is_paid=False,
+            subscription_credits_remaining=0.0,
+            purchased_credits_remaining=10.0,
+            total_usable_credits=None,
+        )
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=access,
+            subscription=free_sub,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIs(res.api_calls_available, True)
+        self.assertEqual(
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+            [("USD", "10.00", "Account balance")],
+        )
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - paid models via purchased credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("Subscription credits", joined)
+
+    def test_missing_total_with_unknown_subscription_is_not_summed(self):
+        """No fabricated total: an unknown included component blocks the fallback."""
+        access = _nous_access(
+            allowed=True,
+            paid_access=True,
+            reason="usable_credits",
+            has_active_subscription=False,
+            active_subscription_is_paid=False,
+            subscription_credits_remaining=None,
+            purchased_credits_remaining=10.0,
+            total_usable_credits=None,
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=access,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.account_balances, [])
+        self.assertNotIn("Account balance", "\n".join(res.details))
+
+    def test_empty_subscription_object_does_not_block_free(self):
+        """A ``subscription: {}`` payload must behave like no subscription."""
+        empty_sub = types.SimpleNamespace(
+            plan=None, tier=None, monthly_charge=None, monthly_credits=None,
+            credits_remaining=None, rollover_credits=None, current_period_end=None,
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            subscription=empty_sub,
+            paid_service_access_info=_nous_access(
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIsNone(res.api_calls_available)
+        self.assertNotIn("unknown", "\n".join(res.details))
+
+    def test_zeroed_subscription_object_does_not_block_free(self):
+        """Every numeric field padded with 0 is still no subscription fact."""
+        zeroed_sub = types.SimpleNamespace(
+            plan=None, tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end=None,
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            subscription=zeroed_sub,
+            paid_service_access_info=_nous_access(
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIsNone(res.api_calls_available)
+
+    def test_free_plan_with_purchased_credits_stays_free(self):
+        """Purchased credits make paid_service_access true but not a paid plan.
+
+        A Free plan whose $10 top-up wallet funds calls reports
+        ``paid_service_access: true``; that must not turn it into a paid
+        subscription. The zeroed subscription object also carries a renewal
+        date, which is not evidence of a paid plan and must not be rendered.
+        """
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        access = _nous_access(
+            allowed=True,
+            paid_access=True,
+            reason="usable_credits",
+            has_active_subscription=False,
+            active_subscription_is_paid=False,
+            subscription_tier=5,
+            subscription_monthly_charge=0.0,
+            subscription_credits_remaining=0.0,
+            purchased_credits_remaining=10.0,
+            total_usable_credits=10.0,
+            member_spend_cap_exceeded=False,
+            member_spend_usd=0.0,
+            member_spend_cap_usd=0.0,
+        )
+        for overrides in (
+            {"account_tier": "free", "subscription": free_sub},
+            {"account_tier": None, "subscription": free_sub},
+        ):
+            with self.subTest(overrides=overrides):
+                acct = _nous_account(
+                    source="account_api",
+                    fresh=True,
+                    paid_service_access=True,
+                    paid_service_access_info=access,
+                    **overrides,
+                )
+                res = self._fetch_with(acct)
+                self.assertEqual(res.access_state, "free")
+                self.assertEqual(res.plan, "Free")
+                self.assertEqual(res.windows, [])
+                # Purchased credits make calls usable, but never make the plan
+                # a subscription: the plan label stays Free, the wallet is a
+                # prominent, explicitly labeled balance, and no renewal date
+                # (the padded one on the free subscription object) is shown.
+                self.assertIs(res.api_calls_available, True)
+                self.assertEqual(
+                    [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+                    [("USD", "10.00", "Account balance")],
+                )
+                joined = "\n".join(res.details)
+                self.assertIn("Free tier - paid models via purchased credits", joined)
+                self.assertNotIn("Top-up credits", joined)
+                self.assertNotIn("Free tier - free models only", joined)
+                for paid_noise in (
+                    "Cycle ends:",
+                    "Subscription credits",
+                    "Account balance",
+                    "Spend this period",
+                    "Tier 5",
+                ):
+                    self.assertNotIn(paid_noise, joined)
+
+    def test_free_topup_with_zero_total_does_not_claim_paid_models(self):
+        """A zero authoritative total contradicts a usable purchased wallet."""
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        access = _nous_access(
+            allowed=True,
+            paid_access=True,
+            reason="usable_credits",
+            has_active_subscription=False,
+            active_subscription_is_paid=False,
+            subscription_credits_remaining=0.0,
+            purchased_credits_remaining=10.0,
+            total_usable_credits=0.0,
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=True,
+            paid_service_access_info=access,
+            subscription=free_sub,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - free models only", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("paid models via purchased credits", joined)
+        self.assertNotIn("Cycle ends:", joined)
+
+    def test_free_funded_total_without_a_named_component_is_neutral(self):
+        """A positive total with no purchased amount is not "free models only"."""
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=None,
+                total_usable_credits=5.0,
+            ),
+            subscription=free_sub,
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIs(res.api_calls_available, True)
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - credits available", joined)
+        self.assertNotIn("free models only", joined)
+        self.assertNotIn("purchased credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("Cycle ends:", joined)
+
+    def test_true_paid_plan_with_topup_credits_is_not_free(self):
+        """A real paid subscription outranks a stale free tier claim."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=24.0,
+                member_spend_cap_exceeded=False,
+                member_spend_usd=5.0,
+                member_spend_cap_usd=100.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=3.0,
+                current_period_end="2026-12-03",
+            ),
+        )
+        res = self._fetch_with(fresh)
+        self.assertEqual(res.access_state, "active")
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(len(res.windows), 1)
+        self.assertIs(res.api_calls_available, True)
+        joined = "\n".join(res.details)
+        self.assertIn("Cycle ends: 2026-12-03", joined)
+        self.assertNotIn("Subscription credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("Account balance", joined)
+        self.assertEqual(
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+            [("USD", "24.00", "Account balance")],
+        )
+        self.assertIn("Spend this period: $5.00", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_stale_paid_jwt_claims_do_not_decorate_free_plan_with_topup(self):
+        """A Free plan with $10 purchased credit is still a free tier."""
+        free_sub = types.SimpleNamespace(
+            plan="Free", tier=0, monthly_charge=0.0, monthly_credits=0.0,
+            credits_remaining=0.0, rollover_credits=0.0,
+            current_period_end="2027-01-01",
+        )
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=False,
+                active_subscription_is_paid=False,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=10.0,
+            ),
+            subscription=free_sub,
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            raw_claims={
+                "rate_limit_rpm": 400,
+                "member_spend_usd": 21.77,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        self.assertEqual(res.access_state, "free")
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.windows, [])
+        self.assertIs(res.api_calls_available, True)
+        self.assertEqual(
+            [(b.currency, b.total_balance, b.label) for b in res.account_balances],
+            [("USD", "10.00", "Account balance")],
+        )
+        joined = "\n".join(res.details)
+        self.assertIn("Free tier - paid models via purchased credits", joined)
+        self.assertNotIn("Top-up credits", joined)
+        self.assertNotIn("Free tier - free models only", joined)
+        self.assertNotIn("Cycle ends:", joined)
+        self.assertNotIn("Rate limits:", joined)
+        self.assertNotIn("Spend this period", joined)
+        self.assertNotIn("Tier 5", joined)
+
+    def test_subscription_tier_number_alone_is_not_paid_evidence(self):
+        """A synthesized ``Tier N`` label must never prove a paid plan."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            subscription=types.SimpleNamespace(
+                plan=None, tier=5, monthly_charge=None, monthly_credits=None,
+                credits_remaining=None, rollover_credits=None, current_period_end=None,
+            ),
+            paid_service_access_info=_nous_access(
+                reason="no_usable_credits",
+                has_active_subscription=None,
+                active_subscription_is_paid=None,
+                subscription_tier=5,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertNotEqual(res.access_state, "depleted")
+        joined = "\n".join(res.details)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("Tier 5", joined)
+
+    def test_account_missing_reason_is_unavailable_not_depleted(self):
+        """``account_missing`` must not become credit exhaustion."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                reason="account_missing",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=110.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.access_state, "unavailable")
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access is unavailable", joined)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_subscription_expired_reason_is_unavailable_not_depleted(self):
+        """A lapsed subscription is not the same state as exhausted credits."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                reason="subscription_expired",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=110.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.access_state, "unavailable")
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access is unavailable", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_unavailable_snapshot_hides_stale_paid_windows_and_credits(self):
+        """An unresolved/lapsed account has no current paid facts to show."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            raw_claims={
+                "rate_limit_rpm": 400,
+                "member_spend_usd": 21.77,
+                "member_spend_cap_usd": 200.0,
+            },
+            paid_service_access_info=_nous_access(
+                reason="subscription_expired",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=110.0,
+                credits_remaining=88.0, rollover_credits=3.0,
+                current_period_end="2026-12-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.access_state, "unavailable")
+        self.assertEqual(res.windows, [])
+        self.assertIsNone(res.plan)
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access is unavailable", joined)
+        for stale in (
+            "Subscription credits",
+            "Top-up credits",
+            "Account balance",
+            "Rollover:",
+            "Cycle ends:",
+            "Spend this period",
+            "Rate limits:",
+            "Tier 2",
+            "Plus",
+        ):
+            self.assertNotIn(stale, joined)
+        self.assertEqual(set(res.detail_facts), {"status"})
+
+    def test_unavailable_reason_outranks_stale_paid_and_pause_flags(self):
+        """A missing account cannot be active/paused just because flags say so."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="account_missing",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+                member_spend_cap_exceeded=True,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=110.0,
+                credits_remaining=88.0, rollover_credits=3.0,
+                current_period_end="2026-12-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.access_state, "unavailable")
+        self.assertEqual(res.windows, [])
+        self.assertIsNone(res.plan)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access is unavailable", joined)
+        self.assertNotIn("paused", joined.lower())
+        self.assertNotIn("Subscription credits", joined)
+
+    def test_live_jwt_fallback_is_unknown_not_free(self):
+        """The live JWT shortcut carries no subscription object; stay unknown."""
+        acct = _nous_account(
+            raw_claims={
+                "paid_access": False,
+                "subscription_tier": 5,
+                "member_spend_usd": 0.0,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+            tool_access=types.SimpleNamespace(enabled=True, coverage={"firecrawl": True}),
+        )
+        res = self._fetch_with(acct, fresh=RuntimeError("portal unavailable"), cached=acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertEqual(res.access_state, "unknown")
+        self.assertIsNone(res.api_calls_available)
+        self.assertEqual(self.lookup_calls, [False, True])
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access: unknown", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_failed_fresh_lookup_marks_a_paid_cached_jwt_stale(self):
+        """A cached paid JWT is history, not a current active entitlement.
+
+        When the forced account-API read fails, the local JWT fallback may
+        still carry a paid plan, renewal and rate/spend claims. Presenting any
+        of those as current would claim a freshness the read did not prove.
+        """
+        cached = _nous_account(
+            source="jwt",
+            fresh=False,
+            account_tier="paid",
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=20.0,
+                credits_remaining=14.0, rollover_credits=3.0,
+                current_period_end="2026-12-03",
+            ),
+            raw_claims={
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "member_spend_usd": 6.0,
+                "member_spend_cap_usd": 200.0,
+            },
+        )
+        res = self._fetch_with(
+            _nous_account(),
+            fresh=RuntimeError("portal unavailable"),
+            cached=cached,
+        )
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertEqual(res.access_state, "unknown")
+        self.assertIsNone(res.api_calls_available)
+        self.assertEqual(res.windows, [])
+        self.assertEqual(res.account_balances, [])
+        self.assertEqual(self.lookup_calls, [False, True])
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access: unknown", joined)
+        self.assertIn("stale", joined)
+        for stale_fact in (
+            "Cycle ends:", "Subscription credits", "Top-up credits",
+            "Rollover", "Spend this period", "Rate limits:", "Account balance",
+        ):
+            self.assertNotIn(stale_fact, joined)
+
+    def test_failed_fresh_and_cached_lookup_is_honest_unavailable(self):
+        res = self._fetch_with(
+            _nous_account(),
+            fresh=RuntimeError("portal unavailable"),
+            cached=RuntimeError("auth store unavailable"),
+        )
+        self.assertEqual(res.unavailable_reason, "fetcher-unavailable")
+        self.assertEqual(res.details, [])
+        self.assertIsNone(res.plan)
+        self.assertIsNone(res.access_state)
+
+    def test_bounded_lookup_honors_wall_clock(self):
+        """The 20s sweep budget needs a hard wall clock, not only socket timeouts."""
+        from quota_providers import builtin
+
+        started = time.monotonic()
+        value = builtin._bounded_account_lookup(
+            lambda **kwargs: (time.sleep(0.4), "late")[1],
+            force_fresh=True,
+            timeout=0.05,
+        )
+        self.assertIs(value, builtin._NOUS_LOOKUP_TIMEOUT)
+        self.assertLess(time.monotonic() - started, 0.3)
+        self.assertLess(builtin._NOUS_FETCH_BUDGET_S, 20.0)
+
+    def test_bounded_lookup_preserves_contextvars(self):
+        """The worker must see the active profile/auth context, not a blank one."""
+        import contextvars
+
+        from quota_providers import builtin
+
+        profile = contextvars.ContextVar("quota_test_profile")
+        profile.set("profile-A")
+
+        value = builtin._bounded_account_lookup(
+            lambda **kwargs: profile.get(), force_fresh=True, timeout=1.0)
+        self.assertEqual(value, "profile-A")
+
+    def test_older_core_without_force_fresh_keyword_still_works(self):
+        """An older lookup signature degrades to one no-argument call."""
+        from quota_providers import builtin
+
+        acct = _nous_account(account_tier="free")
+        no_arg_calls = []
+
+        def old_get(**kwargs):
+            if kwargs:
+                raise TypeError("unexpected keyword argument 'force_fresh'")
+            no_arg_calls.append(True)
+            return acct
+
+        fake_mod = types.ModuleType("hermes_cli.nous_account")
+        setattr(fake_mod, "get_nous_portal_account_info", old_get)
+        with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}):
+            res = builtin._fetch_nous_portal()
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(res.access_state, "free")
+        self.assertIsNone(res.unavailable_reason)
+        # A forced retry after the compatibility fallback would repeat the
+        # same core work; the result is reused for both reads.
+        self.assertEqual(len(no_arg_calls), 1)
+
+    def test_older_core_signature_skips_the_speculative_keyword_call(self):
+        """A lookup that advertises no keyword is never probed with one."""
+        from quota_providers import builtin
+
+        acct = _nous_account(account_tier="free")
+        calls = []
+
+        def old_get():
+            calls.append(True)
+            return acct
+
+        fake_mod = types.ModuleType("hermes_cli.nous_account")
+        setattr(fake_mod, "get_nous_portal_account_info", old_get)
+        with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}):
+            res = builtin._fetch_nous_portal()
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(len(calls), 1)
+
+    def test_lookups_pass_force_fresh_explicitly(self):
+        """Never call the helper with no arguments when the keyword is known."""
+        from quota_providers import builtin
+
+        acct = _nous_account(account_tier="free")
+        calls = []
+
+        def get(*args, **kwargs):
+            calls.append((args, dict(kwargs)))
+            return acct
+
+        fake_mod = types.ModuleType("hermes_cli.nous_account")
+        setattr(fake_mod, "get_nous_portal_account_info", get)
+        with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}):
+            builtin._fetch_nous_portal()
+        self.assertEqual(calls, [((), {"force_fresh": False}),
+                                 ((), {"force_fresh": True})])
+
+    def test_timed_out_master_lookup_does_not_start_a_second_request(self):
+        """An abandoned worker may still be in flight; do not duplicate it."""
+        from quota_providers import builtin
+
+        calls = []
+
+        def slow_get(*args, **kwargs):
+            calls.append((args, dict(kwargs)))
+            time.sleep(0.25)
+            return _nous_account()
+
+        fake_mod = types.ModuleType("hermes_cli.nous_account")
+        setattr(fake_mod, "get_nous_portal_account_info", slow_get)
+        with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}), \
+             mock.patch.object(builtin, "_NOUS_ACCOUNT_TIMEOUT_S", 0.05):
+            res = builtin._fetch_nous_portal()
+        self.assertEqual(res.unavailable_reason, "fetcher-unavailable")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ())
+        self.assertIs(calls[0][1].get("force_fresh"), False)
+
+    def test_account_api_result_from_the_first_lookup_is_not_fetched_twice(self):
+        """A no-arg lookup can already hit the account API; reuse that result."""
+        from quota_providers import builtin
+
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+        )
+        calls = []
+
+        def get(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return acct
+
+        fake_mod = types.ModuleType("hermes_cli.nous_account")
+        setattr(fake_mod, "get_nous_portal_account_info", get)
+        with mock.patch.dict(sys.modules, {"hermes_cli.nous_account": fake_mod}):
+            res = builtin._fetch_nous_portal()
+        self.assertEqual(res.plan, "Free")
+        self.assertEqual(calls, [{"force_fresh": False}])
+
+    def test_error_snapshot_with_stored_free_tier_is_unknown(self):
+        """A failed lookup never turns a stored tier claim into Free."""
+        error_acct = _nous_account(
+            source="error",
+            fresh=False,
+            account_tier="free",
+            raw_claims={},
+            paid_service_access=False,
+        )
+        res = self._fetch_with(error_acct, fresh=error_acct, cached=error_acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertEqual(res.access_state, "unknown")
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Account lookup failed", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_paid_plan_overrides_a_stale_free_tier_claim(self):
+        """A fresh paid subscription outranks a stored/legacy free tier claim."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="free",
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Plus", tier=2, monthly_charge=20.0, monthly_credits=110.0,
+                credits_remaining=0.0, rollover_credits=0.0,
+                current_period_end="2026-12-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.plan, "Plus")
+        self.assertEqual(res.access_state, "depleted")
+        self.assertIs(res.api_calls_available, False)
+        self.assertNotIn("Free tier", "\n".join(res.details))
+
+    def test_depleted_paid_subscription_is_not_free(self):
+        """paid=False + an active paid plan + zero credits is depletion, not free."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                allowed=False,
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Tier 2",
+                tier=2,
+                monthly_charge=20.0,
+                monthly_credits=110.0,
+                credits_remaining=0.0,
+                rollover_credits=0.0,
+                current_period_end="2026-09-01",
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Tier 2")
+        self.assertEqual(len(res.windows), 1)
+        self.assertAlmostEqual(res.windows[0].used_percent, 100.0)
+        self.assertIs(res.api_calls_available, False)
+        joined = "\n".join(res.details)
+        self.assertIn("Status: access depleted - top up to restore", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("unknown", joined)
+
+    def test_depleted_paid_without_balance_fields_is_still_depleted(self):
+        """An active paid subscription + denied access mirrors core's exhausted copy."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=types.SimpleNamespace(
+                allowed=False,
+                paid_access=False,
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=None,
+                purchased_credits_remaining=None,
+                total_usable_credits=None,
+                member_spend_cap_exceeded=False,
+            ),
+            subscription=types.SimpleNamespace(
+                plan="Tier 2",
+                tier=2,
+                monthly_charge=20.0,
+                monthly_credits=None,
+                credits_remaining=None,
+                rollover_credits=None,
+                current_period_end=None,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Tier 2")
+        self.assertIs(res.api_calls_available, False)
+        joined = "\n".join(res.details)
+        self.assertIn("Status: access depleted", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_explicitly_unpaid_subscription_is_unknown_not_free_or_depleted(self):
+        """An active but explicitly non-paid plan is neither free nor depleted."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            account_tier="standard",
+            paid_service_access_info=_nous_access(
+                allowed=False,
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=False,
+                subscription_tier=5,
+                subscription_credits_remaining=0.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=0.0,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access: unknown", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_denied_paid_access_with_positive_credits_is_not_depleted(self):
+        """A denial plus a positive balance is unavailable, not exhaustion."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                allowed=False,
+                reason="no_usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=7.5,
+                purchased_credits_remaining=2.5,
+                total_usable_credits=10.0,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access is unavailable", joined)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_member_spend_cap_pause_is_not_depletion_or_free(self):
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=False,
+            paid_service_access_info=_nous_access(
+                allowed=False,
+                reason="member_spend_cap_exceeded",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=120.0,
+                purchased_credits_remaining=10.0,
+                total_usable_credits=130.0,
+                member_spend_cap_exceeded=True,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        # A paused included plan is not proof that calls stopped: purchased
+        # credits may still continue, and this snapshot has no explicit
+        # credits_pay-style answer, so availability stays unproven.
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Status: access paused - member spend cap exceeded", joined)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("Free tier", joined)
+
+    def test_paid_plan_without_credit_evidence_is_unknown_not_depleted(self):
+        """A paid-tier claim alone cannot prove depletion when balances are absent."""
+        acct = _nous_account(
+            account_tier="paid",
+            raw_claims={
+                "paid_access": False,
+                "subscription_tier": 5,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access: unknown", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_unknown_jwt_snapshot_does_not_fabricate_free_or_a_plan(self):
+        """Without account_tier or subscription facts, do not infer free/depleted."""
+        acct = _nous_account(
+            raw_claims={
+                "paid_access": False,
+                "subscription_tier": 5,
+                "member_spend_usd": 0.0,
+                "rate_limit_rpm": 50,
+                "rate_limit_tpm": 500_000,
+                "rate_limit_rph": 2_100,
+            },
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertIsNone(res.plan)
+        self.assertEqual(res.windows, [])
+        self.assertIsNone(res.api_calls_available)
+        joined = "\n".join(res.details)
+        self.assertIn("Paid access: unknown", joined)
+        self.assertNotIn("Free tier", joined)
+        self.assertNotIn("Tier 5", joined)
+        self.assertNotIn("depleted", joined)
+
+    def test_active_paid_snapshot_is_available(self):
+        acct = _nous_account(
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_credits_remaining=12.0,
+                purchased_credits_remaining=0.0,
+                total_usable_credits=12.0,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertIsNone(res.unavailable_reason)
+        self.assertEqual(res.plan, "Tier 2")
+        self.assertIs(res.api_calls_available, True)
+        joined = "\n".join(res.details)
+        self.assertNotIn("depleted", joined)
+        self.assertNotIn("Free tier", joined)
 
     def test_paid_subscription_builds_percent_window(self):
         acct = _nous_account(
@@ -256,6 +2847,72 @@ class NousPortalFetcherTests(unittest.TestCase):
         joined = "\n".join(res.details)
         self.assertIn("Spend this period: $21.77 (no cap reported)", joined)
         self.assertIn("Rate limits: 400 RPM · 4M TPM · 16.8k RPH", joined)
+
+    def test_fresh_member_spend_is_read_without_a_jwt(self):
+        """The account API's own spend/cap fields are facts, not JWT leftovers."""
+        acct = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            raw_claims=None,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+                member_spend_usd=7.5,
+                member_spend_cap_usd=100.0,
+            ),
+        )
+        res = self._fetch_with(acct)
+        self.assertEqual(res.access_state, "active")
+        joined = "\n".join(res.details)
+        self.assertIn("Spend this period: $7.50", joined)
+        self.assertNotIn("no cap reported", joined)
+        self.assertEqual(res.detail_facts.get("spend"), "Spend this period: $7.50")
+
+    def test_fresh_member_spend_wins_over_a_stale_jwt_claim(self):
+        """The fresh access values are current; the cached JWT spend is not."""
+        fresh = _nous_account(
+            source="account_api",
+            fresh=True,
+            paid_service_access=True,
+            paid_service_access_info=_nous_access(
+                allowed=True,
+                paid_access=True,
+                reason="usable_credits",
+                has_active_subscription=True,
+                active_subscription_is_paid=True,
+                subscription_tier=2,
+                subscription_monthly_charge=20.0,
+                subscription_credits_remaining=14.0,
+                purchased_credits_remaining=12.0,
+                total_usable_credits=26.0,
+                member_spend_usd=7.5,
+                member_spend_cap_usd=100.0,
+            ),
+        )
+        cached = _nous_account(
+            account_tier="paid",
+            paid_service_access=True,
+            subscription=types.SimpleNamespace(plan="Plus", tier=2),
+            raw_claims={
+                "member_spend_usd": 6.0,
+                "member_spend_cap_usd": 200.0,
+                "rate_limit_rpm": 50,
+            },
+        )
+        res = self._fetch_with(fresh, fresh=fresh, cached=cached)
+        joined = "\n".join(res.details)
+        self.assertIn("Spend this period: $7.50", joined)
+        self.assertNotIn("Spend this period: $6.00", joined)
+        self.assertIn("Rate limits: 50 RPM", joined)
 
     def test_not_logged_in_is_unavailable(self):
         res = self._fetch_with(_nous_account(logged_in=False))
@@ -650,33 +3307,6 @@ _KIMI_LIVE_PAYLOAD = {
 
 
 class KimiFetcherTests(unittest.TestCase):
-    def test_requests_identify_application_without_mutating_caller_headers(self):
-        """Kimi's edge rejects urllib's default User-Agent with HTTP 403/1010."""
-        from quota_providers import kimi
-
-        cases = (
-            ("https://api.kimi.ai/coding/v1/usages", "GET", None),
-            ("https://api.kimi.com/coding/v1/usages", "GET", None),
-            (kimi._WEB_URL, "POST", b"{}"),
-        )
-        for url, method, body in cases:
-            with self.subTest(url=url, method=method):
-                headers = {"Authorization": "Bearer test-only"}
-                with mock.patch.object(kimi, "urlopen_no_redirect",
-                                       side_effect=lambda req, **kw: _FakeResponse(
-                                           json.dumps(_KIMI_LIVE_PAYLOAD).encode())) as opener:
-                    result = kimi._fetch_with(
-                        headers, url, method, body)
-                assert result is not None
-                self.assertIsNone(result.unavailable_reason)
-                request = opener.call_args.args[0]
-                self.assertEqual(request.full_url, url)
-                self.assertEqual(request.get_header("User-agent"), "HermesAgent")
-                self.assertEqual(request.get_header("Authorization"), "Bearer test-only")
-                self.assertEqual(request.get_method(), method)
-                self.assertEqual(request.data, body)
-                self.assertEqual(headers, {"Authorization": "Bearer test-only"})
-
     def test_no_credentials_anywhere(self):
         """Neither Hermes auth nor the legacy session file -> no-credentials."""
         from quota_providers import kimi

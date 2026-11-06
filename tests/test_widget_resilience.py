@@ -239,6 +239,25 @@ class NullProviderRenderTests(unittest.TestCase):
         })
         self.assertEqual(got["providerWindowLines"], [])
 
+    def test_tooltip_lists_only_usable_windows(self):
+        """A paused row's stale gauges are withheld quota, not remaining quota."""
+        paused = {
+            "access_state": "paused",
+            "windows": [{"label": "Daily", "used_percent": 20}],
+        }
+        self.assertEqual(
+            run_js({"providerWindowLines": ["nous", paused]})["providerWindowLines"],
+            [],
+        )
+        active = {
+            "access_state": "active",
+            "windows": [{"label": "Daily", "used_percent": 20}],
+        }
+        self.assertEqual(
+            len(run_js({"providerWindowLines": ["nous", active]})["providerWindowLines"]),
+            1,
+        )
+
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for widget render tests")
     def test_null_window_does_not_crash_provider_card(self):
         tree = render(component="row", provider={"windows": [None], "details": []})

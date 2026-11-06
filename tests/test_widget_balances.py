@@ -36,12 +36,101 @@ class WidgetBalanceTests(unittest.TestCase):
         self.assertIn('Account balance', tooltip_text(tree))
         self.assertNotIn('%', text(tree))
 
+    def test_provider_label_is_used_for_a_prominent_balance(self):
+        # Nous Portal names its total "Total usable"; older wallets without a
+        # label must keep the established "Account balance" wording.
+        labelled = dict(BALANCE, account_balances=[dict(
+            BALANCE['account_balances'][0], label='Total usable')])
+        for component in ('row', 'chip'):
+            with self.subTest(component=component):
+                tree = render(component=component, provider=labelled)
+                self.assertIn('$12.50 USD', text(tree))
+                self.assertIn('Total usable', text(tree) + tooltip_text(tree))
+                self.assertNotIn('Account balance', tooltip_text(tree))
+
     def test_zero_and_unavailable_calls_not_missing_data(self):
         p = dict(BALANCE, api_calls_available=False, account_balances=[dict(BALANCE['account_balances'][0], total_balance='0')])
         tree = render(component='row', provider=p)
         self.assertIn('$0.00 USD', text(tree))
         self.assertIn('API calls available: no', text(tree))
         self.assertIn('bad', [n['props'].get('data-tone') for n in nodes(tree)])
+
+    def test_nous_free_is_muted_and_depleted_paid_is_not_green(self):
+        """Only evidence-backed active access may turn the status dot green."""
+        free = {
+            'label': 'nous', 'windows': [], 'account_balances': [],
+            'details': ['Free tier - free models only'], 'plan': 'Free',
+            'api_calls_available': None,
+        }
+        depleted = dict(
+            free, plan='Tier 2',
+            details=['Status: access depleted - top up to restore'],
+            api_calls_available=False,
+        )
+        active = dict(free, plan='Tier 2', details=[], api_calls_available=True)
+
+        free_tree = render(component='row', provider=free)
+        self.assertIn('Free', text(free_tree))
+        self.assertIn('muted', [n['props'].get('data-tone') for n in nodes(free_tree)])
+        self.assertNotIn('good', [n['props'].get('data-tone') for n in nodes(free_tree)])
+
+        depleted_tree = render(component='row', provider=depleted)
+        self.assertIn('bad', [n['props'].get('data-tone') for n in nodes(depleted_tree)])
+        self.assertNotIn('good', [n['props'].get('data-tone') for n in nodes(depleted_tree)])
+
+        active_tree = render(component='row', provider=active)
+        self.assertIn('good', [n['props'].get('data-tone') for n in nodes(active_tree)])
+
+    def test_confirmed_free_access_state_is_green_without_paid_claim(self):
+        """A structured ``access_state=free`` is healthy, not paid availability."""
+        free = {
+            'label': 'nous', 'windows': [], 'account_balances': [],
+            'details': ['Free tier - free models only'], 'plan': 'Free',
+            'api_calls_available': None, 'access_state': 'free',
+        }
+        tree = render(component='row', provider=free)
+        tones = [n['props'].get('data-tone') for n in nodes(tree)]
+        self.assertIn('good', tones)
+        self.assertIn('Free', text(tree))
+        self.assertNotIn('API calls available', text(tree))
+        self.assertIsNone(free['api_calls_available'])
+
+        unknown = dict(free)
+        unknown.pop('access_state')
+        unknown_tree = render(component='row', provider=unknown)
+        self.assertNotIn('good', [n['props'].get('data-tone') for n in nodes(unknown_tree)])
+
+    def test_depleted_or_paused_outranks_a_positive_window(self):
+        """A remaining window cannot turn a confirmed unusable row green."""
+        base = {
+            'windows': [{'label': 'Subscription', 'used_percent': 10}],
+            'details': [], 'account_balances': [], 'api_calls_available': False,
+        }
+        for state in ('depleted', 'paused'):
+            with self.subTest(state=state):
+                provider = dict(base, access_state=state)
+                tree = render(component='row', provider=provider)
+                tones = [n['props'].get('data-tone') for n in nodes(tree)]
+                self.assertIn('bad', tones)
+                self.assertNotIn('good', tones)
+                self.assertEqual([], [n for n in nodes(tree)
+                                      if 'data-window' in n.get('props', {})])
+
+    def test_unavailable_access_does_not_paint_stale_windows_healthy(self):
+        provider = {
+            'windows': [{'label': 'Subscription', 'used_percent': 5}],
+            'details': ['Paid access is unavailable'],
+            'account_balances': [], 'access_state': 'unavailable',
+            'api_calls_available': None,
+        }
+        tree = render(component='row', provider=provider)
+        self.assertEqual([], [n for n in nodes(tree) if 'data-window' in n.get('props', {})])
+        body = text(tree)
+        self.assertNotIn('95%', body)
+        self.assertIn('Paid access is unavailable', body)
+        tones = [n['props'].get('data-tone') for n in nodes(tree)]
+        self.assertIn('muted', tones)
+        self.assertNotIn('good', tones)
 
     def test_small_nonzero_balance_keeps_reported_precision(self):
         # Regression: a nonzero total must not be rounded down into "$0.00".

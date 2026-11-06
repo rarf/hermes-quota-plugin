@@ -285,6 +285,51 @@ class QuotaLayoutTests(unittest.TestCase):
         block = plugin._format_quota_block(cache)
         self.assertIn("• anthropic: Session 90%", block)
 
+    def test_nous_total_usable_balance_uses_its_own_label(self):
+        text = render(self.cache({
+            "nous": record(
+                "nous",
+                plan="Free",
+                details=["Free tier - free models only"],
+                account_balances=[{
+                    "currency": "USD", "total_balance": "10.00",
+                    "label": "Total usable",
+                }],
+                api_calls_available=True,
+            ),
+        }))
+        self.assertIn("Nous Portal (Free)", text)
+        self.assertIn("Total usable: $10.00 USD", text)
+        self.assertIn("Free tier - free models only", text)
+
+    def test_non_usd_balance_never_uses_a_dollar_prefix(self):
+        text = render(self.cache({
+            "nous": record(
+                "nous",
+                account_balances=[{
+                    "currency": "CNY", "total_balance": "25.125",
+                }],
+            ),
+        }))
+        self.assertIn("Account balance: 25.125 CNY", text)
+        self.assertNotIn("$25.125", text)
+        self.assertNotIn("$", text)
+
+    def test_balance_label_strips_terminal_control_characters(self):
+        text = render(self.cache({
+            "nous": record(
+                "nous",
+                account_balances=[{
+                    "currency": "USD", "total_balance": "8.00",
+                    "label": "Total\x1b[31m usable\x07\u202e",
+                }],
+            ),
+        }))
+        self.assertIn("Total usable: $8.00 USD", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+        self.assertNotIn("\u202e", text)
+
 
 if __name__ == "__main__":
     unittest.main()
