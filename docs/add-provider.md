@@ -81,9 +81,18 @@ Contract rules (all enforced in review):
   percent from a bare balance. No denominator: use `account_balances` for
   structured monetary facts and `details` for the CLI breakdown ("$X left").
   `AccountBalance` holds `currency`, `total_balance`, and optional
-  `granted_balance` / `topped_up_balance` as decimal strings. A provider may set
+  `granted_balance` / `topped_up_balance` as decimal strings. A provider may
+  also set the optional `label` when its wallet means something other than a
+  generic account balance; consumers fall
+  back to their own default label when it is absent. A provider may set
   `api_calls_available` to a reported boolean; `None` means unknown. These fields
   survive cache serialization and render without percentage bars.
+  `api_calls_available` is independent of `access_state`: a plan can be
+  `paused` (included usage stopped) while purchased credits still pay for API
+  calls (`api_calls_available: true`). Consumers must consult the flag before
+  painting a paused row unusable — `true` renders as a warning, `false` is the
+  unusable verdict, and `None` leaves continuation unproven. A paused plan's
+  own percentage windows stay unrankable either way.
 - **Prefer a published reset over a derived one.** If any endpoint returns the
   window's own reset timestamp, use it verbatim and delete the derivation
   (`ollama.py` dropped a `_next_monthly_reset()` built from the account's
@@ -93,8 +102,10 @@ Contract rules (all enforced in review):
   and if you must, say so on the card.
 - **Label figures the way the provider's own page labels them.** Ollama shows
   purchased credit as "Current balance" and the plan allowance separately, so
-  the widget's generic "Account balance" row has to carry the purchased wallet —
-  putting the allowance there made the card contradict the page it came from.
+  the widget's provider-labelled balance row (default "Account balance") has to
+  carry the purchased wallet — putting the allowance there made the card
+  contradict the page it came from. Set `AccountBalance.label` when the
+  provider's own name differs (Ollama's purchased credit is "Current balance").
   When two figures from one response are *different pools*, name both in
   `details` instead of merging them or showing one unlabelled.
 - **Round money for display; keep the raw for arithmetic.** Endpoints often
@@ -104,8 +115,11 @@ Contract rules (all enforced in review):
   keeps extra digits rather than reading as "no money left".
 - **Free tiers get honest cards.** If the API exposes nothing numeric for the
   tier, return a card with `plan="Free"` and `details` describing what IS true
-  (published limits, tool pool). See `_fetch_nous_portal()` in `builtin.py`
-  for the reference implementation.
+  (published limits, tool pool). Only call a snapshot free when it carries
+  actual evidence (`account_tier` `free`/`anonymous`, an explicit account-API
+  no-subscription record, or a "Free" plan name); `paid_service_access is
+  False` alone means "not usable right now", not "free". See
+  `_fetch_nous_portal()` in `builtin.py` for the reference implementation.
 - **No secrets in output or logs.** Fetchers receive credentials, the cache
   stores display data only. Never log headers/cookies/tokens; never put
   account IDs or emails into `details`.

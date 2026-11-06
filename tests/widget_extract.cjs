@@ -59,6 +59,9 @@ const SUPPORT = [
 	"asWindowList",
 	"asProvider",
 	"remainingPct",
+	"usableWindows",
+	"worstWindow",
+	"toneForRemaining",
 	"balanceFractionDigits",
 	"accountFacts",
 	"providerTone",
@@ -69,7 +72,10 @@ const SUPPORT = [
 ];
 // Module state the locale helpers read (no ctx and no render here → "en").
 const INTL_TAGS_SRC = src.slice(src.indexOf("const INTL_TAGS = {"), src.indexOf("};", src.indexOf("const INTL_TAGS = {")) + 2);
-const PRELUDE = `let CTX = null;\nlet _renderLocale = null;\n${INTL_TAGS_SRC}\n`;
+// `tr` is the bundle translator; a minimal stand-in lets window lines be
+// exercised without booting the bundle (no test relied on it missing).
+const TR_SRC = `const tr = (key, ...args) => key === "valueLeft" ? args[0] + " left" : key === "windowFallback" ? "window" : args.length ? key + " " + args.join(" ") : key; const fmtPct = (n) => n + "%";\n`;
+const PRELUDE = `let CTX = null;\nlet _renderLocale = null;\n${TR_SRC}${INTL_TAGS_SRC}\n`;
 const names = Array.from(new Set([...SUPPORT, ...Object.keys(input)]))
 	.filter((n) => src.includes("function " + n + "("));
 const parts = names.map(extract);

@@ -22,6 +22,176 @@
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
 
+### Nous Portal
+
+The CLI and TUI read Nous Portal through the cached account fetcher (the same
+Hermes-managed login `hermes portal status` shows). That fetcher imports the
+undocumented core module `hermes_cli.nous_account` — a catalog rule 9
+private-core warning, disclosed rather than claimed compliant, because Hermes
+has no public Nous account-data seam. It keeps two
+independent reads: the old local-JWT method (RPM/TPM/RPH and period spend) and
+the fresh account snapshot (subscription/credits/entitlement), so a successful
+fresh read no longer discards the rate-limit claims. Cached JWT facts are
+merged only when both reads prove the same Portal, organisation and user
+identity and the same plan (name and/or numeric tier), or a cached Free plan
+matched to a fresh Free reading; a missing identity, a free/paid mismatch or a
+paid-tier change contributes no cached claims, so one account's or plan's
+rate/spend facts can never decorate another's card. A JWT minted for a Free plan
+with purchased credits carries `paid_access: true` but no plan name, account
+tier or purchased-credit fields; when its numeric tier matches the fresh Free
+plan, that unproven flag is not a mismatch and its rate-limit claims still
+merge. A paid plan name, paid account tier or paid-subscription evidence still
+fails closed. On
+Desktop, the Nous card reads billing/usage through Hermes's read-only
+`billing.state` gateway method (called with the Desktop SDK's `host.request`) at
+the configured interval; that method may contact Nous Portal, and a failure keeps
+the cached row. `billing.state` is an app gateway method, not a documented
+plugin API or compatibility contract. Billing is authoritative for plan,
+status, usage windows and
+every financial figure on a credit-grant plan. The cached account row is never
+a source of financial data there: `billing.state` exposes no signed-in user id,
+so another login's spend, rollover or **Account balance** cannot be proven
+to describe this Billing account.
+
+A usage-window plan (Plus/Super/Ultra) is the exception: core reports its
+dollar-credit model as unavailable, so Billing carries the plan, access state
+and gauges but no computed usage total. Billing's own `balance_display` is
+still the account wallet and supplies the one **Account balance** even when
+`usage.available` is false; it never depends on the cached account row. A fresh
+same-profile account snapshot may also add neutral `Cycle ends` and `Spend this
+period`, and its reported total-usable figure outranks Billing's wallet when its
+exact plan label and access state match Billing's and its `account_org_key`
+matches the local digest of Billing's `org_slug`; without a fresh matching
+snapshot, Billing's wallet remains the balance. That cached total is display
+data, not verified money: it is a point-in-time Portal figure, and while a plan
+is paused it still counts the included credits the pause withholds. A paused
+plan therefore never takes the cached total and keeps Billing's own wallet (or,
+in the CLI row, the purchased wallet alone); the organisation digest is a
+same-organisation hint that cannot distinguish another signed-in user, so the
+cached total is not account proof. `Cycle ends` is used because
+Billing exposes no cancellation state: a cancelled-at-period-end plan must not
+be labeled as renewing.
+Subscription and top-up component amounts are folded into that one balance and
+never rendered as separate lines. If the total field is absent, the purchased
+wallet may be used only when the snapshot explicitly reports zero included
+subscription credits; an unknown component is never summed into a fabricated
+total. The card also never claims that wallet automatically pays included
+subscription usage (that needs `keep_going_on_credits` / `credits_pay`).
+Billing's plan, access state, usage windows and wallet balance stay
+authoritative; a stale, missing or mismatched cached snapshot contributes no
+cycle-end, spend, rate or component fact. That match is only a
+same-organisation hint, not account proof: Billing exposes no signed-in user
+id, so another user in the same organisation can match. A cached cycle-end or
+spend fact therefore carries the same residual limitation as the rate line;
+Billing's own plan, wallet and windows do not depend on that match.
+
+Two non-financial account facts may accompany a Billing row:
+
+- **Rate limits.** A cached `Rate limits: …` line is shown only when the cache
+  is fresh, the cached row and Billing carry the same exact plan label and the
+  same access state (no free/paid or active/unknown crossing), and both name
+  the same Portal organisation. Billing's `org_slug` is reduced locally to a
+  pseudonymous digest (unkeyed FNV-1a, not a secret or cryptographic
+  identifier) and compared with the cache's `account_org_key`; the raw slug is
+  not rendered or stored in the query cache. A numeric tier or generic "paid"
+  flag is never normalized into a plan. Same organisation + same plan + same
+  state is still only a same-organisation hint, not account proof:
+  `billing.state` exposes no signed-in user id, so another user in the same
+  organisation can match. The line is therefore disclosed as cached account
+  data with that residual limitation; any missing or disagreeing fact fails
+  closed.
+- **Free Tool pool.** It is shown only when Billing and a fresh same-profile
+  cached snapshot both describe a Free plan, the account fetcher's live
+  `tool_access.enabled` switch is true (the fetch emits the fact only in that
+  case), and the cached `account_org_key` matches the local digest of Billing's
+  `org_slug`. A paid Billing row, a disabled pool, an unavailable/unknown
+  account read, a missing or mismatched organisation, and a cache older than
+  the tool-pool freshness bound show no pool line. The categories are
+  entitlement labels, not account or payment data.
+
+When no live account rate claim is mergeable, an unambiguous Billing plan gets
+a documented **published** fallback from the official
+[Nous API docs](https://portal.nousresearch.com/api-docs) (retrieved
+2026-11-06):
+
+| Plan | RPM | TPM |
+| --- | ---: | ---: |
+| Free | 50 | 500,000 |
+| Basic | 400 | 2,000,000 |
+| Plus | 400 | 4,000,000 |
+| Super | 800 | 8,000,000 |
+| Scale | 600 | 6,000,000 |
+| Ultra | 1,600 | 16,000,000 |
+| Default paid users | 180 | 720,000 |
+
+The fallback is rendered as `Rate ceiling: … (published)` and only for an exact
+documented plan label. The account API's product-prefixed labels map to the
+same bare tier (`Hermes Plus` → Plus; 400 RPM / 4M TPM), while an unknown
+suffix or numeric tier still gets no fallback. A Free reading never inherits a
+paid plan's ceiling, and a paid reading never inherits Free's. The docs publish
+RPM and TPM only, so a fallback never invents an RPH figure; a live account
+claim always wins and keeps its RPH value. Unknown labels and numeric tiers
+show no fallback. A low-balance paid
+plan keeps its exact label while its access state becomes `unknown`, so its
+published ceiling is still shown. The same table is
+used by the CLI/TUI account card.
+
+Free accounts with no purchased credit show `Free` plus free-tier facts only:
+component zero credit lines and a free plan's cycle-end date are not rendered.
+When the account snapshot supplies its computed `total_usable_credits`, that
+exact amount is shown as one prominent **Account balance** (zero is a known
+amount; an absent field stays unknown and shows no balance). If that total is
+absent while the snapshot explicitly reports zero included subscription
+credits, the purchased wallet is the whole usable balance and may be shown as
+the Account balance; an unknown subscription component is never summed.
+Purchased credits on a Free plan can make `paid_service_access` true
+while the subscription itself has no charge or included credits; that is still
+a Free plan, not a paid subscription, so the plan stays `Free`, the wallet is
+available for calls, and no cycle-end date is rendered. When that purchased
+wallet is positive, the card says `Free tier - paid models via purchased
+credits` and shows it as the one **Account balance**, so the status
+line no longer denies a funded wallet; separate component lines are hidden.
+A missing top-up amount stays unknown, and the plain free-only copy remains
+for a Free account with no purchased credit. A funded total whose component
+the snapshot does not name is described neutrally as `Free tier - credits
+available`, neither denied as free-only nor attributed to a purchase. The free
+**Tool pool** line is shown only when the account snapshot's live
+`tool_access.enabled` switch is true; coverage entries alone do not advertise
+pool access. When the fresh account-API snapshot omits `tool_access` entirely,
+a cached JWT snapshot that proves the same Portal account and the same
+free/paid reading may supply its enabled switch. An explicit fresh
+`enabled: false` always wins, and a cached pool is never used across accounts
+or from a paid snapshot. A real paid subscription (a positive charge, included
+credits, or an active paid subscription) outranks a stale free tier claim and
+keeps its supplied cycle-end date.
+
+An `unavailable` account (missing account or lapsed subscription) shows only
+the status line: stale subscription windows, credit balances, rollover,
+cycle-end dates, spend and rate limits are suppressed rather than presented as
+current facts.
+
+A paused plan (`plan_usage.paused_reason`) is a warning, not a red unusable
+verdict: the included allowance is paused, while Billing's own `credits_pay`
+answer covers the separate purchased-credit pool. `true` says calls continue on
+purchased credits and renders as a warning, `false` renders as unavailable, and
+an absent answer stays unknown rather than asserting a stop. A `true` answer is
+void when Billing reports the account wallet as explicitly `$0.00`: with no
+purchased credit to spend, calls are unavailable and the card does not claim
+purchased credits still apply. An absent wallet amount leaves the Billing
+answer standing. Paused plan windows are never shown or ranked as remaining
+quota.
+
+The CLI/TUI account snapshot exposes the same pause as
+`usage_window.paused_reason`; it classifies the row `paused` and suppresses its
+windows. Its own `usage_window.keep_going_on_credits` answer governs call
+availability: `true` reports available only when a positive purchased balance
+is actually proven, `false` reports unavailable, and an absent answer stays
+unknown. The same rule applies to an active usage-window plan whose all-scope
+gauge is exhausted: with `keep_going_on_credits=false` calls are unavailable,
+with `true` availability follows the proven purchased balance, and otherwise it
+stays unknown. Only an account confirmed depleted reports calls unavailable
+without that evidence; an unknown snapshot never claims yes.
+
 ### Ollama
 
 Ollama Cloud quota is read from three endpoints, all documented since

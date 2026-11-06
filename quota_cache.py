@@ -40,6 +40,23 @@ Cache schema (``quota_cache.json``)::
       }
     }
 
+``access_state`` is structured evidence for providers whose entitlement is not
+a percentage window: ``"free"`` and ``"active"`` are confirmed usable, while
+``"unknown"``/absent never grants a healthy tone. Older records without it are
+treated as unknown and stay muted.
+
+``detail_facts`` is an optional stable key -> display-line map. It lets a
+consumer pick one non-financial account fact (the Desktop Nous card's Free
+Tool pool) by identity instead of slicing ``details`` text. Financial facts are
+never merged across sources. It is display data only, and older records without
+it remain valid.
+
+A Nous record may also carry ``account_org_key``, a pseudonymous 16-character
+lowercase hexadecimal FNV-1a digest of the provider organisation. It is not a
+secret or a cryptographic identifier, and it cannot distinguish two users in
+the same organisation. The cache accepts only that exact shape, so a legacy or
+buggy fetcher cannot persist a raw organisation slug through the field.
+
 ``codex_special_reset`` is public announcement metadata for Codex. It is not
 account quota: it never changes a provider window or ``reset_at``.
 """
@@ -49,6 +66,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -58,6 +76,7 @@ from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from .quota_providers import PROVIDER_FETCHERS, QuotaAccount, QuotaResult, GENERATED_ACCOUNT_ID_PREFIX
+from .quota_providers.base import ACCESS_STATES
 from .quota_providers.codex import display_label
 from . import codex_special_reset
 
@@ -157,6 +176,10 @@ def iter_account_records(providers):
 
 
 def _result_to_record(res: QuotaResult) -> dict[str, Any]:
+    # Structured tone evidence is normalized here: a malformed fetcher value
+    # must not become a claim the Desktop trusts. Unknown/legacy records carry
+    # None and stay muted.
+    access_state = res.access_state if res.access_state in ACCESS_STATES else None
     record: dict[str, Any] = {
         "label": res.label,
         "plan": res.plan,
@@ -164,10 +187,12 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
         "details": list(res.details or []),
         "account_balances": [
             {"currency": b.currency, "total_balance": b.total_balance,
-             "granted_balance": b.granted_balance, "topped_up_balance": b.topped_up_balance}
+             "granted_balance": b.granted_balance, "topped_up_balance": b.topped_up_balance,
+             **({"label": b.label} if isinstance(b.label, str) and b.label.strip() else {})}
             for b in res.account_balances
         ],
         "api_calls_available": res.api_calls_available,
+        "access_state": access_state,
         "windows": [
             {"label": w.label, "used_percent": w.used_percent, "reset_at": w.reset_at}
             for w in res.windows
@@ -175,6 +200,33 @@ def _result_to_record(res: QuotaResult) -> dict[str, Any]:
     }
     if res.account_label:
         record["account_label"] = res.account_label
+    # Pseudonymous provider organisation digest, used only by the Desktop Nous
+    # merge to compare a cached account row with the Billing organisation.
+    # It is a pseudonymous, unkeyed FNV-1a 64-bit digest, never a rendered
+    # value and never the raw slug. The strict shape is deliberate: a buggy or
+    # legacy fetcher must not be able to persist an organisation slug (or any
+    # other provider text) through this field.
+    account_org_key = res.account_org_key
+    if isinstance(account_org_key, str):
+        account_org_key = account_org_key.strip()
+        if re.fullmatch(r"[0-9a-f]{16}", account_org_key):
+            record["account_org_key"] = account_org_key
+    # Optional source-fact map (currently the Nous account claims). It is
+    # display data only: merge consumers must not have to re-parse `details`
+    # strings, and a malformed provider value is dropped here rather than
+    # becoming a claim the Desktop trusts.
+    raw_facts = res.detail_facts if isinstance(res.detail_facts, dict) else {}
+    facts: dict[str, str] = {}
+    for key, value in raw_facts.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key = key.strip()
+        value = value.strip()
+        if not key or not value or len(key) > 64 or len(value) > 400:
+            continue
+        facts[key] = value
+    if facts:
+        record["detail_facts"] = facts
     if res.accounts:
         record["accounts"] = [
             ({
@@ -252,6 +304,7 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
         reason = account.get("unavailable_reason")
         details = account.get("details")
         windows = account.get("windows")
+        state = account.get("access_state")
         rows[key] = {
             "label": f"{base_label} · {account_label}" if account_label else base_label,
             "provider": provider_id,
@@ -263,6 +316,7 @@ def _expand_accounts(provider_id: str, record: Any) -> dict[str, Any]:
             "windows": windows if isinstance(windows, list) else [],
             "account_balances": [],
             "api_calls_available": None,
+            "access_state": state if state in ACCESS_STATES else None,
         }
     return rows
 
@@ -274,6 +328,7 @@ def _unavailable_record(provider_id: str, reason: str) -> dict[str, Any]:
         "unavailable_reason": reason,
         "details": [],
         "windows": [],
+        "access_state": None,
     }
 
 
@@ -445,19 +500,38 @@ def refresh_quota_cache(*, budget: Optional[float] = None) -> dict[str, Any]:
             record = previous_providers.get(key)
             if not isinstance(record, dict):
                 continue
-            # Keep the identity (label/plan) and the note, drop the numbers: a
-            # sweep that never tried this provider cannot claim its windows are
-            # current, and both the CLI and the widget render windows whenever
-            # they exist.
+            # Keep the identity (label/plan) and the note, drop every number:
+            # a sweep that never tried this provider cannot claim its windows,
+            # balances or financial detail lines are current. In particular,
+            # a cached "Subscription credits"/"Spend"/"Cycle ends" line must not
+            # survive in the CLI just because its provider was not refreshed.
             carried = dict(record)
             carried["unavailable_reason"] = "not-refreshed"
             carried["windows"] = []
             carried["account_balances"] = []
             carried["api_calls_available"] = None
+            carried["access_state"] = None
+            carried["detail_facts"] = {}
             note = "Not refreshed in this sweep: the provider registry was incomplete"
-            details = [d for d in (carried.get("details") or []) if d != note]
-            details.append(note)
-            carried["details"] = details
+            carried["details"] = [note]
+            nested = carried.get("accounts")
+            if isinstance(nested, list):
+                # Codex keeps saved accounts nested; each account row is a
+                # rendering surface of its own, so it gets the same scrub.
+                sanitized: list[Any] = []
+                for account in nested:
+                    if not isinstance(account, dict):
+                        continue
+                    child = dict(account)
+                    child["unavailable_reason"] = "not-refreshed"
+                    child["windows"] = []
+                    child["account_balances"] = []
+                    child["api_calls_available"] = None
+                    child["access_state"] = None
+                    child["detail_facts"] = {}
+                    child["details"] = [note]
+                    sanitized.append(child)
+                carried["accounts"] = sanitized
             providers[key] = carried
     if orphans:
         logger.warning(

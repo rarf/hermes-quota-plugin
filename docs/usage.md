@@ -96,6 +96,76 @@ icon).
   separately so long balance details cannot overlap the footer.
 - A **version-skew** notice when the backend reports a different plugin version.
 
+- **Nous source and freshness**: on Desktop, the Nous card reads the focused
+  profile's billing/usage summary through Hermes's read-only `billing.state`
+  gateway method (called via the Desktop SDK's `host.request`) at the configured
+  refresh interval. The gateway may contact
+  Nous Portal for that read; the widget itself opens no network connection. If the
+  method is unavailable, unsupported or fails, the cached CLI row stays.
+  `billing.state` is an app gateway method, not a documented plugin API or
+  compatibility contract. Billing
+  owns the Nous plan/status/windows; on a credit-grant plan it also owns every
+  financial figure, and the cached account row is never a source of financial
+  data there because Billing exposes no signed-in user id. Spend, rollover and
+  the prominent **Account balance** never come from that cache on a
+  credit-grant plan. A usage-window plan (Plus/Super/Ultra) is the exception:
+  Billing's dollar-credit model is unavailable, but Billing's own
+  `balance_display` wallet still supplies the one **Account balance** without
+  needing any cached account row. A fresh same-profile account snapshot may
+  additionally add neutral `Cycle ends` and spend lines only when its exact plan
+  label and
+  access state match Billing's and its organisation digest matches Billing's
+  `org_slug`; its actual total-usable figure then outranks Billing's wallet,
+  and the wallet remains the balance when no fresh matching snapshot exists.
+  That cached total is display data, not verified money: it still counts the
+  included subscription credits a pause withholds, so a paused plan never takes
+  it and keeps Billing's own wallet (or the purchased wallet alone in the CLI
+  row). The organisation digest cannot distinguish another signed-in user in
+  the same organisation, so the cached total is not account proof.
+  `Cycle ends` is deliberate because `billing.state` has no cancellation state;
+  a cancelled-at-period-end plan must not be labeled as renewing.
+  Subscription and top-up components are folded into that one balance, never
+  rendered as separate lines, and the card never claims the top-up
+  automatically pays included subscription usage (that needs
+  `keep_going_on_credits` / `credits_pay`). An absent total may use the wallet
+  only when the snapshot explicitly reports zero included subscription
+  credits; an unknown component is never summed. Billing's plan, access
+  state, windows and wallet stay authoritative; a stale, missing or mismatched
+  snapshot contributes no cached fact. That match is only a
+  same-organisation hint, not account proof: Billing exposes no signed-in user
+  id, so another user in the same organisation can match. The same residual
+  limitation applies to the live **Rate limits** line, which accompanies a
+  Billing row only when the cache is fresh, carries the same exact plan label
+  and access state, and matches Billing's Portal organisation via a
+  pseudonymous local digest; the Free **Tool pool** line is shown when Billing
+  and a fresh same-profile cached snapshot both say Free, the fetcher's
+  effective `tool_access.enabled` is true, and the cached organisation digest
+  matches Billing's `org_slug`. A missing or mismatched fact fails
+  closed. A low-balance paid plan keeps its exact label, so its published
+  ceiling remains visible even while its access state is `unknown`. When no
+  live claim is mergeable, an exact documented plan label gets its published
+  RPM/TPM ceiling from the official Nous API docs, marked `(published)`; the
+  account's product-prefixed `Hermes Plus` maps to the documented Plus tier,
+  while unknown labels and numeric tiers get none, and no RPH
+  is invented. The footer's `Checked … old` always
+  describes
+  the cached quota snapshot for the other providers; when the Nous row came
+  from billing, a separate `Nous billing checked … ago` note is appended
+  instead of rewriting that age. A
+  paused plan warns rather than reading as healthy or unavailable: included
+  usage is stopped, and when Billing answers `credits_pay: true` the card says
+  purchased credits still apply and the status chip reports API calls as
+  available in the warning colour — unless Billing also reports an explicitly
+  empty wallet (`$0.00`), in which case the promise has no funds, so the card
+  reports calls unavailable and omits the purchased-credits claim. Paused plan
+  windows are not shown or ranked
+  as remaining included quota. The CLI/TUI account fetcher applies the same
+  pause from `usage_window.paused_reason`, suppresses those windows, and uses
+  `usage_window.keep_going_on_credits` plus a proven purchased balance for call
+  availability; an absent answer stays unknown. An exhausted all-scope gauge
+  with `keep_going_on_credits=false` also reports calls unavailable rather than
+  inferring yes from a paid flag.
+
 ### Settings
 
 Everything lives in the pane's **Quota Settings** view and persists locally:

@@ -651,9 +651,31 @@ function asProvider(value) {
 	return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 }
 
+/**
+ * Windows that may inform health, worst-chip ranking and alerts.
+ *
+ * A confirmed unusable entitlement outranks any window in the row. A stale
+ * positive window can survive in a cache after access was revoked, paused or
+ * depleted, or arrive from a Billing snapshot whose `usage.available` is
+ * false; ranking it would paint a healthy/worst percentage and fire alerts
+ * for access that is not actually usable.
+ *
+ * `paused` stays unrankable even when `api_calls_available` says purchased
+ * credits still serve calls: these windows describe the paused included plan,
+ * not the purchased balance, so they are not evidence of usable allowance.
+ */
+function usableWindows(provider) {
+	if (!provider || provider.unavailable_reason) return [];
+	if (provider.windows_usable === false) return [];
+	const state = provider.access_state;
+	if (state === "depleted" || state === "paused" || state === "unavailable") return [];
+	if (provider.api_calls_available === false) return [];
+	return asWindowList(provider.windows);
+}
+
 function worstWindow(provider) {
 	let worst = null;
-	for (const w of asWindowList(provider && provider.windows)) {
+	for (const w of usableWindows(provider)) {
 		const r = remainingPct(w);
 		if (r == null) continue;
 		if (worst == null || r < worst) worst = r;
@@ -662,15 +684,20 @@ function worstWindow(provider) {
 }
 
 // Monetary account facts never become percentage windows or key caps.
+function validAccountBalance(b) {
+	return Boolean(
+		b && /^[A-Z]{3}$/.test(b.currency) &&
+		(typeof b.total_balance === "number" ||
+			(typeof b.total_balance === "string" && /^-?\d+(?:\.\d+)?$/.test(b.total_balance))) &&
+		Number.isFinite(Number(b.total_balance)),
+	);
+}
+
 function accountFacts(provider) {
 	if (!provider || provider.unavailable_reason) return { balances: [], available: null };
 	const rows = provider.account_balances;
 	const available = typeof provider.api_calls_available === "boolean" ? provider.api_calls_available : null;
-	const balances = (Array.isArray(rows) ? rows : []).filter((b) =>
-		b && /^[A-Z]{3}$/.test(b.currency) &&
-		(typeof b.total_balance === "number" || (typeof b.total_balance === "string" && /^-?\d+(?:\.\d+)?$/.test(b.total_balance))) &&
-		Number.isFinite(Number(b.total_balance)),
-	);
+	const balances = (Array.isArray(rows) ? rows : []).filter(validAccountBalance);
 	return { balances, available };
 }
 
@@ -762,13 +789,53 @@ function balanceText(balance, locale) {
 	return `${money} ${balance.currency}`;
 }
 
+// A provider may name its own wallet; every older balance row keeps the
+// established "Account balance" label. Labels are plain display text, so
+// control characters and an unbounded cache value are trimmed before rendering.
+function balanceLabel(balance) {
+	const raw = balance && typeof balance.label === "string" ? balance.label : "";
+	const label = raw.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, "").trim();
+	return label ? Array.from(label).slice(0, 48).join("").trimEnd() : tr("accountBalance");
+}
+
+function balanceLine(balance, locale) {
+	const label = balanceLabel(balance);
+	const value = balanceText(balance, locale);
+	return label === tr("accountBalance") ? tr("accountBalanceLine", value) : `${label}: ${value}`;
+}
+
 function providerTone(provider) {
 	if (!provider) return "muted";
 	if (provider.unavailable_reason) return "muted";
+	// A confirmed unusable state outranks any remaining window. A paid plan can
+	// still report a positive window after access was revoked/paused (or the
+	// stored row can pair a positive window with api_calls_available:false);
+	// reading the window first painted that row green.
+	const { available } = accountFacts(provider);
+	if (available === false) return "bad";
+	const accessState = provider.access_state;
+	if (accessState === "depleted") return "bad";
+	if (accessState === "paused") {
+		// A paused included plan is a separate fact from paid-call
+		// availability. `api_calls_available` is the authoritative answer:
+		// false was already answered above as unusable; true (Billing's
+		// `credits_pay`) means purchased credits still serve calls, which is
+		// a warning - not healthy green, and not the red "unusable" verdict
+		// that contradicted the chip's "available". An older portal that
+		// gives no answer leaves continuation unproven, so the confirmed
+		// pause still warns rather than claiming a call outage.
+		return "warn";
+	}
+	if (accessState === "unavailable") return "muted";
 	const r = worstWindow(provider);
 	if (r != null) return toneForRemaining(r);
-	const { available } = accountFacts(provider);
-	return available === true ? "good" : available === false ? "bad" : "muted";
+	if (available === true) return "good";
+	// A provider with no window can still report a confirmed entitlement in a
+	// structured field instead of free-form details. Nous free is healthy but
+	// explicitly not a claim that paid API calls are available
+	// (`api_calls_available` stays null). Unknown/missing stays muted.
+	if (accessState === "free" || accessState === "active") return "good";
+	return "muted";
 }
 
 function checkedDateTime(iso) {
@@ -1321,6 +1388,1212 @@ async function refreshQuotaCache(scope) {
 		_refreshInFlight.delete(key);
 	}
 }
+// ---- Nous Billing primary (Desktop only) -----------------------------------
+//
+// `billing.state` is a public gateway RPC (read-only, profile-scoped) that the
+// Desktop half of the plugin may call through `host.request`. The Python half
+// has no public billing seam, so the cached CLI payload remains the only
+// source for CLI/TUI; on Desktop it becomes the fallback.
+//
+// This is a sibling of `useQuota`, deliberately: it uses its own namespaced
+// query key (never the app's `["billing","state"]` poll), reads only the
+// fields this card renders, never writes to plugin storage, and maps every
+// failure to `null` so the cached row stays exactly as it was.
+const BILLING_QUERY_KEY = ["quota", "billing"];
+const BILLING_TIMEOUT_MS = 8_000;
+// A gateway call that ignores its timeout must not pin the dedupe entry for
+// the rest of the session. After the result deadline, wait at most this grace
+// for the underlying socket to settle, then allow the next cadence to retry.
+const BILLING_IDLE_GRACE_MS = 1_000;
+// One in-flight billing read per profile scope. Two mounted surfaces (chip
+// and pane) share the query key, but this also keeps a slow portal read from
+// being duplicated when React Query hands both observers the same cadence.
+const _billingInFlight = new Map();
+// One cadence cache per profile scope: several mounted observers (status bar,
+// pane, agents chip) have their own React Query timers and mounting them at
+// different times staggers those timers. This cache keeps at most one real
+// gateway read per interval; the others receive the same snapshot with its
+// original observation time, so freshness is never rewritten as new.
+const _billingCadence = new Map();
+
+function billingScopeKey(scope) {
+	return `${scope.connectionId}\u0000${scope.profile}`;
+}
+
+/** Forget the current cadence window, so an explicit refresh reads again. */
+function resetBillingCadence(scope) {
+	if (!scope || !billingText(scope.profile)) return;
+	_billingCadence.delete(billingScopeKey(scope));
+}
+
+function billingQueryKey(scope) {
+	return scope
+		? [...BILLING_QUERY_KEY, scope.connectionId, scope.profile]
+		: [...BILLING_QUERY_KEY, null, null];
+}
+
+function billingObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+}
+
+function billingList(value) {
+	return Array.isArray(value) ? value : [];
+}
+
+function billingText(value) {
+	return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/** Pseudonymous local organisation digest, matching the account cache's
+ * unkeyed FNV-1a 64-bit key. `billing.state` exposes `org_slug` but no signed-in
+ * user id; this digest lets the rate-limit merge compare organisations without
+ * persisting or rendering the slug. It is not a secret and not a cryptographic
+ * identifier: a low-entropy slug can be brute-forced, and two users in the same
+ * organisation share it.
+ *
+ * The digest is kept in a renderer-wide WeakMap keyed by the sanitized row,
+ * never on the row itself, so neither the billing query-cache payload nor any
+ * serialization carries it. An association that is lost across a rehydration
+ * simply fails closed.
+ */
+const _BILLING_ORG_KEYS = Symbol.for("hermes.quota.billingOrgKeys");
+const _billingOrgKeys = (() => {
+	const existing = globalThis[_BILLING_ORG_KEYS];
+	if (existing instanceof WeakMap) return existing;
+	const map = new WeakMap();
+	Object.defineProperty(globalThis, _BILLING_ORG_KEYS, {
+		value: map, configurable: true, writable: true,
+	});
+	return map;
+})();
+function rememberBillingOrgKey(row, key) {
+	if (row && key) _billingOrgKeys.set(row, key);
+}
+function billingOrgKeyFor(row) {
+	return row ? _billingOrgKeys.get(row) || null : null;
+}
+function orgMatchKey(value) {
+	const text = billingText(value);
+	if (!text) return null;
+	const bytes = typeof TextEncoder !== "undefined"
+		? new TextEncoder().encode(text)
+		: Array.from(unescape(encodeURIComponent(text)), (char) => char.charCodeAt(0));
+	let key = 0xcbf29ce484222325n;
+	for (const byte of bytes) {
+		key ^= BigInt(byte);
+		key = (key * 0x100000001b3n) & 0xffffffffffffffffn;
+	}
+	return key.toString(16).padStart(16, "0");
+}
+
+/** Display string that carries a value; the money formatter's "—" is empty. */
+function billingDisplay(value) {
+	const text = billingText(value);
+	return text && text !== "—" ? text : null;
+}
+
+function billingNumber(value) {
+	return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+/** A displayed dollar amount ("$1,234.50") -> number; unknown/unparseable is null. */
+function billingMoney(value) {
+	const text = billingDisplay(value);
+	if (!text) return null;
+	const n = Number(text.replace(/[$,\s]/g, ""));
+	return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Billing's total spendable credits as one prominent Account balance row.
+ *
+ * `usage.total_spendable_display` is the portal's already-computed total
+ * (included plan allowance plus purchased wallet); it must never be rebuilt by
+ * summing the component bars. Only a canonical USD display string is accepted,
+ * so an absent, placeholder or foreign-currency value stays unknown instead of
+ * becoming a fabricated dollar figure. Zero is a real amount and is returned.
+ */
+function billingUsableBalance(value) {
+	const text = billingDisplay(value);
+	if (!text) return null;
+	const match = /^\$\s*(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d+))?(?:\s*USD)?$/.exec(text);
+	if (!match) return null;
+	const whole = match[1].replace(/,/g, "");
+	const fraction = match[2] || "00";
+	const amount = `${whole}.${fraction}`;
+	const n = Number(amount);
+	if (!Number.isFinite(n) || n < 0) return null;
+	return { currency: "USD", total_balance: amount, label: "Account balance" };
+}
+
+/** Any positive spendable amount in the usage block. */
+function billingHasPositiveBalance(usage, planBar, topupBar) {
+	if (usage.has_topup === true) return true;
+	return billingHasPositiveAmount(usage, planBar, topupBar);
+}
+
+/** Whether a serialized balance field actually carries a positive amount. */
+function billingHasPositiveAmount(usage, planBar, topupBar) {
+	const amounts = [
+		usage.total_spendable_display,
+		usage.subscription_remaining_display,
+		usage.topup_remaining_display,
+		planBar && planBar.remaining_display,
+		topupBar && topupBar.remaining_display,
+	];
+	return amounts.some((value) => {
+		const n = billingMoney(value);
+		return n != null && n > 0;
+	});
+}
+
+/** Positive spendable credits for availability; the total field wins if shown. */
+function billingHasSpendableCredits(usage, planBar, topupBar) {
+	const total = billingMoney(usage.total_spendable_display);
+	if (total != null) return total > 0;
+	return billingHasPositiveAmount(usage, planBar, topupBar);
+}
+
+/**
+ * `usage.status: "depleted"` is core's aggregate "paid access is false"
+ * verdict, not proof of exhaustion. Core also uses it for a member spend cap
+ * with positive credits and for a signed-in account with no plan at all, so a
+ * bare/contradicted status must fall back to the richer cached row instead of
+ * claiming a top-up would restore access. Only a paid plan corroborated with
+ * an explicitly exhausted balance may map to `depleted`.
+ */
+function billingDepletionProven(usage, planBar, topupBar) {
+	if (billingHasPositiveBalance(usage, planBar, topupBar)) return false;
+	const planName = billingText(usage.plan_name);
+	// An explicit Free plan is a plan identity, never an exhaustion claim.
+	if (planName && planName.toLowerCase() === "free") return false;
+	const plan = planBar && (planBar.kind == null || planBar.kind === "plan")
+		? planBar
+		: null;
+	// A monthly allowance bar is itself paid-plan evidence even when the plan
+	// name was not serialized.
+	if (!planName && !plan) return false;
+	const planExhausted = plan != null && (
+		billingMoney(plan.remaining_display) === 0 ||
+		billingNumber(plan.fill_fraction) === 0 ||
+		billingPercent(plan.pct_used) === 100
+	);
+	const subscriptionZero = billingMoney(usage.subscription_remaining_display) === 0;
+	const totalZero = billingMoney(usage.total_spendable_display) === 0;
+	return planExhausted || subscriptionZero || totalZero;
+}
+
+/** A provider-reported used percentage, bounded to the card's 0–100 domain. */
+function billingPercent(value) {
+	const n = billingNumber(value);
+	return n == null ? null : Math.max(0, Math.min(100, n));
+}
+
+/** `left_fraction` (0..1 remains) -> used percentage, two decimals. */
+function billingUsedPercent(leftFraction) {
+	const left = billingNumber(leftFraction);
+	if (left == null) return null;
+	const used = (1 - Math.max(0, Math.min(1, left))) * 100;
+	return Math.max(0, Math.min(100, Math.round(used * 100) / 100));
+}
+
+/**
+ * Whether every general included allowance is spent, or null when unproven.
+ *
+ * Only `scope: "all"` gauges gate every paid model; a full `top_tier` gauge
+ * blocks that model class, not paid calls generally. True means at least one
+ * general gauge is full, false means usable general gauges exist and none is
+ * full, and null means this snapshot proves neither.
+ */
+function nousPlanAllowanceExhausted(planUsage) {
+	const gauges = billingList(planUsage && planUsage.gauges);
+	let seen = false;
+	let exhausted = false;
+	for (const gauge of gauges) {
+		const g = billingObject(gauge);
+		if (!g || g.scope !== "all") continue;
+		const left = billingNumber(g.left_fraction);
+		if (left == null) continue;
+		seen = true;
+		if (left <= 0) exhausted = true;
+	}
+	return seen ? exhausted : null;
+}
+
+/**
+ * Exact card names for the Portal's usage-window gauge ids.
+ *
+ * `plan_usage.gauges[].label` carries the server id (`day`, `week`, `month`,
+ * `top_tier`), not the human title. These four allowances are the ones the
+ * card names itself; an unknown id keeps the server's own label so a future
+ * allowance still renders without a plugin release.
+ */
+const NOUS_WINDOW_LABELS = Object.freeze({
+	day: "Daily",
+	week: "Weekly",
+	month: "Monthly",
+	top_tier: "Large models (Monthly)",
+});
+
+function nousWindowLabel(gauge) {
+	const raw = billingText(gauge && gauge.label) || billingText(gauge && gauge.id);
+	if (!raw) return null;
+	const known = NOUS_WINDOW_LABELS[raw];
+	if (known) return known;
+	// Provider-authored fallback: keep control/bidi characters off the card
+	// and bound a malformed label.
+	const text = raw
+		.replace(/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/gu, "")
+		.trim()
+		.slice(0, 80)
+		.trim();
+	return text || null;
+}
+
+/** Epoch milliseconds -> ISO; unparseable/out-of-range values are dropped. */
+function billingIso(ms) {
+	const n = billingNumber(ms);
+	if (n == null) return null;
+	const dt = new Date(n);
+	return Number.isFinite(dt.getTime()) ? dt.toISOString() : null;
+}
+
+/**
+ * Resolve the exact registry route for `scope`, or null when billing cannot
+ * be addressed safely. A route whose `targetProfile` differs from its focused
+ * `profile` is skipped: a routed RPC addresses the route's profile key, and
+ * when that key is not the backend target profile the plugin cannot name the
+ * account it would read. Ambiguous/missing routes and route discovery
+ * failures fail closed (no billing call) and fall back to the cache. Route
+ * discovery is bounded by the caller's remaining deadline: a gateway that
+ * never answers must not pin `_billingInFlight` for the session.
+ */
+async function resolveBillingRoute(scope, timeoutMs = BILLING_TIMEOUT_MS) {
+	if (!scope) return null;
+	if (scope.live) return { live: true, profile: scope.profile };
+	if (typeof host.profileRoutes !== "function" || typeof host.requestProfile !== "function") return null;
+	const budget = Math.max(1, Number(timeoutMs) || BILLING_TIMEOUT_MS);
+	let timer = null;
+	let routes;
+	try {
+		routes = await Promise.race([
+			host.profileRoutes(),
+			new Promise((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error("billing route timeout")), budget);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+	if (!Array.isArray(routes)) return null;
+	const matches = routes.filter(
+		(route) =>
+			route &&
+			route.connectionId === scope.connectionId &&
+			route.profile === scope.profile,
+	);
+	if (matches.length !== 1) return null;
+	const route = matches[0];
+	if (!billingText(route.targetProfile) || route.profile !== route.targetProfile) return null;
+	return route;
+}
+
+/**
+ * Start one bounded, read-only billing probe.
+ *
+ * `result` settles at the timeout/caller boundary; `idle` settles only when the
+ * underlying gateway promise does, while `hardIdle` caps that wait so a host
+ * call that never settles cannot keep the scope deduped forever. Keeping the
+ * read open until idle normally stops a timed-out read from opening a second
+ * portal read on top of the abandoned one; the cap is the recovery path for a
+ * gateway that never answers.
+ */
+function startBillingRead(scope, timeoutMs) {
+	if (!scope || !billingText(scope.profile)) {
+		return { result: Promise.resolve(null), idle: Promise.resolve(), hardIdle: Promise.resolve() };
+	}
+	const budget = Math.max(1, Number(timeoutMs) || BILLING_TIMEOUT_MS);
+	const deadline = Date.now() + budget;
+	let timer = null;
+	let attempt;
+	try {
+		attempt = (async () => {
+			if (scope.live) {
+				if (typeof host.request !== "function") return null;
+				const remaining = deadline - Date.now();
+				if (remaining <= 0) throw new Error("billing timeout");
+				// Legacy single connection: name the profile explicitly.
+				return host.request("billing.state", { profile: scope.profile }, remaining);
+			}
+			const route = await resolveBillingRoute(scope, deadline - Date.now());
+			if (!route) return null;
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw new Error("billing timeout");
+			return host.requestProfile(route, "billing.state", {}, remaining);
+		})();
+	} catch {
+		attempt = Promise.resolve(null);
+	}
+	const result = (async () => {
+		try {
+			return billingObject(
+				await Promise.race([
+					attempt,
+					new Promise((_resolve, reject) => {
+						timer = setTimeout(() => reject(new Error("billing timeout")), budget);
+					}),
+				]),
+			);
+		} catch {
+			// -32601 (older gateway), 4064 (unknown profile), timeouts and shape
+			// failures all mean "billing unavailable": keep the cached row, no
+			// toast and no log (the response may contain billing metadata).
+			return null;
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
+	})();
+	// The late rejection of an attempt that lost the timeout race must not
+	// escape as an unhandled rejection. `idle` keeps the exact socket-settled
+	// semantics; `hardIdle` is a capped fallback: a host call that never
+	// settles (route discovery or `requestProfile`) would otherwise keep this
+	// scope deduped forever and suppress every later read.
+	const idle = Promise.resolve(attempt).catch(() => {});
+	let hardTimer = null;
+	const hardIdle = new Promise((resolve) => {
+		hardTimer = setTimeout(resolve, budget + Math.min(BILLING_IDLE_GRACE_MS, budget));
+	});
+	idle.finally(() => {
+		if (hardTimer) clearTimeout(hardTimer);
+	});
+	return { result, idle, hardIdle };
+}
+
+/**
+ * Dedupe reads for one scope until the underlying request is really idle.
+ *
+ * While a timed-out request is still in flight, callers get the same settled
+ * `null` instead of starting a second portal read. Cleanup waits for `idle`,
+ * and a capped `hardIdle` releases the scope if the host call never settles,
+ * so the next cadence starts exactly one read after the old socket is done or
+ * the cap expires.
+ */
+function fetchBillingState(scope, timeoutMs = BILLING_TIMEOUT_MS) {
+	if (!scope || !billingText(scope.profile)) return Promise.resolve(null);
+	const key = billingScopeKey(scope);
+	const current = _billingInFlight.get(key);
+	if (current) return current.result;
+	const read = startBillingRead(scope, timeoutMs);
+	const entry = { result: read.result };
+	_billingInFlight.set(key, entry);
+	const cleanup = () => {
+		if (_billingInFlight.get(key) === entry) _billingInFlight.delete(key);
+	};
+	read.idle.finally(cleanup);
+	// A host call that never settles must not dedupe the scope forever.
+	read.hardIdle.finally(cleanup);
+	return entry.result;
+}
+
+/**
+ * A sanitized billing row plus its observation time, throttled to one gateway
+ * read per `minIntervalMs` for a scope.
+ *
+ * Only the whitelisted row is retained between observers; the full
+ * `billing.state` response (card, payment method, organization, raw balance
+ * fields) is dropped as soon as it has been mapped. A usage-window plan's
+ * wallet is the one exception: it survives only as the derived Account
+ * balance row. `observedAt` is the time that
+ * underlying read finished (or failed), never the time it was replayed, so the
+ * footer and the row's billing age stay honest. Failures are cached for the
+ * same window: every observer already gets no row, and retrying each one would
+ * only repeat the same portal failure. An explicit refresh calls
+ * `resetBillingCadence`.
+ */
+async function fetchBillingSnapshot(scope, timeoutMs = BILLING_TIMEOUT_MS, minIntervalMs = 0) {
+	if (!scope || !billingText(scope.profile)) return { row: null, observedAt: null };
+	const key = billingScopeKey(scope);
+	const min = Math.max(0, Number(minIntervalMs) || 0);
+	const last = min > 0 ? _billingCadence.get(key) : null;
+	if (last && Date.now() - last.at < min) return last.snapshot;
+	const state = await fetchBillingState(scope, timeoutMs);
+	const snapshot = { row: billingStateToNousRow(state), observedAt: Date.now() };
+	if (min > 0) {
+		_billingCadence.set(key, { at: snapshot.observedAt, snapshot });
+		// Profile churn can accumulate one small entry per scope; drop stale
+		// windows without touching the current one.
+		for (const [other, entry] of _billingCadence) {
+			if (other !== key && snapshot.observedAt - entry.at >= min) _billingCadence.delete(other);
+		}
+	}
+	return snapshot;
+}
+
+/**
+ * Map the read-only `billing.state` result to the `nous` cache row shape.
+ *
+ * Only whitelisted fields are read. `card`, `payment_method`, `auto_reload`,
+ * `org_*`, `role`, and the raw `balance_*` fields never enter the row, are
+ * never rendered and are never persisted. The one exception is the derived
+ * Account balance on a usage-window plan, which reads `balance_display` as a
+ * canonical USD wallet amount; only that derived row is cached. Returns null
+ * when billing yields neither plan identity nor a window nor an authoritative
+ * depleted/low state: an unavailable snapshot must not blank a card the cache
+ * can still describe.
+ */
+function billingStateToNousRow(billing) {
+	const state = billingObject(billing);
+	if (!state || state.ok === false) return null;
+	const freeTier = state.free_tier_account === true;
+	// A logged-out snapshot is not evidence of a free account. Only the
+	// explicit free-tier flag (answered locally by Hermes) may claim it.
+	if (!freeTier && state.logged_in !== true) {
+		// Core also answers `logged_in: false` with no `error` for its own
+		// BillingAuthError, so that shape cannot be treated as a confirmed
+		// sign-out. Hiding the cached row on it would erase a healthy account
+		// after a transient auth failure; keep the cache as the fallback.
+		return null;
+	}
+
+	const usage = billingObject(state.usage) || {};
+	const planUsage = billingObject(state.plan_usage);
+	const status = typeof usage.status === "string" ? usage.status : null;
+	const pausedReason = planUsage ? billingText(planUsage.paused_reason) : null;
+	const details = [];
+	// Stable fact identities let the merge keep an independent source's
+	// unmapped facts without parsing this card's text. Only keys whose values
+	// Billing actually supplied are present.
+	const detailFacts = {};
+	const balances = [];
+
+	// Window plans carry gauges. They are the plan's own authoritative source:
+	// `usage.available` describes the separate dollar-credit model (and is
+	// always false for a window plan), so it must never invalidate them.
+	const planWindows = [];
+	for (const gauge of billingList(planUsage && planUsage.gauges)) {
+		const g = billingObject(gauge);
+		if (!g) continue;
+		const label = nousWindowLabel(g);
+		const used = billingUsedPercent(g.left_fraction);
+		if (!label || used == null) continue;
+		planWindows.push({
+			label,
+			used_percent: used,
+			reset_at: billingIso(g.resets_at_ms),
+		});
+	}
+	const planAllowanceExhausted = nousPlanAllowanceExhausted(planUsage);
+
+	const planBar = billingObject(usage.plan_bar);
+	const topupBar = billingObject(usage.topup_bar);
+	const planBarIsPlan = Boolean(planBar) && (planBar.kind == null || planBar.kind === "plan");
+	const planBarUsed = planBarIsPlan ? billingPercent(planBar.pct_used) : null;
+	const usagePlanName = billingText(usage.plan_name);
+	const windowPlanName = planUsage ? billingText(planUsage.plan) : null;
+	// `credits_pay` is the window plan's own "past a full allowance, top-up
+	// credits pay" answer. False is evidence it stops; absent/null is not.
+	const creditsPay = planUsage && typeof planUsage.credits_pay === "boolean"
+		? planUsage.credits_pay
+		: null;
+	// plan_usage is the window plan's own block, so it outranks usage.plan_name
+	// (Billing's aggregate view). A literal Free plan name is an explicit plan
+	// identity even when the aggregate status is "depleted", "low" or "healthy":
+	// a Free plan holding purchased credits reports healthy/available because
+	// those top-up dollars can fund calls, not because it has a paid
+	// subscription. A real plan window or plan bar still outranks the name.
+	const planName = windowPlanName || usagePlanName;
+	const namedFree =
+		!freeTier &&
+		Boolean(planName) &&
+		planName.toLowerCase() === "free" &&
+		planWindows.length === 0 &&
+		planBarUsed == null;
+
+	const topupIsTopup = Boolean(topupBar) && (topupBar.kind == null || topupBar.kind === "topup");
+	const freeTopupRemaining = billingDisplay(topupIsTopup ? topupBar.remaining_display : null)
+		|| billingDisplay(usage.topup_remaining_display);
+	const freeTopupAmount = billingMoney(freeTopupRemaining);
+	const freeTopupPositive = freeTopupAmount != null && freeTopupAmount > 0;
+	const freeTotalAmount = billingMoney(usage.total_spendable_display);
+	// A positive purchased wallet pays for paid models even though the plan is
+	// Free. Only make that claim when the portal's total does not contradict it
+	// with an explicit zero; an absent total is unknown, not zero, and the top-up
+	// bar is itself evidence of the purchased component.
+	const freeCreditsFundCalls = freeTopupPositive
+		&& (freeTotalAmount == null || freeTotalAmount > 0);
+	const freeFundedTotal = freeTotalAmount != null && freeTotalAmount > 0;
+	// A plan-less snapshot with an explicit `has_active_subscription: false`
+	// is a Free account. Core's aggregate `paid_service_access` is also true
+	// when purchased credits fund calls, so treating that aggregate as a paid
+	// plan classified a Free+top-up account as active and painted its padded
+	// renewal date. Without the explicit flag, a plan-less snapshot stays
+	// unknown: absence of a plan name is not proof of Free.
+	const explicitNoSubscription =
+		state.has_active_subscription === false || usage.has_active_subscription === false;
+	const noPlanIdentity =
+		!planName && planWindows.length === 0 && !planBarIsPlan;
+	const subscriptionlessFree =
+		!freeTier &&
+		!namedFree &&
+		noPlanIdentity &&
+		explicitNoSubscription;
+
+	// A depleted verdict the usage block does not corroborate (bare status,
+	// positive credits, or no paid plan at all) is not exhaustion. Fall back to
+	// the richer cached row instead of claiming a top-up would restore access:
+	// core reports this status for member spend caps and signed-in free plans.
+	// An explicit plan pause is its own fact and keeps the paused row.
+	if (!freeTier && !namedFree && !subscriptionlessFree && !pausedReason && status === "depleted" &&
+		!billingDepletionProven(usage, planBar, topupBar)) {
+		return null;
+	}
+
+	// The portal's own total, never a sum of the component bars. When the
+	// source omits that total while explicitly reporting zero included
+	// subscription credits, the purchased wallet is the whole usable balance;
+	// that supported top-up-only shape may supply the Account balance. An
+	// unknown subscription component is not a total, so nothing is summed.
+	let totalUsable = billingUsableBalance(usage.total_spendable_display);
+	let walletBalanceOnly = false;
+	if (!totalUsable && !billingDisplay(usage.total_spendable_display)) {
+		const subscriptionZero = billingMoney(usage.subscription_remaining_display) === 0;
+		const topupText = billingDisplay(usage.topup_remaining_display);
+		if (subscriptionZero && topupText) totalUsable = billingUsableBalance(topupText);
+	}
+	// Billing's own account wallet. A usage-window plan has no dollar-credit
+	// model (`usage.available: false`), but `billing.state.balance_display`
+	// still reports the spendable wallet and is a Billing fact, not a cached
+	// account one. It is the fallback only: an authoritative total above wins.
+	// Credit-grant plans keep Billing's total/component model, so their
+	// top-level wallet field is not read here.
+	if (!totalUsable && planUsage && billingText(planUsage.kind) === "usage_window") {
+		totalUsable = billingUsableBalance(state.balance_display);
+		walletBalanceOnly = Boolean(totalUsable);
+	}
+	if (totalUsable) balances.push(totalUsable);
+
+	// The same Billing wallet as a number. A usage-window plan's purchased
+	// credit is the only money that can pay after a pause or a spent included
+	// allowance; an explicit zero there contradicts a `credits_pay` promise.
+	const billingWalletAmount = planUsage && billingText(planUsage.kind) === "usage_window"
+		? billingMoney(state.balance_display)
+		: null;
+	const billingWalletEmpty = billingWalletAmount != null && billingWalletAmount <= 0;
+
+	const windows = [];
+	let plan = null;
+
+	if (freeTier || namedFree || subscriptionlessFree) {
+		plan = "Free";
+		// A funded total without a positive top-up component is a credit source
+		// this snapshot does not name. Do not deny it with "free models only"
+		// and do not invent "purchased" either.
+		const freeLine = freeCreditsFundCalls
+			? "Free tier - paid models via purchased credits"
+			: freeFundedTotal
+				? "Free tier - credits available"
+				: "Free tier - free models only";
+		details.push(freeLine);
+		detailFacts.free_tier = freeLine;
+		const freeModel = billingText(state.free_tier_model);
+		if (freeModel) {
+			details.push(`Free tier model: ${freeModel}`);
+			detailFacts.free_tier_model = `Free tier model: ${freeModel}`;
+		}
+	} else {
+		plan = planName;
+		// Without the free-tier flag an unqualified "Free" is not a paid plan
+		// label; "no plan/top-up in this snapshot" is absence of evidence.
+		if (plan && plan.toLowerCase() === "free") plan = null;
+
+		windows.push(...planWindows);
+
+		if (windows.length === 0 && planBarUsed != null) {
+			windows.push({ label: "Subscription", used_percent: planBarUsed, reset_at: null });
+		}
+
+		const renewed = billingText(usage.renews_display);
+		if (renewed) {
+			// Billing's `renews_display` is `current_period_end`; it carries no
+			// cancellation state, so a cancelled-at-period-end plan would be
+			// mislabeled "Renews". "Cycle ends" is true either way.
+			const when = renewed.replace(/^(?:renews|cycle ends)\s*:\s*/i, "");
+			const line = `Cycle ends: ${when}`;
+			details.push(line);
+			detailFacts.cycle_ends = line;
+		}
+
+		const cap = billingObject(state.monthly_cap);
+		if (cap) {
+			const spent = billingDisplay(cap.spent_display);
+			const limit = billingDisplay(cap.limit_display);
+			const line = spent && limit
+				? `Monthly cap: ${spent} of ${limit}`
+				: limit
+					? `Monthly cap: ${limit}`
+					: null;
+			if (line) {
+				details.push(line);
+				detailFacts.monthly_cap = line;
+			}
+		}
+	}
+
+	const accessState = freeTier || namedFree || subscriptionlessFree
+		? "free"
+		// A withheld usage window is paused, not spent. Respect the plan's own
+		// pause fact even when its gauges are still present.
+		: pausedReason
+			? "paused"
+			// The gate above only lets a corroborated depleted verdict through.
+			: status === "depleted"
+				? "depleted"
+				// Billing's "low" means spendable credits are under the alert
+				// threshold. It is neither depletion nor evidence of healthy
+				// access; without a numeric window it must stay muted instead of
+				// becoming an `active` green row.
+				: status === "low"
+					? "unknown"
+					// "free" means "no plan and no top-up in this snapshot", not a
+					// confirmed free account; without the free-tier flag it is
+					// absence of evidence, so do not claim healthy access.
+					: status === "free"
+						? "unknown"
+						: usage.available === true
+							? "active"
+							// A window plan's gauges are authoritative even though its
+							// separate dollar-credit model reports available:false.
+							: planWindows.length
+								? "active"
+								: "unknown";
+
+	if (accessState === "depleted") {
+		details.push("Status: access depleted - top up to restore");
+		detailFacts.status = "Status: access depleted - top up to restore";
+	} else if (accessState === "paused") {
+		const paused = pausedReason === "payment_past_due"
+			? "Status: included usage paused - subscription payment failed"
+			: "Status: included usage paused - check billing";
+		// A paused plan can keep serving on purchased credits. Only say so when
+		// the plan's own `credits_pay` answer proves it and Billing's wallet is
+		// not explicitly empty; an older portal's absent answer is unknown, not
+		// a promise and not a denial.
+		const continues = creditsPay === true && !billingWalletEmpty;
+		const line = continues ? `${paused}; purchased credits still apply` : paused;
+		details.push(line);
+		detailFacts.status = line;
+	} else if (status === "low") {
+		// Do not read another balance field for the amount; the status alone
+		// is the warning and the plan/top-up lines already carry the numbers.
+		details.push("Low balance - top up soon");
+		detailFacts.low_balance = "Low balance - top up soon";
+	}
+
+	if (!plan && windows.length === 0 && accessState !== "depleted" && accessState !== "paused" && status !== "low") {
+		return null;
+	}
+
+	const row = {
+		label: "nous",
+		windows,
+		plan,
+		unavailable_reason: null,
+		details,
+		detail_facts: detailFacts,
+		account_balances: balances,
+		// Free and active never become true from plan status alone: free-model
+		// access is not evidence that paid API calls are available. A Free plan
+		// holding positive spendable credits is different: those purchased
+		// dollars fund calls while the plan itself remains Free. Depletion is
+		// proven above. `access_state` describes the included plan; this flag
+		// is the separate answer about paid-call access. A paused plan
+		// continues on purchased credits only when `credits_pay` says so (true
+		// renders as a warning, never green health), false is unusable, and an
+		// older portal's absent answer stays unknown rather than asserting a
+		// stop. `credits_pay` is a promise about the purchased wallet: when
+		// Billing itself reports that wallet as explicitly empty, the promise
+		// cannot be kept, so the row must not claim calls continue.
+		api_calls_available: accessState === "depleted"
+			? false
+			: accessState === "paused"
+				? (creditsPay === true && billingWalletEmpty ? false : creditsPay)
+				: accessState === "active"
+					// Every general included allowance is spent. `credits_pay:
+					// false` stops calls outright; `true` with an explicitly
+					// empty wallet also stops them. Any weaker shape (no
+					// answer, top-tier-only gauges, credit model unavailable)
+					// stays unknown here; this row cannot prove a stop from it.
+					? (planAllowanceExhausted === true
+						? (creditsPay === false || (creditsPay === true && billingWalletEmpty) ? false : null)
+						: null)
+					: accessState === "free"
+						? (usage.available === true && billingHasSpendableCredits(usage, planBar, topupBar) ? true : null)
+						: null,
+		access_state: accessState,
+		// Internal source-shape hints (never rendered): a usage-window plan's
+		// dollar-credit model is expected to be unavailable, so the account
+		// snapshot may supply the compatible money breakdown when its identity
+		// and freshness match. A credit-grant plan keeps Billing as the sole
+		// financial source.
+		usage_window_plan: Boolean(planUsage && billingText(planUsage.kind) === "usage_window"),
+		credits_model_available: usage.available === true,
+		// True only when the Account balance above is Billing's wallet field,
+		// not an authoritative Billing total. A fresh compatible cached total
+		// may then replace it; the flag is never rendered.
+		billing_wallet_balance: walletBalanceOnly,
+	};
+	// Internal organisation digest for the cached account row, never rendered
+	// and never the raw slug. It is stored in a WeakMap keyed by this row, not
+	// on the row, so the billing query cache cannot retain it. Billing exposes
+	// the organisation slug but not the signed-in user; the merge uses this
+	// digest plus the exact plan and access state as a same-organisation hint,
+	// not as proof of the same account, and fails closed when it is absent.
+	const org = billingObject(state.org);
+	const billingOrgSlug = billingText(state.org_slug) || (org ? billingText(org.slug) : null);
+	const billingOrgKey = orgMatchKey(billingOrgSlug);
+	if (billingOrgKey) rememberBillingOrgKey(row, billingOrgKey);
+	// Only the `usage`-sourced bar depends on `usage.available`. Plan-window
+	// gauges come from `plan_usage` and were already accepted above, so a
+	// window plan must not be marked unusable by the other source's failure.
+	if (windows.length && planWindows.length === 0 && usage.available !== true) {
+		row.windows_usable = false;
+	}
+	return row;
+}
+
+/**
+ * Published API-key ceilings from the official Nous Portal API docs
+ * (https://portal.nousresearch.com/api-docs, retrieved 2026-11-06).
+ *
+ * RPM and TPM are published; RPH is not, so a fallback never invents one.
+ * Keys are exact plan labels (whitespace-normalized, case-insensitive). A
+ * numeric tier or a generic "paid" flag is not normalized into a plan: those
+ * cannot distinguish Basic, Plus, Super, Scale, Ultra or the default paid
+ * ceiling.
+ */
+const NOUS_PUBLISHED_RATE_LIMITS = Object.freeze({
+	free: [50, 500_000],
+	basic: [400, 2_000_000],
+	plus: [400, 4_000_000],
+	super: [800, 8_000_000],
+	scale: [600, 6_000_000],
+	ultra: [1_600, 16_000_000],
+	"default paid users": [180, 720_000],
+});
+
+/** Normalize a published tier label to a table key, or null.
+ *
+ * The account API names paid plans with a product prefix ("Hermes Plus"), while
+ * the docs table uses the bare tier ("Plus"). That prefix is part of the exact
+ * plan identity, not a generic "paid" flag, so stripping it is safe; any other
+ * unknown label (including numeric tiers) still has no entry.
+ */
+function nousPublishedPlanKey(plan) {
+	const text = billingText(plan);
+	if (!text) return null;
+	const key = text.replace(/\s+/g, " ").toLowerCase();
+	if (Object.prototype.hasOwnProperty.call(NOUS_PUBLISHED_RATE_LIMITS, key)) return key;
+	const prefixed = /^hermes\s+(.+)$/.exec(key);
+	if (prefixed && Object.prototype.hasOwnProperty.call(NOUS_PUBLISHED_RATE_LIMITS, prefixed[1])) {
+		return prefixed[1];
+	}
+	return null;
+}
+
+function formatRateLimit(value) {
+	const number = billingNumber(value);
+	if (number == null || number < 0) return null;
+	if (number >= 1_000_000) return `${Number((number / 1_000_000).toPrecision(6))}M`;
+	if (number >= 1_000) return `${Number((number / 1_000).toPrecision(6))}k`;
+	return `${number}`;
+}
+
+/** The documented ceiling for an unambiguous Billing plan, or null.
+ *
+ * A low balance maps to `unknown` access while the Billing plan label is still
+ * exact; the published ceiling belongs to that documented plan, so it remains
+ * available. The label is what selects the table entry, and a free/paid
+ * crossing is still refused.
+ */
+function nousPublishedRateCeiling(plan, accessState) {
+	const name = billingText(plan);
+	const state = billingText(accessState);
+	if (!name || !state) return null;
+	const key = nousPublishedPlanKey(name);
+	if (!key) return null;
+	const free = state === "free";
+	if (free && key !== "free") return null;
+	if (!free && key === "free") return null;
+	if (!free && state !== "active" && state !== "depleted" && state !== "paused" && state !== "unknown") {
+		return null;
+	}
+	const entry = NOUS_PUBLISHED_RATE_LIMITS[key];
+	if (!entry) return null;
+	const rpm = formatRateLimit(entry[0]);
+	const tpm = formatRateLimit(entry[1]);
+	if (!rpm || !tpm) return null;
+	return `Rate ceiling: ${rpm} RPM / ${tpm} TPM (published)`;
+}
+
+const NOUS_TOOL_POOL_MAX_AGE_S = 1800;
+
+/** A live account rate-limit line that may accompany Billing.
+ *
+ * Rate limits are plan-specific, so the cached row must carry the same exact
+ * plan label and the same access state as Billing, and it must be fresh. The
+ * organisation digest must also match. That combination is only a
+ * same-organisation/same-plan hint: `billing.state` exposes no signed-in user
+ * id, so it cannot distinguish another user in the same organisation. The line
+ * is therefore cached account data, not proof that it belongs to the Billing
+ * account; missing or mismatched facts fail closed. A published fallback line
+ * never qualifies as a live claim.
+ */
+function nousRateLimitsFact(baseRow, billingRow, data, maxAgeS) {
+	const base = billingObject(baseRow);
+	const billing = billingObject(billingRow);
+	const payload = billingObject(data);
+	if (!base || !billing || !payload || base.billing === true) return null;
+	if (base.unavailable_reason) return null;
+	const basePlan = billingText(base.plan);
+	const billingPlan = billingText(billing.plan);
+	if (!basePlan || !billingPlan) return null;
+	if (basePlan.replace(/\s+/g, " ").toLowerCase() !== billingPlan.replace(/\s+/g, " ").toLowerCase()) {
+		return null;
+	}
+	const baseState = billingText(base.access_state);
+	const billingState = billingText(billing.access_state);
+	// Per-tier state must match exactly. Treating every non-Free state as the
+	// same paid side let an `unknown` cached row decorate an `active` Billing
+	// row; that is not proof of the same plan state.
+	if (!baseState || !billingState || baseState !== billingState) return null;
+	if (billingState !== "free" && !["active", "depleted", "paused"].includes(billingState)) {
+		return null;
+	}
+	const baseOrg = billingText(base.account_org_key);
+	const billingOrg = billingText(billingOrgKeyFor(billing));
+	if (!baseOrg || !billingOrg || baseOrg !== billingOrg) return null;
+	const age = billingNumber(payload.age_s);
+	const limit = billingNumber(maxAgeS);
+	const maxAge = limit == null
+		? NOUS_TOOL_POOL_MAX_AGE_S
+		: Math.min(NOUS_TOOL_POOL_MAX_AGE_S, Math.max(0, limit));
+	if (age == null || age < 0 || age > maxAge) return null;
+	const facts = billingObject(base.detail_facts);
+	const line = facts ? billingText(facts.rate_limits) : null;
+	if (!line || line.length > 200) return null;
+	if (!/^Rate limits: (?:[0-9.]+[kM]? (?:RPM|TPM|RPH))(?: · [0-9.]+[kM]? (?:RPM|TPM|RPH))*$/.test(line)) {
+		return null;
+	}
+	if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(line)) return null;
+	if (billingList(billing.details).some((entry) => billingText(entry) === line)) return null;
+	return line;
+}
+
+/**
+ * The cached free-tool-pool fact, when it is safe to show beside Billing.
+ *
+ * The pool is not a financial fact and is emitted by the account fetcher only
+ * when the live `tool_access.enabled` switch is true. It is still scoped
+ * hard: same profile's fresh cache, both sources describe a Free plan, and the
+ * cached row itself must be a usable free snapshot. The cached account's
+ * Portal-organisation digest must also match the digest derived from Billing's
+ * `org_slug`, exactly as the rate-limit merge does; that keeps a pool from a
+ * different signed-in account in the same profile off this card. A disabled
+ * pool (no fact), a paid snapshot, a failed/unknown account read, a stale
+ * cache, and a missing or mismatched organisation all suppress the line.
+ * The organisation digest is a same-organisation hint, not proof of the same
+ * user, because Billing exposes no signed-in user id.
+ */
+function nousToolPoolFact(baseRow, billingRow, data, maxAgeS) {
+	const base = billingObject(baseRow);
+	const billing = billingObject(billingRow);
+	const payload = billingObject(data);
+	if (!base || !billing || !payload || base.billing === true) return null;
+	if (base.unavailable_reason) return null;
+	if (billingText(base.access_state) !== "free") return null;
+	if (billingText(billing.access_state) !== "free") return null;
+	const basePlan = billingText(base.plan);
+	const billingPlan = billingText(billing.plan);
+	if (!basePlan || !billingPlan) return null;
+	if (basePlan.toLowerCase() !== "free" || billingPlan.toLowerCase() !== "free") return null;
+	const baseOrg = billingText(base.account_org_key);
+	const billingOrg = billingText(billingOrgKeyFor(billing));
+	if (!baseOrg || !billingOrg || baseOrg !== billingOrg) return null;
+	const age = billingNumber(payload.age_s);
+	const limit = billingNumber(maxAgeS);
+	const maxAge = limit == null
+		? NOUS_TOOL_POOL_MAX_AGE_S
+		: Math.min(NOUS_TOOL_POOL_MAX_AGE_S, Math.max(0, limit));
+	if (age == null || age < 0 || age > maxAge) return null;
+	const facts = billingObject(base.detail_facts);
+	const line = facts ? billingText(facts.tool_pool) : null;
+	if (!line || line.length > 400 || !/^Tool pool: \S/.test(line)) return null;
+	// A cached line is provider-authored text; control/bidi characters must
+	// never reach the card.
+	if (/[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u.test(line)) return null;
+	if (billingList(billing.details).some((entry) => billingText(entry) === line)) return null;
+	return line;
+}
+
+/**
+ * Money facts a same-profile account snapshot may add to a Billing
+ * usage-window row.
+ *
+ * A usage-window plan (`plan_usage.kind: "usage_window"`) has no dollar-credit
+ * model: core reports `usage.available: false`, so Billing carries the plan,
+ * access state, gauges and its own wallet but not the period money facts. The
+ * cached account fetcher does carry those facts. They are admitted
+ * only when the cache is fresh, its row is usable, its exact plan label and
+ * access state equal Billing's, and its Portal-organisation digest matches
+ * Billing's `org_slug` digest. That is a same-organisation hint, not account
+ * proof (`billing.state` exposes no signed-in user id); missing or disagreeing
+ * facts fail closed. A credit-grant plan keeps Billing as the sole financial
+ * source. A Billing total always wins over a cached balance; when Billing
+ * supplied only its wallet, a fresh matched cached total outranks the wallet.
+ */
+const NOUS_ACCOUNT_FACTS_MAX_AGE_S = 1800;
+const NOUS_MONEY_FACT_ORDER = ["cycle_ends", "spend"];
+const NOUS_MONEY_FACT_PATTERNS = Object.freeze({
+	cycle_ends: /^Cycle ends: (?:\d{4}-\d{2}-\d{2}T[0-9:.+-]+Z?|[A-Z][a-z]{2} \d{1,2}, \d{4})$/,
+	spend: /^Spend this period: \$\d{1,3}(?:,\d{3})*(?:\.\d{2})?(?: \(no cap reported\))?$/,
+});
+const BAD_DISPLAY_TEXT = /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}]/u;
+
+function sameBillingPlan(left, right) {
+	const a = billingText(left);
+	const b = billingText(right);
+	if (!a || !b) return false;
+	return a.replace(/\s+/g, " ").toLowerCase() === b.replace(/\s+/g, " ").toLowerCase();
+}
+
+function nousWindowAccountFacts(baseRow, billingRow, data, maxAgeS) {
+	const base = billingObject(baseRow);
+	const billing = billingObject(billingRow);
+	const payload = billingObject(data);
+	if (!base || !billing || !payload) return null;
+	if (base.billing === true || base.unavailable_reason) return null;
+	// Only a usage-window Billing row whose separate dollar-credit model is
+	// unavailable needs the cached money facts. If Billing supplied the money
+	// model, it stays authoritative and this contributes nothing.
+	if (billing.usage_window_plan !== true || billing.credits_model_available === true) return null;
+	const billingState = billingText(billing.access_state);
+	if (!["active", "depleted", "paused"].includes(billingState)) return null;
+	if (!sameBillingPlan(base.plan, billing.plan)) return null;
+	if (!billingText(base.access_state) || billingText(base.access_state) !== billingState) return null;
+	const baseOrg = billingText(base.account_org_key);
+	const billingOrg = billingText(billingOrgKeyFor(billing));
+	if (!baseOrg || !billingOrg || baseOrg !== billingOrg) return null;
+	const age = billingNumber(payload.age_s);
+	const limit = billingNumber(maxAgeS);
+	const maxAge = limit == null
+		? NOUS_ACCOUNT_FACTS_MAX_AGE_S
+		: Math.min(NOUS_ACCOUNT_FACTS_MAX_AGE_S, Math.max(0, limit));
+	if (age == null || age < 0 || age > maxAge) return null;
+
+	// A paused plan withholds its included allowance, but the cached total
+	// still counts it. Contribute no balance there; Billing's own wallet is
+	// the spendable amount, and the cycle-end/spend facts below still help.
+	const balances = billingState === "paused" ? [] : billingList(base.account_balances)
+		.filter((balance) => {
+			if (!balance || typeof balance !== "object" || Array.isArray(balance)) return false;
+			if (String(balance.currency).toUpperCase() !== "USD") return false;
+			const raw = balance.total_balance;
+			if (typeof raw !== "string" && typeof raw !== "number") return false;
+			if (!/^-?\d+(?:\.\d+)?$/.test(String(raw).trim())) return false;
+			const amount = Number(raw);
+			if (!Number.isFinite(amount) || amount < 0) return false;
+			const label = billingText(balance.label);
+			const normalized = label ? label.toLowerCase() : "";
+			return !normalized || normalized === "account balance" || normalized === "total usable";
+		})
+		.slice(0, 1)
+		.map((balance) => ({
+			currency: "USD",
+			total_balance: String(balance.total_balance).trim(),
+			label: "Account balance",
+		}));
+
+	const sourceFacts = billingObject(base.detail_facts) || {};
+	const facts = {};
+	for (const key of NOUS_MONEY_FACT_ORDER) {
+		const line = billingText(sourceFacts[key]);
+		if (!line || line.length > 200 || BAD_DISPLAY_TEXT.test(line)) continue;
+		if (!NOUS_MONEY_FACT_PATTERNS[key].test(line)) continue;
+		facts[key] = line;
+	}
+	return { balances, facts };
+}
+
+/** Replace the `nous` row with billing facts, or return the payload as-is.
+ *
+ * Accepts either the raw `billing.state` result or an already-sanitized row
+ * (what the query cache stores), so the full billing response never has to
+ * outlive the request that fetched it. `billingAgeS`, when provided, is kept
+ * on the Nous row only: global `age_s` remains the quota-cache age so an old
+ * billing read cannot mark unrelated providers (Codex) stale.
+ *
+ * Billing is the only source for the Desktop Nous row's plan, windows and
+ * financial facts. The cached CLI account row is never mixed in financially:
+ * `billing.state` does not expose the signed-in user id, so a stale cache left
+ * by another login in the same profile cannot be proven to describe this
+ * Billing account. Rate limits are plan-specific, so one display fact is
+ * allowed through only when a fresh cached row carries the same exact plan
+ * label and the same access state, and its pseudonymous organisation digest
+ * matches a key derived locally from Billing's `org_slug`. That match cannot
+ * distinguish another user in the same organisation; it is a cached
+ * same-organisation hint, not account proof, and the residual limitation is
+ * disclosed in the docs. The non-financial Free tool pool is scoped to a fresh
+ * same-profile cache and two Free snapshots whose organisation digests match.
+ * A Billing plan with a documented
+ * exact tier also gets a `(published)` ceiling when no live account claim is
+ * mergeable; a live claim always wins. A failed Billing read still keeps the
+ * cached row as the fallback, whole and single-sourced.
+ */
+function mergeNousRow(data, billing, billingAgeS, toolPoolMaxAgeS) {
+	if (!billing) return data;
+	const raw =
+		Object.prototype.hasOwnProperty.call(billing, "ok") ||
+		Object.prototype.hasOwnProperty.call(billing, "logged_in") ||
+		Object.prototype.hasOwnProperty.call(billing, "free_tier_account");
+	const row = raw ? billingStateToNousRow(billing) : billing;
+	if (!row || row.label !== "nous") return data;
+	const payload = billingObject(data);
+	const providers = payload ? billingObject(payload.providers) : null;
+	const liveAge = billingNumber(billingAgeS);
+	const nextRow = { ...row, label: "nous", billing: true };
+	const liveRate = nousRateLimitsFact(
+		providers ? providers.nous : null,
+		row,
+		payload,
+		toolPoolMaxAgeS,
+	);
+	const publishedRate = liveRate
+		? null
+		: nousPublishedRateCeiling(row.plan, row.access_state);
+	const rateFact = liveRate
+		? { key: "rate_limits", line: liveRate }
+		: publishedRate
+			? { key: "rate_ceiling", line: publishedRate }
+			: null;
+	if (rateFact) {
+		const details = billingList(row.details);
+		if (!details.some((entry) => billingText(entry) === rateFact.line)) {
+			nextRow.details = [...details, rateFact.line];
+		}
+		nextRow.detail_facts = {
+			...(billingObject(row.detail_facts) || {}),
+			[rateFact.key]: rateFact.line,
+		};
+	}
+	const toolPool = nousToolPoolFact(
+		providers ? providers.nous : null,
+		row,
+		payload,
+		toolPoolMaxAgeS,
+	);
+	if (toolPool) nextRow.details = [...billingList(nextRow.details), toolPool];
+	// A usage-window plan's dollar-credit model is unavailable in Billing, so
+	// the compatible cached account snapshot supplies the Account balance and
+	// cycle-end/spend facts. Component amounts fold into that one balance.
+	const accountFacts = nousWindowAccountFacts(
+		providers ? providers.nous : null,
+		row,
+		payload,
+		toolPoolMaxAgeS,
+	);
+	if (accountFacts) {
+		// A Billing total is authoritative and never replaced (a credit model
+		// that supplied one is excluded above). When Billing supplied only its
+		// wallet, a fresh identity-matched cached total is the actual usable
+		// total and outranks that wallet. Missing/stale/unmatched caches leave
+		// the wallet intact. A paused plan contributes no cached balance at
+		// all (its withheld included credits are not spendable money), so
+		// Billing's wallet stays authoritative there.
+		if (accountFacts.balances.length
+			&& (nextRow.billing_wallet_balance === true || !billingList(row.account_balances).length)) {
+			nextRow.account_balances = accountFacts.balances;
+		}
+		const facts = { ...(billingObject(row.detail_facts) || {}) };
+		const details = billingList(nextRow.details);
+		for (const key of NOUS_MONEY_FACT_ORDER) {
+			let line = accountFacts.facts[key];
+			if (!line || facts[key]) continue;
+			// Billing's monthly-cap line already supplies the cap answer; the
+			// account fetcher's "no cap reported" qualifier would contradict it.
+			if (key === "spend" && facts.monthly_cap) {
+				line = line.replace(" (no cap reported)", "");
+			}
+			if (details.some((entry) => billingText(entry) === line)) continue;
+			details.push(line);
+			facts[key] = line;
+		}
+		nextRow.details = details;
+		nextRow.detail_facts = facts;
+	}
+	if (liveAge != null) nextRow.billing_age_s = liveAge;
+	const merged = {
+		...(payload || {}),
+		providers: {
+			...(providers || {}),
+			nous: nextRow,
+		},
+	};
+	// `age_s` describes the cached CLI snapshot, not a billing read. Do not
+	// fold the billing age into it: `useCodexStale`, the pane footer and every
+	// other provider would then inherit a freshness that only Nous has.
+	return merged;
+}
+
+/** Refresh quota and billing together when the user explicitly asks. */
+function invalidateQuotaSurfaces(qc, scope) {
+	// The explicit refresh is also the user's request for a fresh billing read:
+	// do not let the cross-observer cadence throttle serve the previous row.
+	resetBillingCadence(scope);
+	if (!qc || typeof qc.invalidateQueries !== "function") return;
+	qc.invalidateQueries({ queryKey: quotaQueryKey(scope) });
+	qc.invalidateQueries({ queryKey: billingQueryKey(scope) });
+}
+
+function useNousBilling(scope, intervalMs, requested = true) {
+	const enabled = Boolean(scope) && requested !== false;
+	const query = useQuery({
+		queryKey: billingQueryKey(scope),
+		// Cache only the whitelisted row, never the full state (card, org,
+		// payment method, balances) the gateway response carries. The
+		// observation time rides along so a throttled replay is not painted
+		// as a fresh portal read.
+		queryFn: async () => {
+			const snapshot = await fetchBillingSnapshot(scope, BILLING_TIMEOUT_MS, intervalMs);
+			if (!snapshot.row) return null;
+			const row = snapshot.observedAt == null
+				? snapshot.row
+				: { ...snapshot.row, billing_observed_at: snapshot.observedAt };
+			// A spread is a new object, so carry the non-serialized organisation
+			// association across explicitly. The digest never enters the query
+			// cache itself; without this transfer the merge would fail closed.
+			rememberBillingOrgKey(row, billingOrgKeyFor(snapshot.row));
+			return row;
+		},
+		enabled,
+		// Read-only and optional: a failure is an expected fallback, not a
+		// retryable error surface.
+		retry: false,
+		// Keep the exact sanitized row object returned by queryFn. React Query's
+		// structural sharing would build a fresh object on every changed poll,
+		// losing the WeakMap association that carries the non-serialized
+		// organisation digest and silently suppressing a legitimate rate line.
+		structuralSharing: false,
+		refetchInterval: intervalMs,
+		refetchIntervalInBackground: true,
+		// The explicit cadence already refreshes a hidden/unfocused window; a
+		// focus refetch on top of it would duplicate the portal read.
+		refetchOnWindowFocus: false,
+		staleTime: Math.max(5_000, Math.floor(intervalMs / 2)),
+	}) || {};
+	// Never paint a cached result from a previous scope.
+	return enabled ? query : { ...query, data: undefined };
+}
+
 function useQuota() {
 	const qc = useQueryClient();
 	const intervalSec = useValue(refreshIntervalAtom);
@@ -1377,6 +2650,90 @@ function useQuota() {
 	});
 }
 
+const _quotaRevisions = new WeakMap();
+let _quotaRevisionSeq = 0;
+
+function quotaDataRevision(data) {
+	if (!data || typeof data !== "object") return 0;
+	let revision = _quotaRevisions.get(data);
+	if (revision == null) {
+		_quotaRevisionSeq += 1;
+		revision = _quotaRevisionSeq;
+		_quotaRevisions.set(data, revision);
+	}
+	return revision;
+}
+
+/** The value a freshness clock keys on: the quota revision, never the merged wrapper. */
+function quotaFreshnessAnchor(data) {
+	const revision = data && data.quota_revision;
+	return typeof revision === "number" && Number.isFinite(revision) ? revision : data;
+}
+
+/**
+ * The quota payload every render surface consumes: cached CLI data with the
+ * billing `nous` row overlaid when billing has evidence. `useQuota` itself is
+ * untouched so its query key, refresh sweep and cached snapshot behaviour stay
+ * exactly as before.
+ *
+ * `visible: false` is for a mounted-but-hidden consumer (the status bar when
+ * the user turned it off): it still calls the same hooks, but must not keep a
+ * billing portal read alive for UI nobody sees.
+ */
+function useMergedQuota({ visible = true } = {}) {
+	const quota = useQuota();
+	const intervalSec = useValue(refreshIntervalAtom);
+	const owner = useValue(host.state.focusedSessionOwner);
+	const disabled = useValue(disabledProvidersAtom);
+	const scope = normalizeQuotaScope(owner);
+	// Billing only describes Nous. Do not poll a portal read for a provider the
+	// user hid, or while the surface consuming this hook is not on screen
+	// (the status bar still renders its hooks when showStatusBar is false).
+	const billingEnabled = visible !== false && !disabled.includes("nous");
+	const billing = useNousBilling(scope, Math.max(5, intervalSec) * 1000, billingEnabled);
+	// Ignore any query-cache value addressed to another scope. React Query
+	// already keys by connection+profile; this is the belt-and-braces guard
+	// for older hosts and rendered stubs.
+	const billingData = scope && billingEnabled ? billing.data : undefined;
+	// Prefer the gateway observation time carried by the sanitized row: a
+	// cadence replay keeps its original timestamp even though React Query's
+	// `dataUpdatedAt` records the replay.
+	const billingObservedAt = billingData ? billingNumber(billingData.billing_observed_at) : null;
+	const billingUpdatedAt = billingObservedAt != null
+		? billingObservedAt
+		: billingData && typeof billing.dataUpdatedAt === "number" && Number.isFinite(billing.dataUpdatedAt)
+			? billing.dataUpdatedAt
+			: null;
+	const data = useMemo(() => {
+		const billingAgeS =
+			billingUpdatedAt != null ? Math.max(0, (Date.now() - billingUpdatedAt) / 1000) : null;
+		// Billing is the sole Desktop Nous financial source. The one cached
+		// fact allowed through is the non-financial free tool pool, and only
+		// for a fresh same-profile Free snapshot. See `mergeNousRow`.
+		const toolPoolMaxAgeS = Math.min(1800, Math.max(300, intervalSec * 2));
+		const merged = mergeNousRow(quota.data, billingData, billingAgeS, toolPoolMaxAgeS);
+		// Absolute freshness for the footer. It is additive metadata on the
+		// rendered payload only; the cached quota snapshot is never written.
+		if (merged !== quota.data && billingUpdatedAt != null) merged.billing_updated_at = billingUpdatedAt;
+		// Keep the quota-cache revision across billing-only repaints: the
+		// freshness clocks below read this, not the wrapper's identity.
+		if (merged !== quota.data) merged.quota_revision = quotaDataRevision(quota.data);
+		return merged;
+	}, [quota.data, billingData, billingUpdatedAt, intervalSec]);
+	if (data === quota.data) return quota;
+	// Billing supplied the Nous row. The quota query's failure/loading flags
+	// describe the cached CLI sweep, not this primary read: without clearing
+	// them the status bar filters the fresh billing row out entirely and the
+	// pane shows its loading/error state over data it already has.
+	const billingPrimary = Boolean(billingData) && data !== quota.data;
+	return {
+		...quota,
+		data,
+		isError: billingPrimary ? false : quota.isError,
+		isLoading: billingPrimary ? false : quota.isLoading,
+	};
+}
+
 // The bar is a clipped single line: a chip must never wrap or get squeezed.
 const CHIP_NOWRAP = { whiteSpace: "nowrap", flexShrink: 0 };
 
@@ -1403,7 +2760,7 @@ function QuotaTip({ label, children }) {
 // ---- single worst chip (worst mode) ---------------------------------------
 
 function QuotaChipWithBar() {
-	const { data, isError, isPlaceholderData } = useQuota();
+	const { data, isError, isPlaceholderData } = useMergedQuota();
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
@@ -1428,7 +2785,19 @@ function QuotaChipWithBar() {
 	if (worst == null) {
 		// Unknown Codex cannot be ranked. Keep it alongside the existing
 		// balance-only fallback; money has no meaningful worst percentage.
-		const fallback = providers.filter(([pid, p]) => isProviderEnabled(pid) && (p?.display_accounts || accountFacts(p).balances.length));
+		// A confirmed entitlement (free/active) and a confirmed unusable row
+		// are evidence too: "Q:none" would hide a free Nous account or a
+		// revoked paid account behind a healthy-looking empty chip.
+		const fallback = providers.filter(([pid, p]) => {
+			if (!isProviderEnabled(pid)) return false;
+			const facts = accountFacts(p);
+			return Boolean(
+				p?.display_accounts ||
+				facts.balances.length ||
+				p?.access_state ||
+				p?.unavailable_reason,
+			);
+		});
 		if (fallback.length === 1 && fallback[0][1]?.display_accounts) return jsx(ProviderChip, { pid: fallback[0][0], provider: fallback[0][1], alert: alerts(fallback[0][0], fallback[0][1]), special: fallback[0][0] === "openai-codex" ? special : null });
 		return fallback.length
 			? jsx("span", { className: "inline-flex h-full items-center", children: fallback.map(([pid, p]) => jsx(ProviderChip, { pid, provider: p, alert: alerts(pid, p), special: pid === "openai-codex" ? special : null, key: pid })) })
@@ -1562,7 +2931,7 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 	const r = provider && provider.unavailable_reason ? null : provider?.display_accounts ? cachedRemaining : worstWindow(provider);
 	const staleValue = Boolean(provider?.display_accounts && provider.display_stale && r != null);
 	const facts = accountFacts(provider);
-	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? tr("valueUnavailable") : r != null ? fmtPct(r) : facts.balances.length ? facts.balances.map((b) => balanceText(b)).join(" · ") : facts.available === true ? tr("valueAvailable") : facts.available === false ? tr("valueUnavailable") : "—";
+	const value = provider?.display_accounts ? codexValue(r) : provider && provider.unavailable_reason ? tr("valueUnavailable") : provider && provider.access_state === "unavailable" ? tr("valueUnavailable") : r != null ? fmtPct(r) : facts.balances.length ? facts.balances.map((b) => balanceText(b)).join(" · ") : facts.available === true ? tr("valueAvailable") : facts.available === false ? tr("valueUnavailable") : provider?.plan ? provider.plan : "—";
 	const tone = provider?.display_accounts ? (provider.display_stale ? "muted" : toneForRemaining(r)) : providerTone(provider);
 	const dot = toneColor(tone);
 	const label = providerDisplayName(pid, provider);
@@ -1582,7 +2951,7 @@ function ProviderChip({ pid, provider, alert = null, special = null }) {
 				// providers keep the plain dot.
 				r != null
 					? jsx(Ring, { value: r, tone, size: 13, stroke: 2, label: fmtPct(r) })
-					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot } }),
+					: jsx("span", { className: "inline-block h-1.5 w-1.5 rounded-full", style: { background: dot }, "data-sb-dot": true }),
 				jsx("span", { children: label }),
 				jsx("span", { className: "tabular-nums", style: staleValue ? { textDecoration: "line-through" } : undefined, children: value }),
 				// Layout A: other saved Codex accounts are counted, never hidden;
@@ -1700,7 +3069,7 @@ function makeProviderTip(pid, provider, special) {
 	}
 	const lines = providerWindowLines(pid, provider);
 	const facts = accountFacts(provider);
-	lines.push(...facts.balances.map((b) => tr("accountBalanceLine", balanceText(b))));
+	lines.push(...facts.balances.map((b) => balanceLine(b)));
 	if (facts.available != null) lines.push(tr("apiCallsAvailable", facts.available));
 	if (provider.plan) lines.unshift(tr("planLine", provider.plan));
 	lines.unshift(name);
@@ -1723,10 +3092,12 @@ function providerGroupTip(entries) {
 	return lines.join("\n");
 }
 
-// Shared: turn a provider's windows into tooltip lines like
+// Shared: turn a provider's usable windows into tooltip lines like
 // "  Session · 21% left · resets 5d 19h" / "  5.3 Codex Spark · 5h · 8% left · resets 3h 52m"
+// Only windows that may inform health are listed: a paused/depleted row's
+// stale gauges are withheld included quota, not remaining allowance.
 function providerWindowLines(pid, provider) {
-	const windows = asWindowList(provider && provider.windows);
+	const windows = usableWindows(provider);
 	const out = [];
 	for (const w of windows) {
 		const r = remainingPct(w);
@@ -1741,7 +3112,7 @@ function providerWindowLines(pid, provider) {
 function StatusBar() {
 	const showStatusBar = useValue(showStatusBarAtom);
 	const mode = useValue(statusbarModeAtom);
-	const { data, isError, isPlaceholderData } = useQuota();
+	const { data, isError, isPlaceholderData } = useMergedQuota({ visible: showStatusBar });
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const stale = useCodexStale(data, isError || isPlaceholderData);
@@ -2160,8 +3531,8 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 		});
 	}
 
-	const windows = asWindowList(provider && provider.windows);
-	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null) {
+	const windows = usableWindows(provider);
+	if (windows.length === 0 && details.length === 0 && facts.balances.length === 0 && facts.available == null && !(provider && provider.plan)) {
 		return jsxs("div", {
 			className: "flex items-center gap-2 rounded-lg border px-3 py-2 opacity-60",
 			style: { ...cardStyle, background: "transparent" },
@@ -2209,14 +3580,21 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 							headerExtra || null,
 						],
 					}),
-					provider.plan ? jsx(Pill, { color: "var(--ui-text-secondary)", children: provider.plan }) : null,
+					provider.plan
+						? jsx(Pill, {
+								color: "var(--ui-text-secondary)",
+								"data-card-plan": true,
+								title: provider.plan,
+								children: provider.plan,
+							})
+						: null,
 				],
 			}),
 			...facts.balances.map((b) =>
 				jsxs("div", {
 					key: `balance-${b.currency}`,
 					children: [
-						jsx("div", { style: UI.meta, children: t("accountBalance") }),
+						jsx("div", { style: UI.meta, children: balanceLabel(b) }),
 						jsx("div", { style: { ...UI.num, fontWeight: 600, color: "var(--ui-text-primary)", fontSize: "1.25rem", lineHeight: 1.3 }, children: balanceText(b) }),
 					],
 				}),
@@ -2539,7 +3917,7 @@ function lowestLeft(providers) {
 	let lowest = null;
 	for (const [pid, p] of providerEntries(providers)) {
 		if (!isProviderEnabled(pid) || !isConfigured(p)) continue;
-		for (const w of asWindowList(p.windows)) {
+		for (const w of usableWindows(p)) {
 			const r = remainingPct(w);
 			if (r != null && (lowest == null || r < lowest.left)) lowest = { left: r, label: `${providerDisplayName(pid, p)} · ${w.label || tr("windowFallback")}` };
 		}
@@ -2596,7 +3974,7 @@ function QuotaPane({ page = false } = {}) {
 	const t = useQT();
 	const qc = useQueryClient();
 	const [view, setView] = useState("list"); // 'list' | 'settings'
-	const { data, isError, isLoading } = useQuota();
+	const { data, isError, isLoading } = useMergedQuota();
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	// Agent monitor tabs. Every hook runs unconditionally; the views only read
@@ -2617,9 +3995,13 @@ function QuotaPane({ page = false } = {}) {
 	const receivedAt = useRef(Date.now());
 	const pollSeconds = useValue(refreshIntervalAtom);
 	const liveSeconds = useValue(liveIntervalAtom);
+	// Billing repaints the merged payload without refreshing the quota cache.
+	// Key the clock to the quota revision so `age_s` keeps ticking from the
+	// read it actually describes.
+	const freshnessAnchor = quotaFreshnessAnchor(data);
 	useEffect(() => {
 		receivedAt.current = Date.now();
-	}, [data]);
+	}, [freshnessAnchor]);
 	const ageSeconds = (() => {
 		if (data?.age_s == null) return null;
 		const base = Number(data.age_s);
@@ -2644,8 +4026,10 @@ function QuotaPane({ page = false } = {}) {
 			});
 			return scope;
 		},
-		onSuccess: (scope) =>
-			qc.invalidateQueries({ queryKey: quotaQueryKey(scope) }),
+		// The explicit refresh also repaints Billing: `quota refresh` rewrites
+		// only the CLI cache, and the card merges a separately read Billing
+		// row, so invalidating quota alone left a stale Billing half on screen.
+		onSuccess: (scope) => invalidateQuotaSurfaces(qc, scope),
 	});
 
 	const headerTitle = view === "settings" ? t("settingsTitle") : t("paneTitle");
@@ -2788,19 +4172,33 @@ function QuotaPane({ page = false } = {}) {
 	}
 
 	const online = isError ? "bad" : data ? "good" : "muted";
-	const footerText =
-		view !== "settings" && activeTab !== "quota"
-			? mon.snapshot && finiteNumber(mon.snapshot.generated_at) != null
+	const billingAgeSeconds = (() => {
+		if (data?.billing_updated_at == null) return null;
+		const observed = Number(data.billing_updated_at);
+		if (!Number.isFinite(observed)) return null;
+		return Math.max(0, (Date.now() - observed) / 1000);
+	})();
+	const billingFooter =
+		billingAgeSeconds == null ? null : t("billingChecked", formatAgeSeconds(billingAgeSeconds));
+	let footerText = null;
+	if (view !== "settings" && activeTab !== "quota") {
+		footerText =
+			mon.snapshot && finiteNumber(mon.snapshot.generated_at) != null
 				? { text: t("monitorUpdated", checkedDateTime(new Date(Number(mon.snapshot.generated_at) * 1000).toISOString()), liveSeconds) }
-				: null
-			: data && data.fetched_at
-				? {
-						title: data.fetched_at,
-						text:
-							t("fetched", checkedDateTime(data.fetched_at) || data.fetched_at) +
-							(ageSeconds == null ? "" : ` · ${t("fetchedAge", formatAgeSeconds(ageSeconds), pollSeconds)}`),
-					}
 				: null;
+	} else {
+		const cacheFooter = data && data.fetched_at
+			? {
+					title: data.fetched_at,
+					text:
+						t("fetched", checkedDateTime(data.fetched_at) || data.fetched_at) +
+						(ageSeconds == null ? "" : ` · ${t("fetchedAge", formatAgeSeconds(ageSeconds), pollSeconds)}`),
+				}
+			: null;
+		footerText = cacheFooter && billingFooter
+			? { title: cacheFooter.title, text: `${cacheFooter.text} · ${billingFooter}` }
+			: cacheFooter || (billingFooter ? { text: billingFooter } : null);
+	}
 
 	return jsxs("div", {
 		className: "flex h-full flex-col",
@@ -3318,7 +4716,7 @@ function accountRoomHints(providers) {
 	for (const entries of groups.values()) {
 		if (entries.length < 2) continue;
 		for (const [pid, p] of entries) {
-			for (const w of asWindowList(p.windows)) {
+			for (const w of usableWindows(p)) {
 				const used = finiteNumber(w.used_percent);
 				if (used == null || used < 90) continue;
 				let best = null;
@@ -3390,7 +4788,7 @@ function monitorNotifications(input, prev, nowSec = Date.now() / 1000) {
 	for (const [pid, p] of providerEntries(providers)) {
 		if (!isConfigured(p) || !isProviderEnabled(pid)) continue;
 		const name = providerDisplayName(pid, p);
-		for (const w of asWindowList(p.windows)) {
+		for (const w of usableWindows(p)) {
 			const used = finiteNumber(w.used_percent);
 			if (used == null) continue;
 			const level = used >= 95 ? 95 : used >= 80 ? 80 : 0;
@@ -4738,7 +6136,7 @@ function quotaChipAlert(pid, provider, burnMap, nowSec = Date.now() / 1000) {
 	if (!provider || provider.unavailable_reason || provider.display_stale) return null;
 	let reset = null;
 	let full = null;
-	for (const w of asWindowList(provider.windows)) {
+	for (const w of usableWindows(provider)) {
 		const used = finiteNumber(w.used_percent);
 		if (used == null) continue;
 		const resetSec = isoToSeconds(w.reset_at);
@@ -5013,16 +6411,18 @@ function MonitorStatus() {
 	const show = useValue(agentsChipAtom);
 	const showBar = useValue(showStatusBarAtom);
 	const spark = useValue(chipSparkAtom);
-	const { data } = useQuota();
+	const mon = useMonitor();
+	const live = mon.snapshot ? asObject(mon.snapshot.live) : null;
+	const counts = live ? liveCounts(live) : null;
+	// This chip renders nothing when the bar, the chip or an open-session row
+	// is absent. Gate the billing read on the same condition: a hidden agents
+	// chip must not keep a Nous portal read alive for UI nobody sees.
+	const { data } = useMergedQuota({ visible: Boolean(show && showBar && counts && counts.open) });
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
-	const mon = useMonitor();
 	useMonitorNotifier(mon.scope, data, mon.snapshot);
 	const flash = useAttentionFlash(mon.scope, mon.snapshot);
-	if (!show || !showBar || !mon.snapshot) return null;
-	const live = asObject(mon.snapshot.live);
-	const counts = liveCounts(live);
-	if (!counts.open) return null;
+	if (!show || !showBar || !mon.snapshot || !counts || !counts.open) return null;
 	const approval = Number(counts.needs_approval) || 0;
 	const label = [
 		t("chipWorking", counts.working || 0),
@@ -5477,21 +6877,65 @@ function QuotaCardWindow({ w, nowMs }) {
 	});
 }
 
+/**
+ * Whether a provider has something meaningful for the quota card.
+ *
+ * A plan-only row (Billing could not verify usage, or a free/depleted
+ * entitlement) has no percentage window and no balance, but its status is the
+ * most important thing the card can show. Requiring a window or balance hid
+ * exactly those rows.
+ */
+function quotaCardHasContent(provider) {
+	if (!provider) return false;
+	return Boolean(
+		isNoData(provider) ||
+		usableWindows(provider).length ||
+		accountFacts(provider).balances.length ||
+		provider.plan ||
+		asList(provider && provider.details).some((line) => typeof line === "string" && line.trim()),
+	);
+}
+
+// The one line worth showing when a window is missing or unusable: a free
+// entitlement, a paused/depleted access state, or the first factual detail.
+function quotaCardStatus(provider) {
+	if (!provider) return null;
+	const details = asList(provider && provider.details).filter(
+		(line) => typeof line === "string" && line.trim(),
+	);
+	if (provider.access_state === "free") {
+		// The detail list carries the authoritative copy (which distinguishes a
+		// plain Free account from purchased credits funding paid models). If an
+		// old or partial row lost it, say only what the state proves instead of
+		// asserting "free models only" against a balance we cannot explain.
+		return details.find((line) => /^free\b/i.test(line)) || "Free tier";
+	}
+	if (provider.access_state === "depleted" || provider.access_state === "paused" || provider.access_state === "unavailable") {
+		return details.find((line) => /^status:/i.test(line)) || details[0] || null;
+	}
+	return null;
+}
+
 function QuotaCard({ close }) {
 	const t = useQT();
-	const { data } = useQuota();
+	const { data } = useMergedQuota();
 	// Formatters follow the payload's configured timezone.
 	noteDataTimeZone(data);
 	const mon = useMonitor();
 	const forecastOn = useValue(quotaForecastAtom);
 	const nowMs = useNow(30_000);
 	const burnMap = mon.snapshot ? monitorBurnMap(mon.snapshot, null) : null;
+	const billingChecked = (() => {
+		if (data?.billing_updated_at == null) return null;
+		const observed = Number(data.billing_updated_at);
+		if (!Number.isFinite(observed)) return null;
+		return t("billingChecked", formatAgeSeconds(Math.max(0, (Date.now() - observed) / 1000)));
+	})();
 	// Same visibility rule as the status bar: a failed saved account keeps its
 	// slot (with its reason) so every account is reachable here without any
 	// selection; only never-configured rows stay hidden.
 	const entries = providerEntries(data && data.providers).filter(
-		([pid, p]) => isProviderEnabled(pid) && p && !isUnconfigured(p)
-			&& (isNoData(p) || asWindowList(p.windows).length || accountFacts(p).balances.length),
+		([pid, p]) => isProviderEnabled(pid) && p && !isUnconfigured(p) && quotaCardHasContent(p),
 	);
 	const toQuota = () => {
 		close();
@@ -5505,7 +6949,11 @@ function QuotaCard({ close }) {
 		onLink: toQuota,
 		children: entries.length
 			? entries.map(([pid, p], i) => {
-					const windows = asWindowList(p.windows);
+					const windows = usableWindows(p);
+					const details = asList(p && p.details).filter(
+						(line) => typeof line === "string" && line.trim(),
+					);
+					const statusLine = quotaCardStatus(p) || (windows.length === 0 ? details.slice(0, 2).join(" · ") : null);
 					const forecasts = forecastOn
 						? windows
 								.map((w) => ({ w, f: forecastFor(burnFor(burnMap, pid, p, w.label), w, nowMs / 1000) }))
@@ -5530,11 +6978,14 @@ function QuotaCard({ close }) {
 							}),
 							p.unavailable_reason
 								? jsx("span", { "data-card-unavailable": "", style: { ...UI.meta, overflowWrap: "anywhere" }, children: t("unavailable", p.unavailable_reason) })
-								: null,
+								: statusLine
+									? jsx("span", { "data-card-status": pid, style: { ...UI.meta, color: toneColor(providerTone(p)), overflowWrap: "anywhere" }, children: statusLine })
+									: null,
 							windows.length
 								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
-							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
+							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceLine(b)).join(" · ") }) : null,
+							p.billing && billingChecked ? jsx("span", { style: UI.tiny, children: billingChecked }) : null,
 							...forecasts.map(({ w, f }, j) =>
 								jsxs("div", {
 									"data-card-forecast": w.label,
@@ -6959,7 +8410,7 @@ function navLowestQuota() {
 			if (!providers || typeof providers !== "object") continue;
 			for (const [pid, rec] of Object.entries(providers)) {
 				if (!isProviderEnabled(pid) || !rec || rec.unavailable_reason) continue;
-				for (const w of rec.windows || []) {
+				for (const w of usableWindows(rec)) {
 					if (typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent)) continue;
 					const left = Math.max(0, Math.round(100 - w.used_percent));
 					if (lowest == null || left < lowest) lowest = left;
@@ -7470,6 +8921,7 @@ const I18N_EN = {
 	tokensPerMinN: (n) => `${n} tokens/min`,
 	quotaCardTitle: "Quota windows",
 	checkedAgo: (age) => `checked ${age} ago`,
+	billingChecked: (age) => `Nous billing checked ${age} ago`,
 	costCardTitle: "Spend",
 	monthEnd: "Month-end",
 	topModelsToday: "Top models · today",
@@ -7910,6 +9362,7 @@ const I18N_TR = {
 	tokensPerMinN: (n) => `${n} token/dk`,
 	quotaCardTitle: "Kota pencereleri",
 	checkedAgo: (age) => `${age} önce bakıldı`,
+	billingChecked: (age) => `Nous faturası ${age} önce kontrol edildi`,
 	costCardTitle: "Harcama",
 	monthEnd: "Ay sonu",
 	topModelsToday: "En çok harcayan modeller · bugün",
@@ -8372,6 +9825,7 @@ const I18N_DE = {
 	tokensPerMinN: (n) => `${n} Tokens/Min.`,
 	quotaCardTitle: "Kontingentfenster",
 	checkedAgo: (age) => `geprüft vor ${age}`,
+	billingChecked: (age) => `Nous-Abrechnung vor ${age} geprüft`,
 	costCardTitle: "Ausgaben",
 	monthEnd: "Monatsende",
 	topModelsToday: "Top-Modelle · heute",
@@ -8812,6 +10266,7 @@ const I18N_ES = {
 	tokensPerMinN: (n) => `${n} tokens/min`,
 	quotaCardTitle: "Ventanas de cuota",
 	checkedAgo: (age) => `consultado hace ${age}`,
+	billingChecked: (age) => `Facturación de Nous consultada hace ${age}`,
 	costCardTitle: "Gasto",
 	monthEnd: "Fin de mes",
 	topModelsToday: "Modelos principales · hoy",
@@ -9252,6 +10707,7 @@ const I18N_FR = {
 	tokensPerMinN: (n) => `${n} jetons/min`,
 	quotaCardTitle: "Fenêtres de quota",
 	checkedAgo: (age) => `vérifié il y a ${age}`,
+	billingChecked: (age) => `Facturation Nous vérifiée il y a ${age}`,
 	costCardTitle: "Dépenses",
 	monthEnd: "Fin de mois",
 	topModelsToday: "Top modèles · aujourd'hui",
@@ -9692,6 +11148,7 @@ const I18N_RU = {
 	tokensPerMinN: (n) => `${n} токенов/мин`,
 	quotaCardTitle: "Окна квот",
 	checkedAgo: (age) => `проверено ${age} назад`,
+	billingChecked: (age) => `Биллинг Nous проверен ${age} назад`,
 	costCardTitle: "Расходы",
 	monthEnd: "Конец месяца",
 	topModelsToday: "Топ моделей · сегодня",
@@ -10132,6 +11589,7 @@ const I18N_JA = {
 	tokensPerMinN: (n) => `${n} トークン/分`,
 	quotaCardTitle: "クォータウィンドウ",
 	checkedAgo: (age) => `${age}前に確認`,
+	billingChecked: (age) => `Nous 請求を${age}前に確認`,
 	costCardTitle: "支出",
 	monthEnd: "月末",
 	topModelsToday: "上位モデル · 今日",
@@ -10572,6 +12030,7 @@ const I18N_ZH = {
 	tokensPerMinN: (n) => `${n} token/分钟`,
 	quotaCardTitle: "额度窗口",
 	checkedAgo: (age) => `${age}前检查`,
+	billingChecked: (age) => `Nous 账单已于${age}前检查`,
 	costCardTitle: "支出",
 	monthEnd: "月底",
 	topModelsToday: "费用最高的模型 · 今天",
@@ -11012,6 +12471,7 @@ const I18N_ZH_HANT = {
 	tokensPerMinN: (n) => `${n} token/分鐘`,
 	quotaCardTitle: "額度視窗",
 	checkedAgo: (age) => `${age}前檢查`,
+	billingChecked: (age) => `Nous 帳單已於${age}前檢查`,
 	costCardTitle: "支出",
 	monthEnd: "月底",
 	topModelsToday: "費用最高的模型 · 今天",
@@ -11452,6 +12912,7 @@ const I18N_AR = {
 	tokensPerMinN: (n) => `${n} رمز/دقيقة`,
 	quotaCardTitle: "نوافذ الحصة",
 	checkedAgo: (age) => `فُحصت منذ ${age}`,
+	billingChecked: (age) => `تم فحص فاتورة Nous منذ ${age}`,
 	costCardTitle: "الإنفاق",
 	monthEnd: "نهاية الشهر",
 	topModelsToday: "أعلى النماذج · اليوم",

@@ -49,13 +49,17 @@ class QuotaWindow:
 class AccountBalance:
     """Account money, not a key cap or a percentage denominator.
 
-    Decimal strings preserve the precision returned by the provider.
+    Decimal strings preserve the precision returned by the provider. ``label``
+    is an optional, provider-authored display label (for example Nous Portal's
+    "Total usable"); consumers fall back to their own "Account balance" wording
+    when it is absent, so existing fetchers keep their established meaning.
     """
 
     currency: str
     total_balance: str
     granted_balance: Optional[str] = None
     topped_up_balance: Optional[str] = None
+    label: Optional[str] = None
 
 
 @dataclass
@@ -87,6 +91,20 @@ class QuotaAccount:
 GENERATED_ACCOUNT_ID_PREFIX = "__invalid-"
 
 
+#: Allowed values for :attr:`QuotaResult.access_state`. A provider uses this
+#: when its entitlement is not a numeric window (currently Nous): ``"free"``
+#: and ``"active"`` are confirmed usable states, ``"depleted"`` and
+#: ``"unavailable"`` are confirmed unusable ones, and ``"unknown"`` never
+#: grants a healthy tone. ``"paused"`` means the *included plan* is paused: a
+#: confirmed impairment, but not necessarily a call outage. For that state,
+#: call availability is the separate :attr:`QuotaResult.api_calls_available`
+#: fact: ``True`` keeps calls usable on purchased credits (render a warning,
+#: never green health and never the unusable verdict), ``False`` is unusable,
+#: and ``None`` leaves continuation unproven. Consumers must not infer either
+#: from free-form details.
+ACCESS_STATES = ("free", "active", "depleted", "paused", "unavailable", "unknown")
+
+
 @dataclass
 class QuotaResult:
     """Normalized quota for one provider, ready to cache."""
@@ -105,6 +123,22 @@ class QuotaResult:
     accounts: list[Union[QuotaAccount, QuotaResult]] = field(default_factory=list)
     # Explicit label for legacy single-account provider records (Codex).
     account_label: Optional[str] = None
+    #: Structured access/health evidence for providers with no percentage
+    #: window. ``None`` on legacy records means unknown and stays muted.
+    access_state: Optional[str] = None
+    #: Optional stable fact key -> already-rendered detail line. Consumers that
+    #: need one non-financial fact from the account snapshot (the Desktop Nous
+    #: card's Free Tool pool) identify it here instead of parsing ``details``.
+    #: Financial facts are never merged across sources. Only display-safe facts
+    #: belong here.
+    detail_facts: dict[str, str] = field(default_factory=dict)
+    #: Pseudonymous local organisation digest (unkeyed FNV-1a 64-bit hex) for
+    #: the Billing/account rate-limit merge. It is never rendered, is not a
+    #: credential, and is not a cryptographic identifier:
+    #: a low-entropy slug can be brute-forced, and two users in the same
+    #: organisation share it. It is a matching hint, not account proof. Absent
+    #: when the provider cannot supply an organisation identity.
+    account_org_key: Optional[str] = None
 
     def has_data(self) -> bool:
         return (

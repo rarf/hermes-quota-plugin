@@ -57,6 +57,10 @@ class CountdownAndForecastTest(unittest.TestCase):
         self.assertIsNone(self.alert({'windows': [{'label': 'Session', 'used_percent': 99, 'reset_at': iso(-60)}]}))
         self.assertIsNone(self.alert({**provider, 'display_stale': True}))
         self.assertIsNone(self.alert({**provider, 'unavailable_reason': 'no-data'}))
+        # A confirmed unusable entitlement outranks its stale windows: no
+        # countdown or fill alert may fire for access that is not usable.
+        self.assertIsNone(self.alert({**provider, 'access_state': 'unavailable'}))
+        self.assertIsNone(self.alert({**provider, 'access_state': 'paused'}))
 
     def test_fullest_window_wins_then_soonest_reset(self):
         a = self.alert({'windows': [
