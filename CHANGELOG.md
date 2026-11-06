@@ -3,6 +3,26 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 3.1.0 — 2026-11-06
+
+- Desktop Quota: every saved account and every quota window is visible at
+  once, as compact rows with bars, in the pane and in the status-bar popover.
+  The one-account-at-a-time account tabs are gone. Unknown windows show "—",
+  never 0%. Failed saved accounts keep their slot with the reason.
+- Status bar: grouped chips name the limiting account, its window and the
+  remaining value, plus an explicit `+N` for the other accounts; `all` and
+  `worst` modes are kept and Codex stale values stay struck through.
+- Accounts: each saved account lists all of its windows as bars.
+- Live, Health, Usage, Kanban and Settings: flat KPI strips, quiet section
+  titles, status words instead of pills, and secondary detail (charts,
+  per-day values, settings groups) behind native disclosures. Every
+  preference and notification kind is unchanged. Eight new strings are
+  translated in all ten locales.
+- Tests: layout regressions for the quota and monitor surfaces and a
+  real-module render matrix (widths, themes and states).
+- Credentials: unchanged. Provider readers stay opt-in and disclosed as in
+  3.0.x.
+
 ## 3.0.1 — 2026-11-03
 
 - Desktop: keep the last successfully fetched quota data visible when polling
