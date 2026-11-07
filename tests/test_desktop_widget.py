@@ -128,5 +128,40 @@ class ZaiIconStaticTests(unittest.TestCase):
         self.assertNotIn("</", self.source.replace("</path>", "").replace("</svg>", ""))
 
 
+class ExperientialLabsIconStaticTests(unittest.TestCase):
+    """The inline Experiential Labs SVG must be offline, inline, and theme-driven."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = _plugin_source()
+
+    def test_svg_entry_is_the_official_mark(self):
+        entry = _provider_svgs_entry(self.source, "experientiallabs")
+        self.assertIn('viewBox: "0 0 32 32"', entry)
+        self.assertEqual(2, entry.count("<path"), "the official mark has two paths")
+        self.assertNotIn("</g>", entry, "path-only body, like the other providers")
+
+    def test_svg_has_no_external_dependency_or_background(self):
+        entry = _provider_svgs_entry(self.source, "experientiallabs")
+        lowered = entry.lower()
+        for banned in (
+            "http://",
+            "https://",
+            "url(",
+            "<image",
+            "xlink:href",
+            "base64",
+            ".png",
+            "<rect",
+            "fill=",
+        ):
+            self.assertNotIn(banned, lowered, f"icon must not contain {banned!r}")
+
+    def test_icon_renders_with_theme_currentcolor(self):
+        entry = _provider_svgs_entry(self.source, "experientiallabs")
+        self.assertNotIn("fill=", entry)
+        self.assertIn('fill: "currentColor"', self.source)
+
+
 if __name__ == "__main__":
     unittest.main()
