@@ -129,6 +129,29 @@ class ExperientialLabsTests(unittest.TestCase):
         sum_lines = [d for d in result.details if "Sum recent" in d]
         self.assertGreaterEqual(len(sum_lines), 1)
 
+    def test_zero_recent_usage_sum_is_not_unknown(self):
+        """Rows that report zero cost sum to $0.00, not the unknown marker $?."""
+        mod = self.module()
+        usage = {"data": [
+            {"model": "m1", "real_cost_usd": "0", "created_at": "2026-09-30T10:00:00Z"},
+            {"model": "m2", "real_cost_usd": "0.00", "created_at": "2026-09-30T09:00:00Z"},
+        ]}
+        with mock.patch.dict("os.environ", {"EXPLABS_API_KEY": "xpl_" + "h" * 40}), mock.patch.object(
+            mod, "_get_json"
+        ) as get:
+
+            def side_effect(url, secret, timeout=None):
+                if "/credits" in url:
+                    return {"data": {"total_credits": "10.00", "total_usage": "3.00"}}, None
+                if "/usage" in url:
+                    return usage, None
+                return None, "fetch-error"
+
+            get.side_effect = side_effect
+            result = mod.fetch_experientiallabs_quota()
+
+        self.assertIn("Sum recent: $0.00", "\n".join(result.details))
+
     def test_credits_unavailable_does_not_block_recent_usage(self):
         mod = self.module()
         with mock.patch.dict("os.environ", {"EXPLABS_API_KEY": "xpl_" + "b" * 40}), mock.patch.object(

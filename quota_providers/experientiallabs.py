@@ -147,6 +147,7 @@ def _fetch(secret: str) -> QuotaResult:
             rows = payload["data"]
             if isinstance(rows, list) and rows:
                 recent_total = _Decimal("0")
+                saw_cost = False
                 detail_lines = []
                 for row in rows[: _USAGE_ROWS]:
                     if not isinstance(row, dict):
@@ -168,12 +169,19 @@ def _fetch(secret: str) -> QuotaResult:
                     # id deliberately omitted (not user-facing)
                     if cost is not None:
                         recent_total += _Decimal(cost)
+                        saw_cost = True
                     cost_str = cost if cost is not None else "?"
                     detail_lines.append(f"{model} · ${cost_str}{token_str} · {created}")
                 if detail_lines:
                     details.append(f"Recent usage (last {len(detail_lines)}):")
                     details.extend(detail_lines)
-                    details.append(f"Sum recent: ${_amount(str(recent_total)) or '?'}")
+                    # A sum of reported zero costs is $0.00; "?" is only for
+                    # rows that carry no cost at all.
+                    if saw_cost:
+                        sum_text = f"{recent_total:f}" if recent_total != 0 else "0.00"
+                    else:
+                        sum_text = "?"
+                    details.append(f"Sum recent: ${sum_text}")
                     has_data = True
 
     if not has_data:
