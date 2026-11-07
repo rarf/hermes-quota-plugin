@@ -10,7 +10,7 @@ environment (``EXPLABS_API_KEY``).
 from __future__ import annotations
 
 import os
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from typing import Optional
 
 from .api_keys import amount as _amount, get_json as _get_json
@@ -101,6 +101,24 @@ def _safe_int(value) -> int | None:
     return v
 
 
+_CENT = Decimal("0.01")
+_MILL = Decimal("0.0001")
+
+
+def _display_usd(value: Decimal) -> str:
+    """Round a USD figure for display, matching the other money providers.
+
+    Per-token arithmetic leaves fractions of a cent on the wallet total, which
+    read as noise in a headline balance. A nonzero total that would round to
+    $0.00 keeps extra digits instead, so it never reads as an empty wallet.
+    """
+    cents = value.quantize(_CENT, rounding=ROUND_HALF_EVEN)
+    if cents == 0 and value != 0:
+        mills = value.quantize(_MILL, rounding=ROUND_HALF_EVEN)
+        return f"{mills:f}" if mills != 0 else f"{value:f}"
+    return f"{cents:f}"
+
+
 def _fetch(secret: str) -> QuotaResult:
     """Inner fetch body with its own exception guard via the caller."""
     from decimal import Decimal as _Decimal
@@ -126,11 +144,13 @@ def _fetch(secret: str) -> QuotaResult:
                 total_dec = _Decimal(total)
                 used_dec = _Decimal(used)
                 remaining_dec = max(_Decimal("0"), total_dec - used_dec)
-                remaining = f"{remaining_dec:f}"
+                remaining = _display_usd(remaining_dec)
                 account_balances.append(
                     AccountBalance(currency="USD", total_balance=remaining)
                 )
-                details.append(f"Remaining USD {remaining} ({used} used)")
+                details.append(
+                    f"Remaining USD {remaining} ({_display_usd(used_dec)} used)"
+                )
                 has_data = True
             else:
                 details.append("Credits: parse-pending")
