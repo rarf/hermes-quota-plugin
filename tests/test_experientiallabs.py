@@ -116,6 +116,52 @@ class ExperientialLabsTests(unittest.TestCase):
         self.assertIn("Remaining USD", result.details[0])
         self.assertIn("25.50", result.details[0])  # total_usage in detail
 
+    def test_wallet_balance_rounds_to_cents_for_display(self):
+        """The credits endpoint reports fractions of a cent; a headline balance
+        reading $16.946993568 is noise, matching the cents rounding the other
+        money-bearing providers apply before the widget sees the value."""
+        mod = self.module()
+        credits = {"data": {"total_credits": "20.00", "total_usage": "3.053006432"}}
+        with mock.patch.dict("os.environ", {"EXPLABS_API_KEY": "xpl_" + "f" * 40}), mock.patch.object(
+            mod, "_get_json"
+        ) as get:
+
+            def side_effect(url, secret, timeout=None):
+                if "/credits" in url:
+                    return credits, None
+                if "/usage" in url:
+                    return {"data": []}, None
+                return None, "fetch-error"
+
+            get.side_effect = side_effect
+            result = mod.fetch_experientiallabs_quota()
+
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.account_balances[0].total_balance, "16.95")
+        self.assertIn("Remaining USD 16.95 (3.05 used)", "\n".join(result.details))
+
+    def test_sub_cent_balance_keeps_digits_instead_of_reading_as_zero(self):
+        """Rounding to cents must not turn a real wallet into $0.00: the widget
+        renders a zero balance as an empty account."""
+        mod = self.module()
+        credits = {"data": {"total_credits": "0.00241", "total_usage": "0"}}
+        with mock.patch.dict("os.environ", {"EXPLABS_API_KEY": "xpl_" + "g" * 40}), mock.patch.object(
+            mod, "_get_json"
+        ) as get:
+
+            def side_effect(url, secret, timeout=None):
+                if "/credits" in url:
+                    return credits, None
+                if "/usage" in url:
+                    return {"data": []}, None
+                return None, "fetch-error"
+
+            get.side_effect = side_effect
+            result = mod.fetch_experientiallabs_quota()
+
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual(result.account_balances[0].total_balance, "0.0024")
+
     def test_recent_usage_in_details(self):
         result, get = self._run_env_fetch(self.module(), "EXPLABS_API_KEY", "xpl_" + "a" * 40)
         # Usage list items should appear
