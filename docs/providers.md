@@ -11,6 +11,7 @@
 | `kimi` | Hermes `kimi-coding` auth (dotenv/pool) or `~/kimi_session.json` | Session (5h), Monthly, and rate windows from `api.kimi.com/coding/v1/usages` |
 | `openrouter` | Hermes native API key + saved credential pool | Per-key caps/usage and one explicitly scoped account wallet; see below |
 | `deepseek` | Native DeepSeek API key | Account balances in USD/CNY and API-call availability, no fabricated percentage |
+| `experientiallabs` | `EXPLABS_API_KEY` | USD wallet from `GET /api/v1/credits` (`total_credits − total_usage`) plus recent settled usage rows; balance is rounded to cents for display, no fabricated percentage |
 | `opencode-go` | API key | See the OpenCode note below |
 | `zai` | Z.ai API key | GLM Coding Plan Session, Weekly and web-tools windows |
 | `commandcode` | Command Code CLI `~/.commandcode/auth.json`, then Hermes `commandcode` API-key auth | 5h, Weekly, and a known-plan Cycle window |
@@ -115,6 +116,20 @@ mode uses balance chips only when no percentage windows are available.
 Missing credentials and failed requests remain explicit unavailable states.
 Requests have a timeout, bounded response size, and no redirects; error details
 and credentials are never written into the display cache.
+
+### Experiential Labs
+
+Reads the public Cost / Account API at `https://api.experientiallabs.ai/api/v1`:
+`GET /credits` returns `total_credits` and `total_usage` in USD, and `GET /usage`
+returns recent settled requests. Set `EXPLABS_API_KEY` in the environment — the
+provider is not yet in Hermes core, so it falls back to that env var.
+
+The wallet balance is `total_credits − total_usage`, rounded to cents for
+display (a nonzero sub-cent balance keeps extra digits so it never reads as
+`$0.00`). The API publishes no quota denominator, so no percentage is invented.
+The latest five usage rows are included as detail lines (model, cost, tokens,
+date); attribution labels and request IDs are deliberately omitted.
+
 ### OpenRouter
 
 Reads `GET https://openrouter.ai/api/v1/key` separately for each distinct locally

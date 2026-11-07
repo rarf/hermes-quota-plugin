@@ -117,3 +117,5 @@ the release note.
 - Codex special-reset announcement on CLI, TUI and Desktop, with its public
   source and credit.
 - Optional TUI quota chip and a saved dock preference that survives a restart.
+- Experiential Labs provider: USD wallet and recent settled usage from the
+  public Cost/Account API (`EXPLABS_API_KEY`), with no invented percentage.
