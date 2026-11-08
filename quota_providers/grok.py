@@ -101,8 +101,18 @@ def _token_from_auth_json(path: str) -> Optional[str]:
     return None
 
 
-def _hermes_xai_access_token() -> Optional[str]:
-    """Read Hermes' xAI OAuth token, then the local auth-store fallbacks."""
+def _hermes_xai_access_token(force_refresh: bool = False) -> Optional[str]:
+    """Read Hermes' xAI OAuth token, refreshing it first when a caller asks."""
+    try:
+        from hermes_cli.auth_xai import resolve_xai_oauth_runtime_credentials
+
+        runtime = resolve_xai_oauth_runtime_credentials(force_refresh=force_refresh) or {}
+        token = str(runtime.get("api_key", "") or "").strip()
+        if token:
+            return token
+    except Exception:
+        pass
+
     for module_name in ("hermes_cli.auth_xai", "hermes_cli.auth"):
         try:
             module = __import__(module_name, fromlist=["_read_xai_oauth_tokens"])
@@ -186,6 +196,9 @@ def _fetch_grok_grpc(headers: dict[str, str]) -> Optional[QuotaResult]:
             _write_private_debug(_RAW_DEBUG_PATH, raw)
         except Exception:
             pass
+    if not raw:
+        # An invalid or absent credential gets HTTP 200 with an empty body, not 401.
+        return build_unavailable("grok", "auth-failed")
     return _parse_grok_protobuf(raw)
 
 
@@ -390,6 +403,12 @@ def fetch_grok_quota() -> QuotaResult:
     token = _hermes_xai_access_token()
     if token:
         oauth_result = _fetch_grok_grpc(_grok_grpc_headers(bearer=token))
+        if oauth_result is None or _is_grok_auth_failure(oauth_result):
+            # Only the bearer can be stale here, so retry once with a forced
+            # refresh before the cookie fallback.
+            refreshed = _hermes_xai_access_token(force_refresh=True)
+            if refreshed and refreshed != token:
+                oauth_result = _fetch_grok_grpc(_grok_grpc_headers(bearer=refreshed))
         if oauth_result is None:
             return build_unavailable("grok", "parse-pending")
         if not _is_grok_auth_failure(oauth_result):
