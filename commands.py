@@ -51,6 +51,7 @@ _PROVIDER_NAMES = {
     "nous": "Nous Portal",
     "openrouter": "OpenRouter",
     "deepseek": "DeepSeek",
+    "nano-gpt": "NanoGPT",
     "experientiallabs": "Experiential Labs",
     "gemini": "Google Gemini",
     "kimi": "Kimi / Moonshot",

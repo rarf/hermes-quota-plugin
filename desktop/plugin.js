@@ -416,6 +416,11 @@ function applyStoredAll() {
 // Inlined as path data so the widget renders offline — no CDN fetch at render.
 // Providers without an entry fall back to a text monogram badge.
 const PROVIDER_SVGS = {
+	// Monochrome geometry from https://nano-gpt.com/logo.svg.
+	"nano-gpt": {
+		viewBox: "0 0 181.45 186.88",
+		body: '<path d="M145.31 72.24 L93.39 184.24 L43.86 103.66 L145.31 72.24 Z M106.21 2.68 L146.51 64.44 L44.1 96.46 L70.86 27.88 Z M30.06 42.79 L53.68 52.46 L36.31 96.93 L2.6 78.59 L30.06 42.79 Z M109.82 166.73 L153.7 71.14 L178.89 81.47 L109.82 166.73 Z M173.61 71.76 L154.18 63.48 L129.51 25.14 L134.6 21.19 L173.61 71.76 Z M65.92 153.78 L12.44 91.91 L34.91 104.09 L35.83 104.85 L65.92 153.78 Z"/>',
+	},
 	anthropic: {
 		viewBox: "0 0 24 24",
 		body: '<path d="M13.827 3.52h3.603L24 20h-3.603l-6.57-16.48zm-7.258 0h3.767L16.906 20h-3.674l-1.343-3.461H5.017l-1.344 3.46H0L6.57 3.522zm4.132 9.959L8.453 7.687 6.205 13.48H10.7z"></path>',
@@ -523,6 +528,7 @@ const PROVIDER_META = {
 	nous: { name: "Nous Portal", mono: "N" },
 	openrouter: { name: "OpenRouter", mono: "OR" },
 	deepseek: { name: "DeepSeek", mono: "DS" },
+	"nano-gpt": { name: "NanoGPT", mono: "NG" },
 	experientiallabs: { name: "Experiential Labs", mono: "XL" },
 	gemini: { name: "Google Gemini", mono: "G" },
 	kimi: { name: "Kimi / Moonshot", mono: "K" },
