@@ -76,6 +76,26 @@ Hermes sessions over it (`2 sessions ≥ 80%`). Yellow from the threshold
 - Sidebar: `ctx 92%` joins the Quota entry while the focused chat is at 90 %+.
 - Settings ▸ Status bar & sidebar: the chip switch and the threshold.
 
+### Reset pace tick
+
+The colored bar (and the ring, where a ring is shown) is quota remaining. The
+tick is time remaining until reset. Compare the two percentages remaining:
+
+- The bar's fill reaches past the tick: more quota remains than time. You are under pace.
+- The fill ends at the tick: the same percentage of quota and time remains.
+- The fill ends before the tick: less quota remains than time. You are over pace.
+
+For example, 96% quota remaining with 50% time remaining is under pace;
+20% quota remaining with 50% time remaining is over pace.
+
+The tick is a straight-line pacing reference. It moves with the local clock
+between quota refreshes. Weekly, explicit five-hour and daily window labels are
+recognized; `Session` means five hours for known providers, including Ollama.
+Unknown cadences and missing or expired reset times have no tick. Quota rows
+explicitly marked stale also hide it. Every place a window shows its remaining
+quota gets one: the pane rows, the quota popover, the status-bar and provider
+chips, and the saved-account gauges and window rows.
+
 ### Quota pane
 
 Reachable three ways: the **docked pane** (`Placement: right`, 300px, toggled in
