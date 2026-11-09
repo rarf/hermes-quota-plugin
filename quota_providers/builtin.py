@@ -26,6 +26,7 @@ import sys
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1256,7 +1257,7 @@ def _fetch_codex_with_models() -> QuotaResult:
 
 # Codex plan names as shown to the user: the API's "prolite" is the $100 Pro
 # tier and "pro" the $200 tier. Unknown values (including a Pro 500 tier, whose
-# raw API value is not yet confirmed) keep a title-cased upstream spelling.
+# raw API value is not yet confirmed) keep the upstream spelling unchanged.
 _CODEX_PLAN_NAMES = {
     "free": "Free",
     "go": "Go",
@@ -1267,12 +1268,47 @@ _CODEX_PLAN_NAMES = {
     "enterprise": "Enterprise",
 }
 
+# Upstream keeps adding tiers (Pro 500, team/business variants); the label must
+# not depend on a fixed list or an unknown tier would read as "Pro500".
+_CODEX_PRO_TIER = re.compile(r"pro(\d+)")
+
 
 def _codex_plan_label(raw: Any) -> Optional[str]:
     text = str(raw or "").strip()
     if not text:
         return None
-    return _CODEX_PLAN_NAMES.get(text.lower(), text.title())
+    key = text.lower()
+    if key in _CODEX_PLAN_NAMES:
+        return _CODEX_PLAN_NAMES[key]
+    # `pro500`, `pro_100`, `pro-100` and `Pro 500` all name a numeric Pro tier.
+    match = _CODEX_PRO_TIER.fullmatch(re.sub(r"[\s_-]+", "", key))
+    if match:
+        return f"Pro {int(match.group(1))}"
+    # Unknown code: keep the upstream spelling instead of guessing a tier.
+    return text
+
+
+def _codex_credit_balance(value: Any) -> Optional[int]:
+    """Whole credits, with exact decimal rounding and a signed-i64 ceiling."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+            return None
+    try:
+        # JSON decimal strings and integers must never pass through float.
+        balance = Decimal(str(value) if isinstance(value, float) else value)
+    except (InvalidOperation, ValueError, OverflowError):
+        return None
+    if not balance.is_finite():
+        return None
+    # Preserve the old finite-number admission range, without rounding the
+    # accepted balance through binary float (oversized fields stay unknown).
+    if balance.copy_abs() > Decimal.from_float(sys.float_info.max):
+        return None
+    bounded = max(Decimal(0), min(balance, Decimal(2**63 - 1)))
+    return int(bounded.to_integral_value(rounding=ROUND_HALF_UP))
 
 
 def _parse_codex_payload(payload: dict) -> QuotaResult:
@@ -1347,7 +1383,17 @@ def _parse_codex_payload(payload: dict) -> QuotaResult:
     if not isinstance(reset_credits, dict):
         reset_credits = {}
     def _finite_number(value):
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # Reset counts tolerate plain decimal strings as well as JSON numbers;
+        # this is parser compatibility, not a claim about the upstream schema.
+        # Credit balances use the separate exact-decimal parser above.
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+                return None
+            value = text
+        if not isinstance(value, (int, float, str)):
             return None
         try:
             value = float(value)
@@ -1363,12 +1409,18 @@ def _parse_codex_payload(payload: dict) -> QuotaResult:
     credits = payload.get("credits")
     if not isinstance(credits, dict):
         credits = {}
-    if credits.get("has_credits"):
-        balance = _finite_number(credits.get("balance"))
-        if balance is not None:
-            details.append(f"Credits balance: ${float(balance):.2f}")
-        elif credits.get("unlimited"):
-            details.append("Credits balance: unlimited")
+    # Show whole credits, or "unlimited"/"available" without inventing a number.
+    # Unlike upstream's status row, a known nonpositive balance explicitly shows 0.
+    if credits.get("unlimited") is True:
+        details.append("Credits: unlimited")
+    elif credits.get("has_credits") is True:
+        balance = _codex_credit_balance(credits.get("balance"))
+        if balance is None:
+            details.append("Credits: available")
+        else:
+            details.append(f"Credits: {balance:,}")
+    if credits.get("overage_limit_reached") is True:
+        details.append("Credits overage limit reached")
 
     plan = _codex_plan_label(payload.get("plan_type"))
     if not windows and not details:

@@ -56,7 +56,7 @@ const ID = "quota";
 // gateway, so the two halves can really be different builds. `tests/test_widget_version.py`
 // fails when they drift; a mismatch found at runtime is surfaced in the pane
 // instead of looking like a broken feature.
-const WIDGET_VERSION = "3.1.0";
+const WIDGET_VERSION = "3.2.0";
 
 // Module-level ctx handle (set in register). The data hook below needs it.
 let CTX = null;
@@ -1551,6 +1551,9 @@ function codexAccountsTip(provider, special) {
 			// A single window already has its remaining value in the account line.
 			lines.push(`  ${w.label}${windows.length > 1 ? ` · ${value}` : ""}${reset ? ` · ${reset}` : ""}`);
 		}
+		// The credits balance is current quota state, not historical trivia, so it
+		// stays in this summary instead of waiting behind the pane's dense mode.
+		for (const detail of asList(account.details).filter((d) => /^Credits\b/.test(d))) lines.push(`  ${detail}`);
 	}
 	// Provider-level announcement: appended once, never repeated per account.
 	if (special) lines.push("", ...specialTipLines(special));
@@ -2188,8 +2191,10 @@ function ProviderRow({ id, provider, monitor, page = false, headerExtra, special
 				points: historyFor(monitor.history, id, provider, w.label),
 			}))
 		: [];
+	// Clean mode keeps the pane quiet, but a credits balance is live quota state
+	// (it is what carries you past a spent window) and must not hide behind it.
 	const detailLines = details.filter(
-		(d) => (dense || id === "openrouter" || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d)),
+		(d) => (dense || id === "openrouter" || /^Credits\b/.test(d) || (baseProviderId(id) === "anthropic" && /^Observed /.test(d))) && (facts.available == null || !/^API calls available: (yes|no)$/.test(d)),
 	);
 
 	return jsxs("div", {
@@ -5491,7 +5496,8 @@ function QuotaCard({ close }) {
 	// selection; only never-configured rows stay hidden.
 	const entries = providerEntries(data && data.providers).filter(
 		([pid, p]) => isProviderEnabled(pid) && p && !isUnconfigured(p)
-			&& (isNoData(p) || asWindowList(p.windows).length || accountFacts(p).balances.length),
+			&& (isNoData(p) || asWindowList(p.windows).length || accountFacts(p).balances.length
+				|| asList(p.details).some((d) => /^Credits\b/.test(d))),
 	);
 	const toQuota = () => {
 		close();
@@ -5535,6 +5541,11 @@ function QuotaCard({ close }) {
 								? jsx("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(116px, 1fr))", gap: "6px 12px" }, children: windows.map((w, j) => jsx(QuotaCardWindow, { w, nowMs }, `${w.label}-${j}`)) })
 								: null,
 							balances.length ? jsx("span", { style: UI.meta, children: balances.map((b) => balanceText(b)).join(" · ") }) : null,
+							// Codex credits are live quota state, not pane trivia: this
+							// card has no dense mode, so the balance is shown outright.
+							...asList(p.details)
+								.filter((d) => /^Credits\b/.test(d))
+								.map((d, j) => jsx("span", { "data-card-credit": "", style: UI.meta, children: d }, `credit-${j}`)),
 							...forecasts.map(({ w, f }, j) =>
 								jsxs("div", {
 									"data-card-forecast": w.label,

@@ -219,11 +219,109 @@ class CodexAccountsTests(unittest.TestCase):
             raw['additional_rate_limits'] = [{'limit_name': 'Synthetic Future Model',
                 'rate_limit': {'primary_window': {'used_percent': 5}}}]
             result = builtin._parse_codex_payload(raw)
-            # prolite is the $100 tier ("Pro 100"); unknown names stay title-cased.
-            expected_plan = 'Pro 100' if plan == 'prolite' else plan.title()
+            # prolite is the $100 tier; unknown names keep the upstream spelling.
+            expected_plan = 'Pro 100' if plan == 'prolite' else plan
             self.assertEqual(result.plan, expected_plan)
             self.assertEqual([w.label for w in result.windows],
                              ['Session', 'Synthetic Future Model · 5h'])
+
+    def test_credits_balance_decimal_string_is_reported_as_whole_credits(self):
+        # Live Pro 200 usage payload: credits.balance is a decimal STRING
+        # ("62148.5742430000"), not a JSON number or a dollar amount.
+        raw = payload(100)
+        raw['credits'] = {'has_credits': True, 'unlimited': False,
+                          'overage_limit_reached': False, 'balance': '62148.5742430000'}
+        result = builtin._parse_codex_payload(raw)
+        self.assertIn('Credits: 62,149', result.details)
+
+    def test_credit_balance_rounding_preserves_integer_precision_and_i64_cap(self):
+        cases = [
+            ('9223372036854775807', '9,223,372,036,854,775,807'),
+            ('9223372036854775808', '9,223,372,036,854,775,807'),
+            ('9223372036854775806.5', '9,223,372,036,854,775,807'),
+            ('9007199254740993', '9,007,199,254,740,993'),
+            ('12.499999999999999999', '12'),
+            ('12.5', '13'),
+        ]
+        for balance, shown in cases:
+            with self.subTest(balance=balance):
+                raw = payload(21)
+                raw['credits'] = {'has_credits': True, 'balance': balance}
+                self.assertIn('Credits: ' + shown, builtin._parse_codex_payload(raw).details)
+
+    def test_credit_states_follow_the_documented_plugin_contract(self):
+        cases = [
+            ({'has_credits': False, 'unlimited': False}, []),
+            ({'has_credits': False, 'unlimited': True}, ['Credits: unlimited']),
+            ({'has_credits': True, 'unlimited': False}, ['Credits: available']),
+            ({'has_credits': True, 'balance': None}, ['Credits: available']),
+            ({'has_credits': True, 'balance': 'not-a-number'}, ['Credits: available']),
+            ({'has_credits': True, 'balance': 'nan'}, ['Credits: available']),
+            ({'has_credits': True, 'balance': True}, ['Credits: available']),
+            ({'has_credits': True, 'balance': float('inf')}, ['Credits: available']),
+            ({'has_credits': True, 'balance': float('nan')}, ['Credits: available']),
+            ({'has_credits': True, 'balance': 10 ** 400}, ['Credits: available']),
+            ({'has_credits': True, 'balance': '9' * 400}, ['Credits: available']),
+            ({'has_credits': True, 'balance': '1e3'}, ['Credits: available']),
+            ({'has_credits': True, 'balance': '$5'}, ['Credits: available']),
+            ({'has_credits': True, 'balance': '0'}, ['Credits: 0']),
+            ({'has_credits': True, 'balance': 0}, ['Credits: 0']),
+            ({'has_credits': True, 'balance': '-1'}, ['Credits: 0']),
+            ({'has_credits': True, 'balance': '-0.000004'}, ['Credits: 0']),
+            ({'has_credits': True, 'balance': '999'}, ['Credits: 999']),
+            ({'has_credits': True, 'balance': 12.5}, ['Credits: 13']),
+            ({'has_credits': True, 'balance': '12', 'overage_limit_reached': True},
+             ['Credits: 12', 'Credits overage limit reached']),
+            ({'has_credits': False, 'overage_limit_reached': True},
+             ['Credits overage limit reached']),
+        ]
+        for credits, expected in cases:
+            raw = payload(21)
+            raw['credits'] = credits
+            with self.subTest(credits=credits):
+                result = builtin._parse_codex_payload(raw)
+                self.assertEqual([d for d in result.details if d.startswith('Credits')], expected)
+
+    def test_banked_reset_count_accepts_plain_numeric_strings(self):
+        for count in (2, '2', ' 2 ', '2.0'):
+            with self.subTest(count=count):
+                raw = payload(21)
+                raw['rate_limit_reset_credits'] = {'available_count': count}
+                self.assertEqual(builtin._parse_codex_payload(raw).details,
+                                 ['You have 2 resets banked - use /usage reset to activate'])
+
+    def test_unusable_banked_reset_count_does_not_invent_resets(self):
+        for count in (True, 'nan', 'inf', '$2', 'bad', '', None, 0, '-2'):
+            with self.subTest(count=count):
+                raw = payload(21)
+                raw['rate_limit_reset_credits'] = {'available_count': count}
+                self.assertEqual(builtin._parse_codex_payload(raw).details, [])
+
+    def test_unknown_plan_keeps_upstream_spelling(self):
+        for plan in ('enterpriseXYZ', 'pro_lite', 'team_pro500', 'synthetic-future-plan'):
+            with self.subTest(plan=plan):
+                raw = payload(21)
+                raw['plan_type'] = plan
+                self.assertEqual(builtin._parse_codex_payload(raw).plan, plan)
+
+    def test_pro_tiers_come_from_the_plan_code_not_a_fixed_list(self):
+        cases = [
+            ("pro", "Pro 200"),
+            ("prolite", "Pro 100"),
+            ("pro100", "Pro 100"),
+            ("pro500", "Pro 500"),
+            ("pro_500", "Pro 500"),
+            ("pro-500", "Pro 500"),
+            ("Pro 500", "Pro 500"),
+            ("business", "Business"),
+            ("go", "Go"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(plan_type=raw):
+                self.assertEqual(builtin._codex_plan_label(raw), expected)
+                payload_with_plan = payload(21)
+                payload_with_plan["plan_type"] = raw
+                self.assertEqual(builtin._parse_codex_payload(payload_with_plan).plan, expected)
 
     def test_multi_account_reset_details_are_counts_not_commands(self):
         raw = payload(21)
@@ -327,8 +425,9 @@ class CodexAccountsTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, auth_modules([{"access_token": token("synthetic-a")} ])), mock_http(return_value=BytesIO(json.dumps(raw).encode())):
             result = builtin._fetch_codex_with_models()
         self.assertEqual([w.used_percent for w in result.windows], [21, 12, 5])
-        self.assertEqual(result.plan, "Synthetic-Future-Plan")
-        self.assertEqual(result.details, [])
+        self.assertEqual(result.plan, "synthetic-future-plan")
+        # A malformed balance is reported as unusable credit, never as a number.
+        self.assertEqual(result.details, ["Credits: available"])
 
     def test_metadata_expiry_and_network_timeout_are_honest(self):
         for expiry in (1, "1970-01-01T00:00:01Z"):
@@ -376,7 +475,8 @@ class CodexAccountsTests(unittest.TestCase):
             with self.subTest(extra=extra), mock.patch.dict(sys.modules, auth_modules([{"access_token": token("synthetic-a")} ])), mock_http(return_value=BytesIO(json.dumps(raw).encode())):
                 result = builtin._fetch_codex_with_models()
             self.assertEqual([w.used_percent for w in result.windows], [21])
-            self.assertEqual(result.details, [])
+            # Credits are present but unreadable, so no number is invented.
+            self.assertEqual(result.details, ["Credits: available"])
 
     def test_saved_accounts_deduplicate_identity_not_oauth_token(self):
         a, duplicate, b = token("synthetic-a"), token("synthetic-a", nonce="two"), token("synthetic-b")

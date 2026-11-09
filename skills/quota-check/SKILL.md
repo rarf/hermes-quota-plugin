@@ -43,6 +43,10 @@ desktop widget). Read them before committing to long work.
 - remaining% = the LOWEST remaining percentage among the windows relevant to
   the task's horizon (rolling window for sessions; billing cycle for
   credit-metered providers). For USD credits: `remaining / total * 100`.
+- Codex Pro/Pro 200 adds a separate `Credits:` line under its windows — whole
+  credits you can spend after the plan window is used up. `Credits: unlimited`
+  and `Credits overage limit reached` say what they mean, and
+  `Credits: available` means the balance could not be read (not zero).
 
 ## Alerts by remaining quota
 

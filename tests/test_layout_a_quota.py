@@ -146,5 +146,101 @@ class AccountsAllWindowsTests(unittest.TestCase):
         self.assertIsNone(rows['Weekly'])  # unknown is not zero
 
 
+@unittest.skipUnless(shutil.which('node'), 'Node.js is required for widget render tests')
+class CodexCreditLineTests(unittest.TestCase):
+    """The credits balance is live quota state, not historical trivia."""
+
+    DETAIL = 'Credits: 62,149'
+    BANKED = 'You have 2 resets banked - use /usage reset to activate'
+
+    def _data(self):
+        return codex([{'label': 'Synthetic Amber', 'plan': 'Pro 200',
+                       'windows': [{'label': 'Weekly', 'used_percent': 100}],
+                       'details': [self.BANKED, self.DETAIL]}])
+
+    def test_credit_line_is_visible_in_the_pane_card(self):
+        self.assertIn(self.DETAIL, text(render(data=self._data())))
+
+    def test_credit_line_stays_visible_in_clean_pane_mode(self):
+        # The pane's default clean mode still has to show the balance: it is what
+        # carries the account past a spent window.
+        body = text(render(data=self._data(), mode='clean'))
+        self.assertIn(self.DETAIL, body)
+        self.assertNotIn('usage reset', body)
+
+    def test_credit_line_is_visible_in_the_status_bar_tip(self):
+        tip = tooltip_text(render(component='status', data=self._data()))
+        self.assertIn(self.DETAIL, tip)
+        # Banked-reset guidance stays pane-only, so the chip keeps its size.
+        self.assertNotIn('usage reset', tip)
+
+
+@unittest.skipUnless(shutil.which('node'), 'Node.js is required for widget render tests')
+class CodexCreditInPopoverCardTests(unittest.TestCase):
+    """The status-bar popover card has no dense mode: it shows the balance."""
+
+    def run_card(self, data):
+        from test_widget_monitor import run, snapshot
+        expr = '(() => QuotaCard({close: () => {}}))()'
+        return run(expr=expr, data=data, monitor=snapshot())['value']
+
+    def test_credit_only_payload_is_visible_in_the_popover(self):
+        from dataclasses import asdict
+        from quota_providers.builtin import _parse_codex_payload
+        result = _parse_codex_payload({
+            'plan_type': 'pro',
+            'credits': {'has_credits': True, 'balance': '62148.5742430000'},
+        })
+        record = asdict(result)
+        self.assertEqual(record['windows'], [])
+        self.assertIsNone(record['unavailable_reason'])
+        data = {'age_s': 0, 'providers': {'openai-codex': record}}
+        body = text(self.run_card(data))
+        self.assertIn('Credits: 62,149', body)
+        self.assertNotIn('No quota data yet', body)
+
+    def test_credit_line_is_visible_in_the_popover_card(self):
+        data = codex([{'label': 'Synthetic Amber', 'plan': 'Pro 200',
+                       'windows': [{'label': 'Weekly', 'used_percent': 100}],
+                       'details': ['You have 2 resets banked - use /usage reset to activate',
+                                   'Credits: 62,149']}])
+        tree = self.run_card(data)
+        self.assertIn('Credits: 62,149', text(tree))
+        # Only the balance crosses over; the pane keeps the reset guidance.
+        self.assertNotIn('usage reset', text(tree))
+
+    def test_credit_states_without_windows_survive_multi_account_filtering(self):
+        from dataclasses import asdict
+        from quota_providers.builtin import _parse_codex_payload
+        cases = [
+            ({'has_credits': True, 'balance': '0'}, 'Credits: 0'),
+            ({'has_credits': True}, 'Credits: available'),
+            ({'unlimited': True}, 'Credits: unlimited'),
+            ({'has_credits': False, 'overage_limit_reached': True},
+             'Credits overage limit reached'),
+        ]
+        accounts = []
+        for index, (credits, _) in enumerate(cases):
+            account = asdict(_parse_codex_payload({'credits': credits}))
+            account['label'] = 'Synthetic credit account ' + str(index)
+            accounts.append(account)
+        tree = self.run_card(codex(accounts))
+        body = text(tree)
+        for index, (_, detail) in enumerate(cases):
+            self.assertIn('Synthetic credit account ' + str(index), body)
+            self.assertEqual(body.count(detail), 1)
+        self.assertEqual(len(attr_nodes(tree, 'data-card-credit')), len(cases))
+
+    def test_unrelated_details_do_not_admit_empty_popover_rows(self):
+        data = codex([{'label': 'Synthetic Amber', 'windows': [],
+                       'details': ['You have 2 resets banked - use /usage reset to activate']}])
+        self.assertEqual(attr_nodes(self.run_card(data), 'data-card-provider'), [])
+
+    def test_no_credentials_stays_hidden_even_with_credit_details(self):
+        data = codex([{'label': 'Synthetic Amber', 'windows': [],
+                       'unavailable_reason': 'no-credentials', 'details': ['Credits: 10']}])
+        self.assertEqual(attr_nodes(self.run_card(data), 'data-card-provider'), [])
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
