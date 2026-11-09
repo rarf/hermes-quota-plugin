@@ -19,8 +19,9 @@ class CodexPlanLabelTests(unittest.TestCase):
         self.assertEqual(builtin._codex_plan_label("pro"), "Pro 200")
         self.assertEqual(builtin._codex_plan_label("plus"), "Plus")
 
-    def test_unknown_plan_keeps_title_case_and_empty_is_none(self):
-        self.assertEqual(builtin._codex_plan_label("synthetic-future"), "Synthetic-Future")
+    def test_unknown_plan_keeps_upstream_spelling_and_empty_is_none(self):
+        self.assertEqual(builtin._codex_plan_label("synthetic-future"), "synthetic-future")
+        self.assertEqual(builtin._codex_plan_label("  enterpriseXYZ  "), "enterpriseXYZ")
         self.assertIsNone(builtin._codex_plan_label(""))
         self.assertIsNone(builtin._codex_plan_label(None))
 

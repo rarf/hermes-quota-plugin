@@ -3,7 +3,7 @@
 | Provider | Source | Notes |
 | --- | --- | --- |
 | `anthropic` | Anthropic OAuth usage API | One bounded read maps session/weekly windows, model-scoped weekly limits such as **Fable week**, and extra usage. Additional Claude logins can be shown side by side — see [Claude accounts](claude-accounts.md) |
-| `openai-codex` | local OAuth | Also parses `additional_rate_limits` to surface **per-model Spark limits** (`5.3 Codex Spark · 5h`, `· Weekly`) that stay hidden elsewhere |
+| `openai-codex` | local OAuth | Also parses `additional_rate_limits` to surface **per-model Spark limits** (`5.3 Codex Spark · 5h`, `· Weekly`) that stay hidden elsewhere, and the `credits.balance` decimal string as a `Credits:` line — see [Codex credits](#codex-credits) |
 | `copilot` | local OAuth | Plan badge + windows |
 | `nous` | Nous Portal | Works on free accounts |
 | `gemini` | local CLI / OAuth | Detects the tier via `loadCodeAssist` |
@@ -21,6 +21,63 @@
 
 Each fetcher is **fail-open**: a broken provider shows `unavailable (<reason>)`
 and never blocks the rest.
+
+### Codex credits
+
+`GET /wham/usage` reports a workspace credits balance next to the plan windows,
+and Codex Pro/Pro 200 accounts draw on it once the weekly window is spent. The
+field is a **decimal string**, not a JSON number and not dollars:
+
+```json
+"credits": {
+  "has_credits": true, "unlimited": false, "overage_limit_reached": false,
+  "balance": "62148.5742430000",
+  "approx_local_messages": [15537, 80793],
+  "approx_cloud_messages": [2486, 15537]
+}
+```
+
+Codex's own status surface renders this as a `Credits` row with whole credits
+(`codex-rs/tui/src/status/rate_limits.rs`). The plugin uses a detail line with
+the following explicit contract:
+
+- `Credits: 62,149` — the balance rounded to whole credits, with halves rounded
+  up. Decimal strings and integers retain their precision; the displayed amount
+  is bounded to `0..9223372036854775807` without a binary-float conversion.
+  Values outside the previous finite-number range remain unreadable.
+- `Credits: 0` for a known zero or negative balance: an intentional plugin
+  convention, not exact parity with Codex's status row (which uses `Available`
+  for those inputs when `has_credits` is true).
+- `Credits: unlimited` when the account reports unlimited credits.
+- `Credits: available` when credits exist but the balance is missing or not a
+  plain decimal (a malformed field never invents a number), and
+  `Credits overage limit reached` when the provider reports the overage limit
+  reached, even if `has_credits` is false. This is a warning, not a balance.
+
+The line appears in `/quota`, the status-bar tooltip, the chip popover card and
+the pane card — in the pane it stays visible in **clean** mode too, because a
+balance is live state rather than history (other detail lines still wait for
+dense mode, and the popover card has no mode at all). Credit-only accounts and
+overage warnings remain visible in the popover even without quota windows.
+`approx_local_messages` / `approx_cloud_messages` are estimates (and an
+`[min, max]` range), so they are not shown.
+
+Banked-reset counts accept numbers and plain decimal strings such as `"2"`;
+this is tolerant parsing, not evidence that the API currently emits strings.
+Booleans, non-finite and malformed values do not invent available resets.
+
+### Codex plans
+
+`plan_type` is a code, not a promise: `free`, `go`, `plus`, `prolite` (the $100
+Pro tier), `pro` (the $200 Pro tier), `business`, `enterprise` are mapped by
+name, and any numeric Pro code is rendered from the code itself — `pro500`,
+`pro_500` and `Pro 500` all become `Pro 500`. Anything unrecognised keeps its
+upstream spelling (apart from trimming surrounding whitespace), including
+capitalization, instead of being forced into a known tier. `pro_lite` is not
+treated as an alias for `prolite`: the inspected upstream
+[plan parser](https://github.com/openai/codex/blob/3016671bb077c43448b8fa88f3edfa9772e17058/codex-rs/protocol/src/auth.rs)
+recognizes `prolite`, not `pro_lite`; unrecognized names remain readable
+without inventing a subscription tier.
 
 ### Ollama
 

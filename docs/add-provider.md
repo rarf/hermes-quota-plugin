@@ -58,7 +58,7 @@ def fetch_<provider>_quota() -> QuotaResult:
         label="<provider>",
         windows=[QuotaWindow(label="Monthly", used_percent=used, reset_at=iso)],
         plan="Plus",            # or None when unknown — NEVER invent one
-        details=["Credits balance: $12.50"],
+        details=["Credits: 1,234"],
     )
 
 

@@ -3,6 +3,30 @@
 Newest first. Each entry matches an annotated `vX.Y.Z` tag; the tag message is
 the release note.
 
+## 3.2.0 — 2026-11-09
+
+- Codex: the credits balance is collected again. The live `/wham/usage`
+  payload sends `credits.balance` as a decimal **string**
+  (`"62148.5742430000"`), which the parser rejected, so Pro and Pro 200
+  accounts showed no credit figure at all. The decimal string is now parsed
+  and rendered as whole credits (`Credits: 62,149`), matching Codex's own
+  status row, in `/quota`, the pane card and the status-bar tooltip.
+- Codex: `unlimited`, a hidden balance (`Credits: available`) and
+  `overage_limit_reached` are reported honestly; a malformed or unreadable
+  balance never becomes a number, and a negative one is not spendable credit.
+- Codex: the credits line is pinned into the pane card in **clean** mode as
+  well, and into the status-bar popover card, which has no detail modes at all —
+  the balance is visible everywhere the quota is shown.
+- Codex: plan labels no longer depend on a fixed list of tiers. Any numeric Pro
+  code renders from the code itself (`pro500` → `Pro 500`), and an unknown tier
+  keeps its upstream spelling rather than being forced into `Pro 200`.
+- Docs: providers.md documents the credits payload, its states and plan tiers.
+- Codex follow-up: credit-only accounts and overage warnings survive the popover
+  filter even without windows; decimal credit rounding and the i64 ceiling are
+  exact, and unknown plan codes preserve their capitalization. Regression tests
+  cover these cases and tolerant reset-count parsing; nonpositive balances
+  intentionally show zero rather than matching upstream's `Available` label.
+
 ## 3.1.0 — 2026-11-06
 
 - Desktop Quota: every saved account and every quota window is visible at
