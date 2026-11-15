@@ -3119,11 +3119,15 @@ async function fetchMonitor(scope, argv) {
 		if (isMonitorUnsupportedError(error)) return { unsupported: true };
 		throw error;
 	}
+	const output = result.output || "";
 	try {
-		return parseJsonOutput(result.output || "", "monitor_version");
-	} catch {
-		// Exit 0 without a monitor payload: an older build printing help.
-		return { unsupported: true };
+		return parseJsonOutput(output, "monitor_version");
+	} catch (error) {
+		// Exit 0 with argparse's usage text: an older build printing help.
+		if (/^usage: /m.test(output)) return { unsupported: true };
+		// Anything else, such as a snapshot cut off at cli.exec's 48,000-character
+		// cap, is a failed poll: the next interval asks again.
+		throw error;
 	}
 }
 

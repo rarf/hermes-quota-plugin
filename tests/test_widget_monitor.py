@@ -162,6 +162,23 @@ def snapshot(**over):
     return snap
 
 
+CLI_EXEC_OUTPUT_CAP = 48_000
+
+
+def fetch_monitor(view):
+    return (f'fetchMonitor(host.state.focusedSessionOwner.get(), ["quota","monitor","{view}","--json"])'
+            '.then((value) => ({value}), (error) => ({error: String(error && error.message)}))')
+
+
+def truncated_snapshot(title='Session {}'):
+    snap = snapshot()
+    row = snap['live']['running'][0]
+    snap['live']['running'] = [dict(row, id=f'sess_work_{i}', title=title.format(i)) for i in range(200)]
+    full = json.dumps(snap, separators=(',', ':'))
+    assert len(full) > CLI_EXEC_OUTPUT_CAP
+    return full[:CLI_EXEC_OUTPUT_CAP]
+
+
 def find(tree, pred):
     return [n for n in nodes(tree) if pred(n)]
 
@@ -322,6 +339,35 @@ class MonitorViewsTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             run(expr='fetchMonitor(host.state.focusedSessionOwner.get(), ["quota","monitor","snapshot","--json"])',
                 cliResult={'code': 1, 'output': 'Traceback: something else broke'})
+
+    def test_old_backend_help_text_is_unsupported(self):
+        out = run(expr=fetch_monitor('snapshot'), cliResult={'code': 0, 'output': 'usage: hermes quota [-h] {status,refresh,provider} ...'})
+        self.assertEqual(out['value'], {'value': {'unsupported': True}})
+
+    def test_truncated_snapshot_is_a_failed_poll_not_an_old_backend(self):
+        # cli.exec returns at most 48,000 characters; a busy gateway's snapshot is longer.
+        for view in ('snapshot', 'accounts'):
+            out = run(expr=fetch_monitor(view), cliResult={'code': 0, 'output': truncated_snapshot()})
+            self.assertEqual(sorted(out['value']), ['error'], view)
+        # A session title that reads like argparse help is still session data.
+        titled = run(expr=fetch_monitor('snapshot'),
+                     cliResult={'code': 0, 'output': truncated_snapshot('usage: run the tests {}')})
+        self.assertEqual(sorted(titled['value']), ['error'])
+
+    def test_live_view_keeps_polling_after_a_truncated_snapshot(self):
+        expr = '''(async () => {
+          const real = useQuery;
+          let opts = null;
+          useQuery = (o) => { opts = o; return real(o); };
+          try { useMonitor(); } finally { useQuery = real; }
+          const state = await opts.queryFn().then(
+            (data) => ({status: 'success', data, error: null}),
+            (error) => ({status: 'error', data: undefined, error}));
+          return {status: state.status, next: opts.refetchInterval({state})};
+        })()'''
+        out = run(expr=expr, cliResult={'code': 0, 'output': truncated_snapshot()})
+        self.assertGreater(out['value']['next'], 0)
+        self.assertEqual(out['value']['status'], 'error')
 
     def test_agents_chip(self):
         out = run(component='agents', data=quota_payload(), monitor=snapshot())
