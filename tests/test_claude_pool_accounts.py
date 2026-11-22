@@ -206,5 +206,67 @@ class PoolFetchTests(unittest.TestCase):
         self.assertNotIn("SECRET-TOKEN", repr(res.accounts))
 
 
+class PrimaryLabelTests(unittest.TestCase):
+    def _run(self, settings):
+        pool = _Pool([_Row("4e06dd", "anthropic-oauth-2", "PRIMARY"), _Row("b70608", "conta2", "TOK2")])
+        return _fetch(settings, pool, {"PRIMARY": _payload(10), "TOK2": _payload(70)})
+
+    def test_primary_label_names_the_core_card(self):
+        res = self._run({"claudePrimaryLabel": "Pessoal",
+                         "claudeAccounts": [{"id": "conta2", "label": "Gotiva", "poolId": "b70608"}]})
+        self.assertEqual(res.account_label, "Pessoal")
+        self.assertEqual(res.accounts[0].label, "Gotiva")
+
+    def test_primary_label_works_without_extra_accounts(self):
+        res = self._run({"claudePrimaryLabel": "Pessoal"})
+        self.assertEqual(res.account_label, "Pessoal")
+        self.assertEqual(res.accounts, [])
+
+    def test_invalid_primary_label_is_ignored(self):
+        for bad in ("", "  ", 3, "x" * 81, "a\nb"):
+            self.assertIsNone(self._run({"claudePrimaryLabel": bad}).account_label, bad)
+
+    def test_cache_and_cli_show_both_names(self):
+        import importlib
+        import os
+        import tempfile
+        if "hermes_constants" not in sys.modules:
+            stub = types.ModuleType("hermes_constants")
+            stub.get_hermes_home = lambda: Path(os.environ.get("HERMES_HOME") or tempfile.gettempdir())
+            sys.modules["hermes_constants"] = stub
+        if "quota_plugin_under_test" not in sys.modules:
+            pkg = types.ModuleType("quota_plugin_under_test")
+            pkg.__path__ = [str(ROOT)]
+            sys.modules["quota_plugin_under_test"] = pkg
+        qc = importlib.import_module("quota_plugin_under_test.quota_cache")
+        base = importlib.import_module("quota_plugin_under_test.quota_providers.base")
+        commands = importlib.import_module("quota_plugin_under_test.commands")
+        res = self._run({"claudePrimaryLabel": "Pessoal",
+                         "claudeAccounts": [{"id": "conta2", "label": "Gotiva", "poolId": "b70608"}]})
+        # Rebuild with the package-under-test classes (isinstance checks in the cache).
+        acc = res.accounts[0]
+        mirrored = base.QuotaResult(
+            label=res.label, account_label=res.account_label,
+            windows=[base.QuotaWindow(w.label, w.used_percent, w.reset_at) for w in res.windows],
+            accounts=[base.QuotaAccount(id=acc.id, label=acc.label, windows=[
+                base.QuotaWindow(w.label, w.used_percent, w.reset_at) for w in acc.windows])])
+        rows = qc._expand_accounts("anthropic", qc._result_to_record(mirrored))
+        self.assertEqual(rows["anthropic"]["account_label"], "Pessoal")
+        self.assertEqual(commands._provider_label("anthropic", rows["anthropic"]), "Anthropic · Pessoal")
+        self.assertEqual(commands._provider_label("anthropic:conta2", rows["anthropic:conta2"]), "Anthropic · Gotiva")
+
+
+@unittest.skipUnless(__import__("shutil").which("node"), "Node.js is required for widget render tests")
+class PrimaryLabelWidgetTests(unittest.TestCase):
+    def test_widget_row_and_chip_show_the_primary_label(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from widget_harness import render, text
+        primary = {"label": "anthropic", "account_label": "Pessoal",
+                   "windows": [{"label": "Current session", "used_percent": 10.0}]}
+        for component in ("row", "chip"):
+            rendered = text(render(component=component, id="anthropic", provider=primary))
+            self.assertIn("Anthropic · Pessoal", rendered, component)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -161,6 +161,17 @@ hermes config set plugins.entries.quota.settings.claudeAccounts \
 - Plan names are not shown for pool rows (the pool does not store
   `subscriptionType`).
 
+## Naming the primary card (`claudePrimaryLabel`, local extension)
+
+The core account's card has no `label` of its own. Set one with:
+
+```sh
+hermes config set plugins.entries.quota.settings.claudePrimaryLabel Pessoal
+```
+
+It renders as **Anthropic · Pessoal** (same rules as `label`: at most 80
+characters, no control characters; anything else is ignored).
+
 ## Friendly names and icons
 
 `label` is user-configurable; it is not a fixed ordinal or a translated product string.
