@@ -137,6 +137,30 @@ computed windows and machine-readable reasons — never a token or a filesystem
 path.
 
 
+## Accounts from the Hermes credential pool (`poolId`, local extension)
+
+An entry may name a row of Hermes' own credential pool (`hermes auth list`)
+instead of a Claude Code directory. No Claude Code install is needed:
+
+```sh
+hermes config set plugins.entries.quota.settings.claudeAccounts \
+  '[{"id":"conta2","label":"Conta 2","poolId":"a1b2c3"}]'
+```
+
+- `poolId` is the row's `id=` from `hermes auth list` (or its exact label; an
+  ambiguous label is `config-invalid`). Use either `poolId` or `configDir`,
+  never both.
+- The row is read through the core API (`agent.credential_pool.load_pool`);
+  the plugin never opens `auth.json` itself.
+- An expiring token (2 min before `expires_at_ms`), or a 401 from the usage
+  endpoint, is renewed by the core pool (`try_refresh_matching`), which owns
+  the refresh token, its lock and its persistence. The OAuth grant is never
+  forked. A failed renewal shows `auth-failed`; a `dead` row is not requested.
+- Only OAuth rows have usage windows; an API-key row is refused.
+- The primary row listed again is deduped by token, like any other entry.
+- Plan names are not shown for pool rows (the pool does not store
+  `subscriptionType`).
+
 ## Friendly names and icons
 
 `label` is user-configurable; it is not a fixed ordinal or a translated product string.
