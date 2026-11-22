@@ -1,6 +1,6 @@
 """``claudeAccounts`` entries backed by Hermes' credential pool (``poolId``).
 
-Local extension: an extra Claude account may name a ``hermes auth list`` row
+An extra Claude account may name a ``hermes auth list`` row
 instead of a Claude Code ``configDir``. These tests pin that the row is found
 through the core pool API (never ``auth.json``), that refresh is delegated to
 the core pool, and that dedup/failure rules match the ``configDir`` path.
@@ -213,9 +213,9 @@ class PrimaryLabelTests(unittest.TestCase):
 
     def test_primary_label_names_the_core_card(self):
         res = self._run({"claudePrimaryLabel": "Pessoal",
-                         "claudeAccounts": [{"id": "conta2", "label": "Gotiva", "poolId": "b70608"}]})
+                         "claudeAccounts": [{"id": "conta2", "label": "Work", "poolId": "b70608"}]})
         self.assertEqual(res.account_label, "Pessoal")
-        self.assertEqual(res.accounts[0].label, "Gotiva")
+        self.assertEqual(res.accounts[0].label, "Work")
 
     def test_primary_label_works_without_extra_accounts(self):
         res = self._run({"claudePrimaryLabel": "Pessoal"})
@@ -242,7 +242,7 @@ class PrimaryLabelTests(unittest.TestCase):
         base = importlib.import_module("quota_plugin_under_test.quota_providers.base")
         commands = importlib.import_module("quota_plugin_under_test.commands")
         res = self._run({"claudePrimaryLabel": "Pessoal",
-                         "claudeAccounts": [{"id": "conta2", "label": "Gotiva", "poolId": "b70608"}]})
+                         "claudeAccounts": [{"id": "conta2", "label": "Work", "poolId": "b70608"}]})
         # Rebuild with the package-under-test classes (isinstance checks in the cache).
         acc = res.accounts[0]
         mirrored = base.QuotaResult(
@@ -253,7 +253,7 @@ class PrimaryLabelTests(unittest.TestCase):
         rows = qc._expand_accounts("anthropic", qc._result_to_record(mirrored))
         self.assertEqual(rows["anthropic"]["account_label"], "Pessoal")
         self.assertEqual(commands._provider_label("anthropic", rows["anthropic"]), "Anthropic · Pessoal")
-        self.assertEqual(commands._provider_label("anthropic:conta2", rows["anthropic:conta2"]), "Anthropic · Gotiva")
+        self.assertEqual(commands._provider_label("anthropic:conta2", rows["anthropic:conta2"]), "Anthropic · Work")
 
 
 @unittest.skipUnless(__import__("shutil").which("node"), "Node.js is required for widget render tests")

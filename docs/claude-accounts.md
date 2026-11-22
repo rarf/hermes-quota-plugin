@@ -137,14 +137,14 @@ computed windows and machine-readable reasons — never a token or a filesystem
 path.
 
 
-## Accounts from the Hermes credential pool (`poolId`, local extension)
+## Accounts from the Hermes credential pool (`poolId`)
 
 An entry may name a row of Hermes' own credential pool (`hermes auth list`)
 instead of a Claude Code directory. No Claude Code install is needed:
 
 ```sh
 hermes config set plugins.entries.quota.settings.claudeAccounts \
-  '[{"id":"conta2","label":"Conta 2","poolId":"b70608"}]'
+  '[{"id":"work","label":"Work","poolId":"b70608"}]'
 ```
 
 - `poolId` is the row's `id=` from `hermes auth list` (or its exact label; an
@@ -161,15 +161,15 @@ hermes config set plugins.entries.quota.settings.claudeAccounts \
 - Plan names are not shown for pool rows (the pool does not store
   `subscriptionType`).
 
-## Naming the primary card (`claudePrimaryLabel`, local extension)
+## Naming the primary card (`claudePrimaryLabel`)
 
 The core account's card has no `label` of its own. Set one with:
 
 ```sh
-hermes config set plugins.entries.quota.settings.claudePrimaryLabel Pessoal
+hermes config set plugins.entries.quota.settings.claudePrimaryLabel Personal
 ```
 
-It renders as **Anthropic · Pessoal** (same rules as `label`: at most 80
+It renders as **Anthropic · Personal** (same rules as `label`: at most 80
 characters, no control characters; anything else is ignored).
 
 ## Friendly names and icons
