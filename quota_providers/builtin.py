@@ -23,6 +23,7 @@ import os
 import re
 import stat
 import sys
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -804,10 +805,35 @@ def _claude_accounts_setting() -> tuple[list[dict[str, Any]], bool]:
                         "error": "config-invalid",
                         "detail": f"duplicate claudeAccounts id '{account_id}'."})
             continue
+        pool_ref = item.get("poolId", item.get("pool_id"))
+        if pool_ref is not None:
+            # The account is a Hermes credential-pool row
+            # (``hermes auth list``), read through the core pool API instead of
+            # a Claude Code ``.credentials.json``.
+            if config_dir is not None:
+                out.append({"index": position, "id": account_id, "label": label if isinstance(label, str) else None,
+                            "error": "config-invalid",
+                            "detail": f"account '{account_id}' sets both 'configDir' and 'poolId'; use one."})
+                continue
+            if (
+                not isinstance(pool_ref, str) or not pool_ref.strip() or len(pool_ref.strip()) > 128
+                or any(ord(char) < 32 or ord(char) == 127 for char in pool_ref)
+            ):
+                out.append({"index": position, "id": account_id, "label": label if isinstance(label, str) else None,
+                            "error": "config-invalid",
+                            "detail": f"account '{account_id}' 'poolId' must be the id or label shown by `hermes auth list`."})
+                continue
+            seen_ids.add(account_id)
+            out.append({
+                "id": account_id,
+                "label": label.strip() if isinstance(label, str) and label.strip() else account_id,
+                "pool_ref": pool_ref.strip(),
+            })
+            continue
         if not isinstance(config_dir, str) or not config_dir.strip():
             out.append({"index": position, "id": account_id, "label": label if isinstance(label, str) else None,
                         "error": "config-invalid",
-                        "detail": f"account '{account_id}' needs a non-empty string 'configDir'."})
+                        "detail": f"account '{account_id}' needs a non-empty string 'configDir' or 'poolId'."})
             continue
         seen_ids.add(account_id)
         out.append({
@@ -882,6 +908,68 @@ def _read_claude_account_token(config_dir: str) -> tuple[Optional[str], Optional
     return None, "no-credentials"
 
 
+# Refresh a pool row this long before its ``expires_at_ms`` (the core rotates
+# 2 minutes ahead too).
+_POOL_REFRESH_SKEW_MS = 120_000
+
+
+def _pool_account_token(pool_ref: str, *, force_refresh: bool = False) -> tuple[Optional[str], Optional[str]]:
+    """Access token for an Anthropic row of Hermes' credential pool, or a reason.
+
+    The row is located by exact id, then by exact label, through the core API
+    (``agent.credential_pool.load_pool``) -- ``auth.json`` is never opened here.
+    An expiring token (or ``force_refresh`` after a 401) is renewed by the core
+    pool itself (``try_refresh_matching``), which owns the refresh token, its
+    lock and its persistence, so the plugin never forks the OAuth grant. The
+    token is never logged, cached or returned in a reason.
+    """
+    try:
+        from agent.credential_pool import load_pool
+    except Exception:  # noqa: BLE001 - standalone install without the core
+        return None, "fetcher-unavailable"
+    try:
+        pool = load_pool("anthropic")
+        rows = list(pool.entries())
+    except Exception:  # noqa: BLE001 - locked/corrupt store fails open
+        return None, "no-credentials"
+    entry = next((e for e in rows if getattr(e, "id", None) == pool_ref), None)
+    if entry is None:
+        by_label = [e for e in rows if getattr(e, "label", None) == pool_ref]
+        if len(by_label) > 1:
+            return None, "config-invalid"
+        entry = by_label[0] if by_label else None
+    if entry is None:
+        return None, "no-credentials"
+    if getattr(entry, "last_status", None) == "dead":
+        return None, "auth-failed"
+    if str(getattr(entry, "auth_type", "") or "").lower() != "oauth":
+        return None, _ANTHROPIC_OAUTH_REQUIRED_REASON
+    expires = getattr(entry, "expires_at_ms", None)
+    expiring = (
+        isinstance(expires, (int, float)) and not isinstance(expires, bool)
+        and expires - time.time() * 1000 < _POOL_REFRESH_SKEW_MS
+    )
+    if force_refresh or expiring:
+        refresh = getattr(pool, "try_refresh_matching", None)
+        refreshed = None
+        if callable(refresh):
+            try:
+                refreshed = refresh(credential_id=getattr(entry, "id", None))
+            except Exception:  # noqa: BLE001 - a failed refresh is auth-failed
+                refreshed = None
+        if refreshed is not None:
+            entry = refreshed
+        elif force_refresh:
+            return None, "auth-failed"
+    token = str(getattr(entry, "access_token", "") or "").strip()
+    return (token, None) if token else (None, "no-credentials")
+
+
+_POOL_AMBIGUOUS_DETAIL = (
+    "More than one `hermes auth list` row has that label; use its id in 'poolId'."
+)
+
+
 def _invalid_account(entry: dict[str, Any]) -> QuotaAccount:
     """An actionable ``config-invalid``/``config-limit`` row for a bad entry."""
     account_id = entry.get("id")
@@ -929,11 +1017,25 @@ def _claude_subscription_type(config_dir: str) -> Optional[str]:
     return text.title()
 
 
+def _note_primary_match(
+    entry: dict[str, Any],
+    fingerprint: Optional[str],
+    primary_fp: Optional[str],
+    primary_match: Optional[list[dict[str, Any]]],
+) -> None:
+    """Record the listed entry that holds the primary's token (first one wins)."""
+    if primary_match is None or primary_match or not primary_fp:
+        return
+    if fingerprint == primary_fp:
+        primary_match.append(entry)
+
+
 def _claude_account_results(
     entries: list[dict[str, Any]],
     *,
     primary_token: Optional[str],
     deadline: Deadline,
+    primary_match: Optional[list[dict[str, Any]]] = None,
 ) -> list[QuotaAccount]:
     """Fetch every configured extra account under one shared deadline.
 
@@ -948,6 +1050,10 @@ def _claude_account_results(
     The result is bounded: at most ``_MAX_CLAUDE_ACCOUNTS`` rows are produced,
     and when entries remain beyond the bound exactly one ``config-limit`` row is
     appended, so a huge or all-invalid config cannot flood the cache and UI.
+
+    When *primary_match* is a list, the first listed entry whose token is the
+    primary's is appended to it. That entry gets no card of its own (it is the
+    primary), and the caller names the primary card after it.
     """
     accounts: list[QuotaAccount] = []
     # Only directories the user actually listed are collapsed together; the
@@ -970,6 +1076,51 @@ def _claude_account_results(
         if fetched >= _MAX_CLAUDE_ACCOUNTS:
             overflow = True
             break
+        if "pool_ref" in entry:
+            pool_key = f"pool:{entry['pool_ref']}"
+            if pool_key in seen_dirs:
+                continue
+            seen_dirs.add(pool_key)
+            fetched += 1
+            if deadline.expired():
+                accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                             unavailable_reason="timeout",
+                                             details=[_ACCOUNT_TIMEOUT_DETAIL]))
+                continue
+            token, reason = _pool_account_token(entry["pool_ref"])
+            if not token:
+                accounts.append(QuotaAccount(
+                    id=entry["id"], label=entry["label"],
+                    unavailable_reason=reason or "no-credentials",
+                    details=[_POOL_AMBIGUOUS_DETAIL] if reason == "config-invalid" else []))
+                continue
+            fingerprint = _token_fingerprint(token)
+            if fingerprint in seen_tokens:
+                _note_primary_match(entry, fingerprint, primary_fp, primary_match)
+                continue
+            seen_tokens.add(fingerprint)
+            payload, reason = _request_anthropic_usage(
+                token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+            if payload is None and reason == "auth-failed" and not deadline.expired():
+                # The access token was revoked or expired early: let the core
+                # pool renew it once, then retry with the fresh token.
+                token, reason = _pool_account_token(entry["pool_ref"], force_refresh=True)
+                if token:
+                    seen_tokens.add(_token_fingerprint(token))
+                    payload, reason = _request_anthropic_usage(
+                        token, timeout=deadline.slice(_ANTHROPIC_TIMEOUT_S))
+            if payload is None:
+                accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                             unavailable_reason=reason or "no-data"))
+                continue
+            windows, details = _parse_anthropic_usage(payload)
+            if not windows and not details:
+                accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                             unavailable_reason="no-data"))
+                continue
+            accounts.append(QuotaAccount(id=entry["id"], label=entry["label"],
+                                         windows=windows, details=details))
+            continue
         account_dir = Path(entry["config_dir"]).expanduser()
         canonical = _canonical_dir(account_dir)
         if canonical in seen_dirs:
@@ -989,6 +1140,7 @@ def _claude_account_results(
             continue
         fingerprint = _token_fingerprint(token)
         if fingerprint in seen_tokens:
+            _note_primary_match(entry, fingerprint, primary_fp, primary_match)
             continue
         seen_tokens.add(fingerprint)
         payload, reason = _request_anthropic_usage(
@@ -1060,9 +1212,40 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
                 primary_reason = "no-data"
 
     result = primary or build_unavailable("anthropic", primary_reason or "no-data")
+    matched: list[dict[str, Any]] = []
     result.accounts = _claude_account_results(
-        entries, primary_token=token, deadline=deadline)
+        entries, primary_token=token, deadline=deadline, primary_match=matched)
+    if matched:
+        # The core resolved one of the listed accounts (e.g. it has priority 0
+        # in the credential pool): the primary card carries that account's name,
+        # so names follow the account when the pool priority changes.
+        result.account_label = matched[0]["label"]
     return result
+
+
+def _claude_primary_label() -> Optional[str]:
+    """Optional display name for the core Claude account (``claudePrimaryLabel``).
+
+    Same rules as an account ``label``: a string of at most 80
+    characters with no control characters; anything else is ignored.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:  # noqa: BLE001 - standalone install / locked store
+        return None
+    plugins = config.get("plugins") if isinstance(config, dict) else None
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get("quota") if isinstance(entries, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    value = settings.get("claudePrimaryLabel") if isinstance(settings, dict) else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in text):
+        return None
+    return text
 
 
 def _fetch_anthropic() -> QuotaResult:
@@ -1073,8 +1256,13 @@ def _fetch_anthropic() -> QuotaResult:
     """
     entries, configured = _claude_accounts_setting()
     if not configured or not entries:
-        return _fetch_anthropic_single()
-    return _fetch_anthropic_multi(entries)
+        result = _fetch_anthropic_single()
+    else:
+        result = _fetch_anthropic_multi(entries)
+    primary_label = _claude_primary_label()
+    if primary_label and not result.account_label:
+        result.account_label = primary_label
+    return result
 
 
 _register("anthropic")(_fetch_anthropic)
