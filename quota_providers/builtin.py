@@ -1197,6 +1197,31 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
     return result
 
 
+def _claude_primary_label() -> Optional[str]:
+    """Optional display name for the core Claude account (``claudePrimaryLabel``).
+
+    Local extension. Same rules as an account ``label``: a string of at most 80
+    characters with no control characters; anything else is ignored.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except Exception:  # noqa: BLE001 - standalone install / locked store
+        return None
+    plugins = config.get("plugins") if isinstance(config, dict) else None
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get("quota") if isinstance(entries, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    value = settings.get("claudePrimaryLabel") if isinstance(settings, dict) else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in text):
+        return None
+    return text
+
+
 def _fetch_anthropic() -> QuotaResult:
     """Anthropic usage: the core account, plus any configured extra accounts.
 
@@ -1205,8 +1230,13 @@ def _fetch_anthropic() -> QuotaResult:
     """
     entries, configured = _claude_accounts_setting()
     if not configured or not entries:
-        return _fetch_anthropic_single()
-    return _fetch_anthropic_multi(entries)
+        result = _fetch_anthropic_single()
+    else:
+        result = _fetch_anthropic_multi(entries)
+    primary_label = _claude_primary_label()
+    if primary_label:
+        result.account_label = primary_label
+    return result
 
 
 _register("anthropic")(_fetch_anthropic)
