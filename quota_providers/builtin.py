@@ -807,7 +807,7 @@ def _claude_accounts_setting() -> tuple[list[dict[str, Any]], bool]:
             continue
         pool_ref = item.get("poolId", item.get("pool_id"))
         if pool_ref is not None:
-            # Local extension: the account is a Hermes credential-pool row
+            # The account is a Hermes credential-pool row
             # (``hermes auth list``), read through the core pool API instead of
             # a Claude Code ``.credentials.json``.
             if config_dir is not None:
@@ -1200,7 +1200,7 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
 def _claude_primary_label() -> Optional[str]:
     """Optional display name for the core Claude account (``claudePrimaryLabel``).
 
-    Local extension. Same rules as an account ``label``: a string of at most 80
+    Same rules as an account ``label``: a string of at most 80
     characters with no control characters; anything else is ignored.
     """
     try:

@@ -1,6 +1,6 @@
 """``claudeAccounts`` entries backed by Hermes' credential pool (``poolId``).
 
-Local extension: an extra Claude account may name a ``hermes auth list`` row
+An extra Claude account may name a ``hermes auth list`` row
 instead of a Claude Code ``configDir``. These tests pin that the row is found
 through the core pool API (never ``auth.json``), that refresh is delegated to
 the core pool, and that dedup/failure rules match the ``configDir`` path.
