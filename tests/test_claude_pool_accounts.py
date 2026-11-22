@@ -256,6 +256,66 @@ class PrimaryLabelTests(unittest.TestCase):
         self.assertEqual(commands._provider_label("anthropic:conta2", rows["anthropic:conta2"]), "Anthropic · Work")
 
 
+
+class PrimaryFollowsListedAccountTests(unittest.TestCase):
+    """The primary card is named after the listed account whose token it uses.
+
+    The core resolves the primary token from the pool row with the highest
+    priority. When that row is also listed in ``claudeAccounts`` its card is
+    deduped into the primary, so the primary must carry its name; otherwise a
+    priority change would show one account under the other's name and hide it.
+    """
+
+    ROWS = [_Row("d4e5f6", "anthropic-oauth-1", "PERSONAL"), _Row("a1b2c3", "conta2", "WORK")]
+    MAPPING = {"PERSONAL": _payload(10), "WORK": _payload(70)}
+    BOTH = [{"id": "personal", "label": "Personal", "poolId": "d4e5f6"},
+            {"id": "work", "label": "Work", "poolId": "a1b2c3"}]
+
+    def _run(self, primary, accounts, **extra):
+        settings = {"claudeAccounts": accounts, **extra}
+        return _fetch(settings, _Pool(list(self.ROWS)), self.MAPPING, primary=primary)
+
+    def test_primary_takes_the_matching_entry_label(self):
+        res = self._run("WORK", self.BOTH)
+        self.assertEqual(res.account_label, "Work")
+        self.assertEqual([(a.id, a.label) for a in res.accounts], [("personal", "Personal")])
+        self.assertEqual(res.windows[0].used_percent, 70.0)
+        self.assertEqual(res.accounts[0].windows[0].used_percent, 10.0)
+
+    def test_names_follow_the_account_when_priority_flips(self):
+        res = self._run("PERSONAL", self.BOTH)
+        self.assertEqual(res.account_label, "Personal")
+        self.assertEqual([(a.id, a.label) for a in res.accounts], [("work", "Work")])
+        self.assertEqual(res.windows[0].used_percent, 10.0)
+
+    def test_matching_entry_wins_over_claude_primary_label(self):
+        res = self._run("WORK", self.BOTH, claudePrimaryLabel="Pessoal")
+        self.assertEqual(res.account_label, "Work")
+
+    def test_primary_label_still_applies_when_nothing_matches(self):
+        res = self._run("PERSONAL", [self.BOTH[1]], claudePrimaryLabel="Personal")
+        self.assertEqual(res.account_label, "Personal")
+        self.assertEqual([a.label for a in res.accounts], ["Work"])
+
+    def test_unlabelled_match_uses_the_entry_id(self):
+        res = self._run("WORK", [{"id": "work", "poolId": "a1b2c3"}])
+        self.assertEqual(res.account_label, "work")
+        self.assertEqual(res.accounts, [])
+
+    def test_config_dir_entry_with_the_primary_token_names_it_too(self):
+        with mock.patch.object(builtin, "_read_claude_account_token", return_value=("WORK", None)), \
+             mock.patch.object(builtin, "_claude_subscription_type", return_value=None):
+            res = self._run("WORK", [{"id": "work", "label": "Work", "configDir": "/tmp/claude-work"}])
+        self.assertEqual(res.account_label, "Work")
+        self.assertEqual(res.accounts, [])
+
+    def test_first_matching_entry_wins(self):
+        accounts = [{"id": "a", "label": "First", "poolId": "a1b2c3"},
+                    {"id": "b", "label": "Second", "poolId": "conta2"}]
+        res = self._run("WORK", accounts)
+        self.assertEqual(res.account_label, "First")
+        self.assertEqual(res.accounts, [])
+
 @unittest.skipUnless(__import__("shutil").which("node"), "Node.js is required for widget render tests")
 class PrimaryLabelWidgetTests(unittest.TestCase):
     def test_widget_row_and_chip_show_the_primary_label(self):

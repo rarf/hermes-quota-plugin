@@ -1017,11 +1017,25 @@ def _claude_subscription_type(config_dir: str) -> Optional[str]:
     return text.title()
 
 
+def _note_primary_match(
+    entry: dict[str, Any],
+    fingerprint: Optional[str],
+    primary_fp: Optional[str],
+    primary_match: Optional[list[dict[str, Any]]],
+) -> None:
+    """Record the listed entry that holds the primary's token (first one wins)."""
+    if primary_match is None or primary_match or not primary_fp:
+        return
+    if fingerprint == primary_fp:
+        primary_match.append(entry)
+
+
 def _claude_account_results(
     entries: list[dict[str, Any]],
     *,
     primary_token: Optional[str],
     deadline: Deadline,
+    primary_match: Optional[list[dict[str, Any]]] = None,
 ) -> list[QuotaAccount]:
     """Fetch every configured extra account under one shared deadline.
 
@@ -1036,6 +1050,10 @@ def _claude_account_results(
     The result is bounded: at most ``_MAX_CLAUDE_ACCOUNTS`` rows are produced,
     and when entries remain beyond the bound exactly one ``config-limit`` row is
     appended, so a huge or all-invalid config cannot flood the cache and UI.
+
+    When *primary_match* is a list, the first listed entry whose token is the
+    primary's is appended to it. That entry gets no card of its own (it is the
+    primary), and the caller names the primary card after it.
     """
     accounts: list[QuotaAccount] = []
     # Only directories the user actually listed are collapsed together; the
@@ -1078,6 +1096,7 @@ def _claude_account_results(
                 continue
             fingerprint = _token_fingerprint(token)
             if fingerprint in seen_tokens:
+                _note_primary_match(entry, fingerprint, primary_fp, primary_match)
                 continue
             seen_tokens.add(fingerprint)
             payload, reason = _request_anthropic_usage(
@@ -1121,6 +1140,7 @@ def _claude_account_results(
             continue
         fingerprint = _token_fingerprint(token)
         if fingerprint in seen_tokens:
+            _note_primary_match(entry, fingerprint, primary_fp, primary_match)
             continue
         seen_tokens.add(fingerprint)
         payload, reason = _request_anthropic_usage(
@@ -1192,8 +1212,14 @@ def _fetch_anthropic_multi(entries: list[dict[str, Any]]) -> QuotaResult:
                 primary_reason = "no-data"
 
     result = primary or build_unavailable("anthropic", primary_reason or "no-data")
+    matched: list[dict[str, Any]] = []
     result.accounts = _claude_account_results(
-        entries, primary_token=token, deadline=deadline)
+        entries, primary_token=token, deadline=deadline, primary_match=matched)
+    if matched:
+        # The core resolved one of the listed accounts (e.g. it has priority 0
+        # in the credential pool): the primary card carries that account's name,
+        # so names follow the account when the pool priority changes.
+        result.account_label = matched[0]["label"]
     return result
 
 
@@ -1234,7 +1260,7 @@ def _fetch_anthropic() -> QuotaResult:
     else:
         result = _fetch_anthropic_multi(entries)
     primary_label = _claude_primary_label()
-    if primary_label:
+    if primary_label and not result.account_label:
         result.account_label = primary_label
     return result
 
