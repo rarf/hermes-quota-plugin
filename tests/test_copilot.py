@@ -249,5 +249,65 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(result.unavailable_reason, "no-data")
 
 
+class NoCopilotAccessTests(unittest.TestCase):
+    """A GitHub account without Copilot is not a failing Copilot quota.
+
+    ``GET /copilot_internal/user`` answers 200 for any signed-in GitHub token —
+    including the one ``gh auth login`` leaves behind — and marks the account
+    ``access_type_sku: "no_access"`` with no quota snapshots. That surfaced as
+    ``no-data``: a permanent muted card for a subscription the machine never
+    had. The dashboard only hides ``no-credentials``, so an account with no
+    Copilot entitlement must report that instead.
+    """
+
+    NO_ACCESS = {
+        "id": 104975751,
+        "login": "octocat",
+        "access_type_sku": "no_access",
+        "can_signup_for_limited": True,
+        "chat_enabled": False,
+        "cli_enabled": False,
+        "copilot_plan": "individual",
+        "organization_list": [],
+    }
+
+    def test_no_access_sku_reports_no_credentials(self):
+        result = _fetch_with_payload(dict(self.NO_ACCESS))
+        self.assertEqual(result.unavailable_reason, "no-credentials")
+        self.assertEqual(result.windows, [])
+
+    def test_camel_case_alias_is_recognized(self):
+        payload = dict(self.NO_ACCESS)
+        payload.pop("access_type_sku")
+        payload["accessTypeSku"] = "no_access"
+        result = _fetch_with_payload(payload)
+        self.assertEqual(result.unavailable_reason, "no-credentials")
+
+    def test_no_access_with_meters_still_renders(self):
+        """Real meters win: the sku alone must never hide a reporting account."""
+        payload = dict(self.NO_ACCESS)
+        payload["quota_snapshots"] = {
+            "chat": {"percent_remaining": 55.0, "has_quota": True,
+                     "quota_remaining": 550, "entitlement": 1000,
+                     "unlimited": False, "quota_reset_at": 0},
+        }
+        result = _fetch_with_payload(payload)
+        self.assertIsNone(result.unavailable_reason)
+        self.assertEqual([w.label for w in result.windows], ["Chat"])
+
+    def test_other_sku_without_snapshots_stays_no_data(self):
+        payload = dict(self.NO_ACCESS)
+        payload["access_type_sku"] = "copilot_for_individual"
+        result = _fetch_with_payload(payload)
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+    def test_missing_sku_without_snapshots_stays_no_data(self):
+        """An unknown payload shape must not be reinterpreted as no-access."""
+        payload = dict(self.NO_ACCESS)
+        payload.pop("access_type_sku")
+        result = _fetch_with_payload(payload)
+        self.assertEqual(result.unavailable_reason, "no-data")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -221,6 +221,32 @@ def parse_usage_payload(data: Any) -> tuple[list[QuotaWindow], Optional[str], li
 # -- network --------------------------------------------------------------------
 
 
+# ``access_type_sku`` values the user endpoint returns when the token belongs to
+# a GitHub account that has no Copilot entitlement at all. Signing in with
+# ``gh auth login`` (or exporting any GITHUB_TOKEN) is enough to reach this
+# endpoint and get a 200 — no Copilot subscription is involved.
+_NO_ACCESS_SKUS = frozenset({"no_access", "none"})
+
+
+def _has_no_copilot_access(data: Any) -> bool:
+    """True when the payload explicitly says this account has no Copilot access.
+
+    Only server evidence counts. ``access_type_sku: "no_access"`` is the API's
+    own marker for a signed-in GitHub account without Copilot; an unknown shape
+    must fall through to ``no-data`` so a real account is never hidden.
+    Requiring no snapshots as well keeps the rule off any payload that does
+    carry meters.
+    """
+    if not isinstance(data, dict):
+        return False
+    sku = data.get("access_type_sku") or data.get("accessTypeSku")
+    if not isinstance(sku, str):
+        return False
+    if sku.strip().lower().replace("-", "_") not in _NO_ACCESS_SKUS:
+        return False
+    return not _snapshots(data)
+
+
 def fetch_usage(github_token: str) -> QuotaResult:
     headers = dict(_HEADERS)
     headers["Authorization"] = f"token {github_token}"
@@ -241,6 +267,12 @@ def fetch_usage(github_token: str) -> QuotaResult:
         return build_unavailable(_PROVIDER_ID, "bad-json")
 
     windows, plan, details = parse_usage_payload(data)
+    if _has_no_copilot_access(data):
+        # A token for a GitHub account with no Copilot subscription is not a
+        # failing quota — there is no Copilot account here to read. Report what
+        # a missing credential reports so the dashboard hides the provider
+        # instead of parking a permanent "no-data" card on the pane.
+        return build_unavailable(_PROVIDER_ID, "no-credentials")
     if not windows and not details:
         return build_unavailable(_PROVIDER_ID, "no-data")
     return QuotaResult(
