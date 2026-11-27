@@ -32,6 +32,17 @@ function readStdin() {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+// Effects run synchronously when `runEffects` is set; an effect that starts a
+// repeating interval (useNow's 30s countdown ticker) would otherwise hold the
+// process open forever, since the stub never runs effect cleanups. Unref the
+// interval: it still fires while the render settles, it just cannot keep the
+// renderer alive after stdout is written.
+const setIntervalUnref = (fn, ms, ...args) => {
+  const id = setInterval(fn, ms, ...args);
+  if (id && typeof id.unref === 'function') id.unref();
+  return id;
+};
+
 async function run(options = {}) {
   const jsx = (type, props, key) => typeof type === 'function' ? type(props || {}) : {type, props: props || {}, key: key ?? null};
   const atom = value => ({get: () => value, set: v => { value = v; }});
@@ -43,7 +54,7 @@ async function run(options = {}) {
     return typeof v === 'function' ? v(...args) : v != null ? v : key;
   };
   const storage = new Map(Object.entries(options.storage || {}));
-  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: [], navigated: []};
+  const record = {notified: [], clipboard: [], opened: [], toasts: [], cli: [], queries: [], submitted: [], navigated: [], published: []};
   const focus = options.focus || {};
   const ro = value => ({get: () => value, listen: () => () => {}, subscribe: () => () => {}});
   const scope = options.noScope ? null : {connectionId: 'local', profile: 'work'};
@@ -83,6 +94,7 @@ async function run(options = {}) {
     },
     openSession: async (id, opts) => { record.opened.push({id, opts: opts || null}); },
     notify: (toast) => { record.toasts.push(toast); },
+    publishMonitorLive: options.noPublishDoor ? undefined : (input) => { record.published.push(input); return true; },
     navigate: (path) => { record.navigated.push(path); },
   };
   // `now` (ms) freezes the clock: payloads are built relative to the test's
@@ -111,7 +123,7 @@ async function run(options = {}) {
     host,
     PANES_AREA: 'panes', ROUTES_AREA: 'routes', SIDEBAR_NAV_AREA: 'nav', STATUSBAR_AREAS: {right: 'statusbar.right'},
     fmtDayTime: new Intl.DateTimeFormat('en-US'), console,
-    Date: DateImpl, Intl, setTimeout, clearTimeout, setInterval, clearInterval,
+    Date: DateImpl, Intl, setTimeout, clearTimeout, setInterval: setIntervalUnref, clearInterval,
   };
   const file = options.source || path.join(__dirname, '../desktop/plugin.js');
   const source = fs.readFileSync(file, 'utf8')
