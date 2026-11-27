@@ -3147,6 +3147,25 @@ function useMonitor() {
 	// A backend-side crash still answers one JSON object: {monitor_version, error}.
 	const payload = enabled ? asMonitorPayload(raw) : null;
 	const snapshot = payload && !(payload.error && !payload.live) ? payload : null;
+	// Seam A publish leg: share each polled monitor snapshot with the
+	// Desktop host (`host.publishMonitorLive`, hermes-agent branch
+	// musti/live-session-unification-t_c63fe524) so the sidebar's Open-now
+	// section shows the same live rows. Feature-detected: hosts without
+	// the door ignore this silently. The host validates the payload and
+	// keeps the last good snapshot on a malformed publish; a failed
+	// publish must never break the widget.
+	useEffect(() => {
+		if (!snapshot || !scope) return;
+		try {
+			host.publishMonitorLive?.({
+				profile: scope.profile,
+				live: snapshot.live,
+				fetchedAt: snapshot.generated_at,
+			});
+		} catch {
+			/* Publish failures are not widget errors. */
+		}
+	}, [scope && scope.profile, snapshot]);
 	return {
 		scope,
 		enabled,
